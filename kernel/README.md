@@ -10,7 +10,17 @@ make -C kernel LINUX_SRC=/path/to/linux -j4 kernel
 make -C kernel LINUX_SRC=/path/to/linux modules
 ```
 
+The default configuration starts from Linux `allnoconfig` and merges
+`hwrun.config`, so disabled subsystems stay out unless they are explicitly
+added to the fragment. To regenerate the pruned configuration only:
+
+```sh
+make -C kernel LINUX_SRC=/path/to/linux prune
+```
+
 The first module is `modules/hwrun_core.ko`. It exposes `/dev/hwrun` and the UAPI in `include/uapi/hwrun.h`.
+
+The pruned x86_64 build produces `build/linux/arch/x86/boot/bzImage`.
 
 ## Architecture
 

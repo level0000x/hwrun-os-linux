@@ -8,16 +8,18 @@ MODULE_DIR := $(CURDIR)/modules
 CONFIG_FRAGMENT := $(CURDIR)/hwrun.config
 JOBS ?= 1
 
-.PHONY: all config kernel modules menuconfig oldconfig clean help
+.PHONY: all config prune kernel modules menuconfig oldconfig clean help
 
 all: kernel modules
 
 config:
-	$(MAKE) -C $(LINUX_SRC) O=$(KBUILD_OUT) defconfig
+	$(MAKE) -C $(LINUX_SRC) O=$(KBUILD_OUT) allnoconfig
 	$(LINUX_SRC)/scripts/kconfig/merge_config.sh -m -O $(KBUILD_OUT) \
 		$(KBUILD_OUT)/.config $(CONFIG_FRAGMENT)
 	$(MAKE) -C $(LINUX_SRC) O=$(KBUILD_OUT) olddefconfig
 	$(MAKE) -C $(LINUX_SRC) O=$(KBUILD_OUT) modules_prepare
+
+prune: config
 
 kernel: config
 	$(MAKE) -C $(LINUX_SRC) O=$(KBUILD_OUT) \
