@@ -2,6 +2,10 @@
 node_modules/
 dist/
 build/
+linux-src/
+kernel/build/
+*.o
+*.ko
 *.log
 # OS
 .DS_Store

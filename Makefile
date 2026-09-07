@@ -38,6 +38,10 @@ PLUGIN_SOS  := $(foreach d,$(PLUGIN_DIRS),$(d)/build/$(lastword $(subst /, ,$(d)
 
 all: bus plugins
 
+# ---------- 微内核（独立构建） ----------
+kernel:
+	$(MAKE) -C kernel
+
 # ---------- 总线 ----------
 $(BUS_BIN): $(BUS_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -70,4 +74,4 @@ install: all
 	install -D -m 755 $(BUS_BIN) $(BINDIR)/hwrun
 	$(foreach d,$(PLUGIN_DIRS),$(MAKE) -C $(d) install;)
 
-.PHONY: all bus plugins test clean install $(PLUGIN_DIRS)
+.PHONY: all kernel bus plugins test clean install $(PLUGIN_DIRS)
