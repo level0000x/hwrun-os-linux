@@ -6,6 +6,11 @@ linux-src/
 kernel/build/
 *.o
 *.ko
+*.cmd
+*.mod
+*.mod.c
+Module.symvers
+modules.order
 *.log
 # OS
 .DS_Store

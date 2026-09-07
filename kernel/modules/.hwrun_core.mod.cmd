@@ -1,1 +1,0 @@
-cmd_/mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/hwrun_core.mod := printf '%s\n'   hwrun_core.o | awk '!x[$$0]++ { print("/mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/"$$0) }' > /mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/hwrun_core.mod

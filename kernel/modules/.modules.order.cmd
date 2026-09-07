@@ -1,1 +1,0 @@
-cmd_/mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/modules.order := {   echo /mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/hwrun_core.ko; :; } > /mnt/c/Users/xingg/Desktop/hwrun-os-linux/kernel/modules/modules.order
