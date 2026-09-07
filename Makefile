@@ -52,13 +52,11 @@ $(BUS_BIN): $(BUS_OBJS)
 bus: $(BUS_BIN)
 
 # ---------- 插件 ----------
-plugins: $(PLUGIN_SOS)
+plugins:
+	@set -e; for d in $(PLUGIN_DIRS); do $(MAKE) -C $$d; done
 
 $(PLUGIN_DIRS):
 	$(MAKE) -C $@
-
-$(PLUGIN_SOS): %/build/%.so: %
-	$(MAKE) -C $(dir $@).. all
 
 # ---------- 测试 ----------
 test: bus
