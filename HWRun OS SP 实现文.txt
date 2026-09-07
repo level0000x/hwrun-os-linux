@@ -1,0 +1,1260 @@
+﻿HWRun OS SP 实现文档
+
+模块名称： SP (Security Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 安全协议，提供认证、授权、加密、解密、哈希、签名、密钥管理等安全功能的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）
+提供协议： SP
+
+一、设计哲学
+
+1.1 核心定位
+
+SP 是 HWRun OS 的安全核心——所有与认证、授权、加密、解密、哈希、签名相关的操作都通过 SP 协议进行。
+
+```
+SP = 安全协议 = 所有安全操作 (HAP) 的统一入口
+
+上层插件 (CLUSTER, FS_TRANSFER, PERMISSION, CRYPTO, CONTAINER, ...)
+    │
+    │  通过 SP 协议进行安全操作
+    ▼
+SP 插件 (内核模块)
+    │
+    │  直接操作内核安全子系统
+    ▼
+Linux 内核 (Crypto API / Keyring / LSM / IMA)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有安全操作通过 SP 协议进行
+2. 内核实现：SP 插件运行在内核态，直接操作内核安全子系统
+3. 标准接口：暴露认证、授权、加密、解密、哈希、签名、密钥管理等标准安全接口
+4. 多种算法：支持 AES、RSA、ECDSA、SHA-256、SHA-512 等主流算法
+5. 密钥管理：支持密钥生成、存储、轮换
+6. 权限检查：集成 Linux 内核的 LSM 框架进行访问控制
+
+1.3 SP 插件的本质
+
+SP 插件 = Linux 内核安全子系统的 HWRun 协议封装
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SP 插件架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  SP 协议接口 (通过 IPC 调用)                                        │   │
+│  │  Authenticate / Authorize / Encrypt / Decrypt / Hash / Sign /     │   │
+│  │  Verify / GenKey / GenCert / GetPublicKey                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层 (将 SP 协议调用转换为内核安全操作)                       │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 权限检查                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核功能封装                                                       │   │
+│  │  ├── 加密: crypto_alloc_skcipher() / crypto_skcipher_encrypt()    │   │
+│  │  ├── 哈希: crypto_alloc_shash() / crypto_shash_digest()           │   │
+│  │  ├── 密钥: keyctl 系统调用封装                                     │   │
+│  │  └── 认证: LSM 钩子封装                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (Crypto API / Keyring / LSM / IMA)                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 SP 插件的组成
+
+```
+SP 插件 (sp.ko)
+├── 协议处理层
+│   ├── sp_ipc_handler()       ← IPC 消息分发
+│   ├── sp_authenticate()      ← 身份认证
+│   ├── sp_authorize()         ← 权限检查
+│   ├── sp_encrypt()           ← 加密
+│   ├── sp_decrypt()           ← 解密
+│   ├── sp_hash()              ← 哈希
+│   ├── sp_sign()              ← 签名
+│   ├── sp_verify()            ← 验签
+│   ├── sp_gen_key()           ← 生成密钥
+│   ├── sp_get_pubkey()        ← 获取公钥
+│   └── sp_gen_cert()          ← 生成证书
+│
+├── 加密实现
+│   ├── sp_crypto.c            ← 对称/非对称加密
+│   └── sp_hash.c              ← 哈希
+│
+├── 密钥管理
+│   └── sp_key.c               ← 密钥生成/存储/轮换
+│
+├── 认证与授权
+│   └── sp_auth.c              ← 身份认证与权限检查
+│
+└── 初始化/清理
+    ├── sp_init()              ← 模块加载
+    └── sp_exit()              ← 模块卸载
+```
+
+2.2 SP 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → 其他插件
+                                                                                          ↑
+                                                                            SP 在这里加载
+```
+
+SP 是第五个加载的硬件相关插件（HAP → PMP → FSP → NP → SP）。在它之后，依赖安全功能的插件才能正常工作。
+
+2.3 SP 的上层消费者
+
+上层插件 需要 SP 提供什么
+PERMISSION (权限管理) 身份认证、权限检查
+CLUSTER (集群管理) 节点间安全通信、身份认证
+FS_TRANSFER (文件传输) 传输加密
+CONTAINER (容器) 镜像签名验证
+NODE_DISCOVERY (节点发现) 节点身份验证
+AUDIT (审计) 安全审计
+
+三、核心数据结构
+
+```c
+// sp/include/sp.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   加密算法类型
+   ============================================================ */
+typedef enum {
+    SP_CIPHER_AES_128_GCM = 0,
+    SP_CIPHER_AES_256_GCM,
+    SP_CIPHER_AES_128_CBC,
+    SP_CIPHER_AES_256_CBC,
+    SP_CIPHER_AES_128_XTS,
+    SP_CIPHER_AES_256_XTS,
+    SP_CIPHER_CHACHA20_POLY1305,
+} sp_cipher_t;
+
+/* ============================================================
+   哈希算法类型
+   ============================================================ */
+typedef enum {
+    SP_HASH_SHA1 = 0,
+    SP_HASH_SHA256,
+    SP_HASH_SHA512,
+    SP_HASH_SHA3_256,
+    SP_HASH_SHA3_512,
+} sp_hash_t;
+
+/* ============================================================
+   非对称算法类型
+   ============================================================ */
+typedef enum {
+    SP_ASYM_RSA_2048 = 0,
+    SP_ASYM_RSA_4096,
+    SP_ASYM_ECDSA_P256,
+    SP_ASYM_ECDSA_P384,
+    SP_ASYM_ED25519,
+} sp_asym_t;
+
+/* ============================================================
+   加密请求
+   ============================================================ */
+typedef struct sp_crypto_req {
+    sp_cipher_t cipher;
+    uint32_t key_len;
+    uint8_t *key;
+    uint32_t iv_len;
+    uint8_t *iv;
+    uint32_t data_len;
+    uint8_t *data;
+    uint32_t aad_len;           // 附加认证数据 (AEAD)
+    uint8_t *aad;
+} sp_crypto_req_t;
+
+/* ============================================================
+   加密响应
+   ============================================================ */
+typedef struct sp_crypto_resp {
+    uint32_t out_len;
+    uint8_t *out_data;
+    uint32_t tag_len;           // AEAD 认证标签
+    uint8_t *tag;
+    int32_t error;
+} sp_crypto_resp_t;
+
+/* ============================================================
+   哈希请求
+   ============================================================ */
+typedef struct sp_hash_req {
+    sp_hash_t hash;
+    uint32_t data_len;
+    uint8_t *data;
+} sp_hash_req_t;
+
+/* ============================================================
+   哈希响应
+   ============================================================ */
+typedef struct sp_hash_resp {
+    uint32_t hash_len;
+    uint8_t *hash;
+    int32_t error;
+} sp_hash_resp_t;
+
+/* ============================================================
+   密钥生成请求
+   ============================================================ */
+typedef struct sp_genkey_req {
+    sp_asym_t algorithm;
+    uint32_t key_id;            // 0 表示生成新密钥
+} sp_genkey_req_t;
+
+/* ============================================================
+   密钥生成响应
+   ============================================================ */
+typedef struct sp_genkey_resp {
+    uint32_t key_id;
+    uint32_t pubkey_len;
+    uint8_t *pubkey;
+    int32_t error;
+} sp_genkey_resp_t;
+
+/* ============================================================
+   签名请求
+   ============================================================ */
+typedef struct sp_sign_req {
+    uint32_t key_id;
+    uint32_t data_len;
+    uint8_t *data;
+} sp_sign_req_t;
+
+/* ============================================================
+   签名响应
+   ============================================================ */
+typedef struct sp_sign_resp {
+    uint32_t sig_len;
+    uint8_t *signature;
+    int32_t error;
+} sp_sign_resp_t;
+
+/* ============================================================
+   验证请求
+   ============================================================ */
+typedef struct sp_verify_req {
+    uint32_t key_id;
+    uint32_t data_len;
+    uint8_t *data;
+    uint32_t sig_len;
+    uint8_t *signature;
+} sp_verify_req_t;
+
+/* ============================================================
+   认证请求
+   ============================================================ */
+typedef struct sp_auth_req {
+    char user[64];
+    char password[128];
+    char token[256];
+} sp_auth_req_t;
+
+/* ============================================================
+   授权请求
+   ============================================================ */
+typedef struct sp_authorize_req {
+    char user[64];
+    char action[64];            // "fs.read", "task.submit", etc.
+    char target[256];           // 文件路径、节点ID等
+} sp_authorize_req_t;
+
+/* ============================================================
+   SP 上下文
+   ============================================================ */
+typedef struct sp_context {
+    int initialized;
+    uint64_t sp_task_id;        // SP 自身的任务 ID
+    
+    // 密钥存储 (key_id -> 密钥)
+    struct sp_key *keys;
+    uint32_t next_key_id;
+    
+    // 用户认证缓存
+    struct sp_auth_cache *auth_cache;
+    
+    void *lock;
+} sp_context_t;
+
+/* ============================================================
+   密钥存储结构
+   ============================================================ */
+typedef struct sp_key {
+    uint32_t key_id;
+    sp_asym_t algorithm;
+    uint8_t *private_key;
+    uint32_t private_len;
+    uint8_t *public_key;
+    uint32_t public_len;
+    uint64_t created_at;
+    uint64_t expires_at;
+    int revoked;
+    struct sp_key *next;
+} sp_key_t;
+```
+
+四、SP 协议定义
+
+```protobuf
+// protocols/sp.proto
+syntax = "proto3";
+
+package hwrun.sp;
+
+service Security {
+    // === 认证与授权 ===
+    rpc Authenticate(AuthRequest) returns (AuthResponse);
+    rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+    
+    // === 加密与解密 ===
+    rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+    rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+    
+    // === 哈希 ===
+    rpc Hash(HashRequest) returns (HashResponse);
+    
+    // === 签名与验签 ===
+    rpc Sign(SignRequest) returns (SignResponse);
+    rpc Verify(VerifyRequest) returns (VerifyResponse);
+    
+    // === 密钥管理 ===
+    rpc GenKey(GenKeyRequest) returns (GenKeyResponse);
+    rpc GetPublicKey(GetPublicKeyRequest) returns (GetPublicKeyResponse);
+    rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
+}
+
+// ============ 认证与授权 ============
+
+message AuthRequest {
+    string user = 1;
+    string password = 2;
+    string token = 3;
+}
+
+message AuthResponse {
+    bool success = 1;
+    string session_id = 2;
+    string error = 3;
+}
+
+message AuthorizeRequest {
+    string user = 1;
+    string action = 2;
+    string target = 3;
+}
+
+message AuthorizeResponse {
+    bool allowed = 1;
+    string reason = 2;
+}
+
+// ============ 加密与解密 ============
+
+message EncryptRequest {
+    uint32 cipher = 1;              // sp_cipher_t
+    bytes key = 2;
+    bytes iv = 3;
+    bytes data = 4;
+    bytes aad = 5;                  // 附加认证数据 (AEAD)
+}
+
+message EncryptResponse {
+    bytes ciphertext = 1;
+    bytes tag = 2;                  // AEAD 认证标签
+    int32 error = 3;
+}
+
+message DecryptRequest {
+    uint32 cipher = 1;
+    bytes key = 2;
+    bytes iv = 3;
+    bytes ciphertext = 4;
+    bytes tag = 5;
+    bytes aad = 6;
+}
+
+message DecryptResponse {
+    bytes plaintext = 1;
+    int32 error = 2;
+}
+
+// ============ 哈希 ============
+
+message HashRequest {
+    uint32 hash = 1;                // sp_hash_t
+    bytes data = 2;
+}
+
+message HashResponse {
+    bytes hash = 1;
+    int32 error = 2;
+}
+
+// ============ 签名与验签 ============
+
+message SignRequest {
+    uint32 key_id = 1;
+    bytes data = 2;
+}
+
+message SignResponse {
+    bytes signature = 1;
+    int32 error = 2;
+}
+
+message VerifyRequest {
+    uint32 key_id = 1;
+    bytes data = 2;
+    bytes signature = 3;
+}
+
+message VerifyResponse {
+    bool valid = 1;
+    int32 error = 2;
+}
+
+// ============ 密钥管理 ============
+
+message GenKeyRequest {
+    uint32 algorithm = 1;           // sp_asym_t
+}
+
+message GenKeyResponse {
+    uint32 key_id = 1;
+    bytes public_key = 2;
+    int32 error = 3;
+}
+
+message GetPublicKeyRequest {
+    uint32 key_id = 1;
+}
+
+message GetPublicKeyResponse {
+    bytes public_key = 1;
+    int32 error = 2;
+}
+
+message RevokeKeyRequest {
+    uint32 key_id = 1;
+}
+
+message RevokeKeyResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// sp/src/sp.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/crypto.h>
+#include <linux/random.h>
+#include <linux/key.h>
+#include <linux/security.h>
+#include <crypto/hash.h>
+#include <crypto/aead.h>
+#include <crypto/skcipher.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+#include "sp_crypto.h"
+#include "sp_hash.h"
+#include "sp_key.h"
+#include "sp_auth.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Security Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static sp_context_t g_sp_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init sp_init(void) {
+    printk(KERN_INFO "HWRun SP: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_sp_ctx, 0, sizeof(sp_context_t));
+    
+    // 2. 初始化密钥存储
+    g_sp_ctx.keys = NULL;
+    g_sp_ctx.next_key_id = 1;
+    
+    // 3. 注册 IPC 消息处理器
+    int ret = sp_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun SP: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 SP 协议（通过 METAPROTO - 通过 IPC）
+    sp_register_protocol();
+    
+    g_sp_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun SP: Initialized successfully\n");
+    printk(KERN_INFO "  Supported ciphers: AES-128/256-GCM, AES-128/256-CBC, ChaCha20-Poly1305\n");
+    printk(KERN_INFO "  Supported hashes: SHA-256, SHA-512, SHA3-256, SHA3-512\n");
+    printk(KERN_INFO "  Supported asym: RSA-2048/4096, ECDSA-P256/P384, Ed25519\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit sp_exit(void) {
+    printk(KERN_INFO "HWRun SP: Exiting...\n");
+    
+    sp_ipc_unregister();
+    
+    // 清理密钥存储
+    sp_key_cleanup();
+    
+    g_sp_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun SP: Exited\n");
+}
+
+module_init(sp_init);
+module_exit(sp_exit);
+```
+
+5.2 对称加密 (AES-GCM)
+
+```c
+// sp/src/sp_crypto.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/crypto.h>
+#include <crypto/aead.h>
+#include <crypto/skcipher.h>
+#include <crypto/gcm.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+
+/* ============================================================
+   获取加密算法名称
+   ============================================================ */
+static const char *sp_get_cipher_name(sp_cipher_t cipher) {
+    switch (cipher) {
+        case SP_CIPHER_AES_128_GCM: return "gcm(aes)";
+        case SP_CIPHER_AES_256_GCM: return "gcm(aes)";
+        case SP_CIPHER_AES_128_CBC: return "cbc(aes)";
+        case SP_CIPHER_AES_256_CBC: return "cbc(aes)";
+        case SP_CIPHER_AES_128_XTS: return "xts(aes)";
+        case SP_CIPHER_AES_256_XTS: return "xts(aes)";
+        case SP_CIPHER_CHACHA20_POLY1305: return "rfc7539(chacha20,poly1305)";
+        default: return NULL;
+    }
+}
+
+/* ============================================================
+   获取密钥长度
+   ============================================================ */
+static int sp_get_key_len(sp_cipher_t cipher) {
+    switch (cipher) {
+        case SP_CIPHER_AES_128_GCM: return 16;
+        case SP_CIPHER_AES_256_GCM: return 32;
+        case SP_CIPHER_AES_128_CBC: return 16;
+        case SP_CIPHER_AES_256_CBC: return 32;
+        case SP_CIPHER_AES_128_XTS: return 32;  // XTS 需要双倍密钥
+        case SP_CIPHER_AES_256_XTS: return 64;
+        case SP_CIPHER_CHACHA20_POLY1305: return 32;
+        default: return 0;
+    }
+}
+
+/* ============================================================
+   获取 IV 长度
+   ============================================================ */
+static int sp_get_iv_len(sp_cipher_t cipher) {
+    switch (cipher) {
+        case SP_CIPHER_AES_128_GCM: return 12;
+        case SP_CIPHER_AES_256_GCM: return 12;
+        case SP_CIPHER_AES_128_CBC: return 16;
+        case SP_CIPHER_AES_256_CBC: return 16;
+        case SP_CIPHER_AES_128_XTS: return 16;
+        case SP_CIPHER_AES_256_XTS: return 16;
+        case SP_CIPHER_CHACHA20_POLY1305: return 12;
+        default: return 0;
+    }
+}
+
+/* ============================================================
+   AEAD 加密 (AES-GCM / ChaCha20-Poly1305)
+   ============================================================ */
+int sp_aead_encrypt(sp_cipher_t cipher, const uint8_t *key, uint32_t key_len,
+                     const uint8_t *iv, uint32_t iv_len,
+                     const uint8_t *aad, uint32_t aad_len,
+                     const uint8_t *plaintext, uint32_t pt_len,
+                     uint8_t *ciphertext, uint32_t *out_len,
+                     uint8_t *tag, uint32_t *tag_len) {
+    struct crypto_aead *tfm;
+    struct aead_request *req;
+    struct scatterlist sg[2];
+    uint8_t *data;
+    int ret;
+    const char *alg_name;
+    
+    alg_name = sp_get_cipher_name(cipher);
+    if (!alg_name) {
+        return -EINVAL;
+    }
+    
+    // 分配 AEAD 上下文
+    tfm = crypto_alloc_aead(alg_name, 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+    
+    // 设置密钥
+    ret = crypto_aead_setkey(tfm, key, key_len);
+    if (ret < 0) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    // 设置 tag 大小
+    ret = crypto_aead_setauthsize(tfm, 16);  // 128-bit tag
+    if (ret < 0) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    // 分配请求
+    req = aead_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+    
+    // 准备数据（AEAD 需要 in-place 操作）
+    data = kmalloc(pt_len + crypto_aead_authsize(tfm), GFP_KERNEL);
+    if (!data) {
+        aead_request_free(req);
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+    
+    memcpy(data, plaintext, pt_len);
+    
+    // 设置 scatterlist
+    sg_init_one(&sg[0], data, pt_len + crypto_aead_authsize(tfm));
+    
+    // 设置请求
+    aead_request_set_crypt(req, sg, sg, pt_len, iv);
+    aead_request_set_ad(req, aad_len);
+    
+    // 执行加密
+    ret = crypto_aead_encrypt(req);
+    if (ret < 0) {
+        kfree(data);
+        aead_request_free(req);
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    // 复制结果
+    memcpy(ciphertext, data, pt_len);
+    *out_len = pt_len;
+    
+    // 复制 tag（在数据末尾）
+    memcpy(tag, data + pt_len, 16);
+    *tag_len = 16;
+    
+    kfree(data);
+    aead_request_free(req);
+    crypto_free_aead(tfm);
+    
+    return 0;
+}
+
+/* ============================================================
+   AEAD 解密
+   ============================================================ */
+int sp_aead_decrypt(sp_cipher_t cipher, const uint8_t *key, uint32_t key_len,
+                     const uint8_t *iv, uint32_t iv_len,
+                     const uint8_t *aad, uint32_t aad_len,
+                     const uint8_t *ciphertext, uint32_t ct_len,
+                     const uint8_t *tag, uint32_t tag_len,
+                     uint8_t *plaintext, uint32_t *out_len) {
+    struct crypto_aead *tfm;
+    struct aead_request *req;
+    struct scatterlist sg[2];
+    uint8_t *data;
+    int ret;
+    const char *alg_name;
+    
+    alg_name = sp_get_cipher_name(cipher);
+    if (!alg_name) {
+        return -EINVAL;
+    }
+    
+    tfm = crypto_alloc_aead(alg_name, 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+    
+    ret = crypto_aead_setkey(tfm, key, key_len);
+    if (ret < 0) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    ret = crypto_aead_setauthsize(tfm, tag_len);
+    if (ret < 0) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    req = aead_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+    
+    // 准备数据（密文 + tag）
+    data = kmalloc(ct_len + tag_len, GFP_KERNEL);
+    if (!data) {
+        aead_request_free(req);
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+    
+    memcpy(data, ciphertext, ct_len);
+    memcpy(data + ct_len, tag, tag_len);
+    
+    sg_init_one(&sg[0], data, ct_len + tag_len);
+    
+    aead_request_set_crypt(req, sg, sg, ct_len, iv);
+    aead_request_set_ad(req, aad_len);
+    
+    ret = crypto_aead_decrypt(req);
+    if (ret < 0) {
+        kfree(data);
+        aead_request_free(req);
+        crypto_free_aead(tfm);
+        return ret;
+    }
+    
+    memcpy(plaintext, data, ct_len);
+    *out_len = ct_len;
+    
+    kfree(data);
+    aead_request_free(req);
+    crypto_free_aead(tfm);
+    
+    return 0;
+}
+```
+
+5.3 哈希
+
+```c
+// sp/src/sp_hash.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+
+/* ============================================================
+   获取哈希算法名称
+   ============================================================ */
+static const char *sp_get_hash_name(sp_hash_t hash) {
+    switch (hash) {
+        case SP_HASH_SHA1: return "sha1";
+        case SP_HASH_SHA256: return "sha256";
+        case SP_HASH_SHA512: return "sha512";
+        case SP_HASH_SHA3_256: return "sha3-256";
+        case SP_HASH_SHA3_512: return "sha3-512";
+        default: return NULL;
+    }
+}
+
+/* ============================================================
+   获取哈希输出长度
+   ============================================================ */
+static int sp_get_hash_len(sp_hash_t hash) {
+    switch (hash) {
+        case SP_HASH_SHA1: return 20;
+        case SP_HASH_SHA256: return 32;
+        case SP_HASH_SHA512: return 64;
+        case SP_HASH_SHA3_256: return 32;
+        case SP_HASH_SHA3_512: return 64;
+        default: return 0;
+    }
+}
+
+/* ============================================================
+   计算哈希
+   ============================================================ */
+int sp_hash_compute(sp_hash_t hash, const uint8_t *data, uint32_t data_len,
+                     uint8_t *out_hash, uint32_t *out_len) {
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int ret;
+    const char *alg_name;
+    int hash_len;
+    
+    alg_name = sp_get_hash_name(hash);
+    if (!alg_name) {
+        return -EINVAL;
+    }
+    
+    hash_len = sp_get_hash_len(hash);
+    if (hash_len == 0) {
+        return -EINVAL;
+    }
+    
+    tfm = crypto_alloc_shash(alg_name, 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+    
+    desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(tfm),
+                   GFP_KERNEL);
+    if (!desc) {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+    
+    desc->tfm = tfm;
+    
+    ret = crypto_shash_digest(desc, data, data_len, out_hash);
+    if (ret < 0) {
+        kfree(desc);
+        crypto_free_shash(tfm);
+        return ret;
+    }
+    
+    *out_len = hash_len;
+    
+    kfree(desc);
+    crypto_free_shash(tfm);
+    
+    return 0;
+}
+```
+
+5.4 密钥管理
+
+```c
+// sp/src/sp_key.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include <crypto/akcipher.h>
+#include <crypto/ecdh.h>
+#include <crypto/ecdsa.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+
+/* ============================================================
+   生成 RSA 密钥对 (简化版)
+   ============================================================ */
+int sp_gen_rsa_key(uint32_t bits, uint8_t **pubkey, uint32_t *pubkey_len,
+                    uint8_t **privkey, uint32_t *privkey_len) {
+    // 实际实现需要使用内核的 akcipher API
+    // 或者通过 OpenSSL 生成后导入
+    // 这里给出框架
+    
+    struct crypto_akcipher *tfm;
+    int ret;
+    
+    // 分配 akcipher 上下文
+    tfm = crypto_alloc_akcipher("rsa", 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+    
+    // 生成密钥对 (需要实现)
+    // ...
+    
+    crypto_free_akcipher(tfm);
+    return 0;
+}
+
+/* ============================================================
+   生成 ECDSA 密钥对
+   ============================================================ */
+int sp_gen_ecdsa_key(sp_asym_t algorithm, uint8_t **pubkey, uint32_t *pubkey_len,
+                      uint8_t **privkey, uint32_t *privkey_len) {
+    // 实际实现需要使用内核的 ecdsa 或 ecdh API
+    // 这里给出框架
+    return 0;
+}
+
+/* ============================================================
+   存储密钥
+   ============================================================ */
+uint32_t sp_key_store(sp_asym_t algorithm,
+                       const uint8_t *pubkey, uint32_t pubkey_len,
+                       const uint8_t *privkey, uint32_t privkey_len) {
+    sp_key_t *key;
+    uint32_t key_id;
+    
+    key = kmalloc(sizeof(sp_key_t), GFP_KERNEL);
+    if (!key) {
+        return 0;
+    }
+    
+    key_id = g_sp_ctx.next_key_id++;
+    key->key_id = key_id;
+    key->algorithm = algorithm;
+    
+    key->public_key = kmalloc(pubkey_len, GFP_KERNEL);
+    if (key->public_key) {
+        memcpy(key->public_key, pubkey, pubkey_len);
+        key->public_len = pubkey_len;
+    }
+    
+    key->private_key = kmalloc(privkey_len, GFP_KERNEL);
+    if (key->private_key) {
+        memcpy(key->private_key, privkey, privkey_len);
+        key->private_len = privkey_len;
+    }
+    
+    key->created_at = get_jiffies_64();
+    key->expires_at = 0;
+    key->revoked = 0;
+    
+    key->next = g_sp_ctx.keys;
+    g_sp_ctx.keys = key;
+    
+    return key_id;
+}
+
+/* ============================================================
+   获取公钥
+   ============================================================ */
+int sp_key_get_public(uint32_t key_id, uint8_t **pubkey, uint32_t *pubkey_len) {
+    sp_key_t *key = g_sp_ctx.keys;
+    
+    while (key) {
+        if (key->key_id == key_id && !key->revoked) {
+            *pubkey_len = key->public_len;
+            *pubkey = kmalloc(key->public_len, GFP_KERNEL);
+            if (!*pubkey) {
+                return -ENOMEM;
+            }
+            memcpy(*pubkey, key->public_key, key->public_len);
+            return 0;
+        }
+        key = key->next;
+    }
+    
+    return -ENOENT;
+}
+
+/* ============================================================
+   撤销密钥
+   ============================================================ */
+int sp_key_revoke(uint32_t key_id) {
+    sp_key_t *key = g_sp_ctx.keys;
+    
+    while (key) {
+        if (key->key_id == key_id) {
+            key->revoked = 1;
+            return 0;
+        }
+        key = key->next;
+    }
+    
+    return -ENOENT;
+}
+```
+
+5.5 认证与授权
+
+```c
+// sp/src/sp_auth.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/cred.h>
+#include <linux/security.h>
+#include <linux/sched.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+
+/* ============================================================
+   身份认证
+   ============================================================ */
+int sp_authenticate(const char *user, const char *password, char *session_id) {
+    // 实际实现需要连接到用户数据库或 PAM
+    // 这里给出框架
+    
+    // 1. 查找用户
+    // 2. 验证密码 (使用 SP_HASH_SHA256)
+    // 3. 生成 session_id
+    // 4. 缓存认证结果
+    
+    // 简化版：硬编码测试用户
+    if (strcmp(user, "admin") == 0 && strcmp(password, "hwrun") == 0) {
+        snprintf(session_id, 64, "session-%ld-%s", get_jiffies_64(), user);
+        return 0;
+    }
+    
+    return -EPERM;
+}
+
+/* ============================================================
+   权限检查 (通过 LSM)
+   ============================================================ */
+int sp_authorize(const char *user, const char *action, const char *target) {
+    // 实际实现需要集成 Linux 的 LSM 框架
+    // 或者实现一个简单的 RBAC 系统
+    
+    // 简化版：admin 用户拥有所有权限
+    if (strcmp(user, "admin") == 0) {
+        return 0;
+    }
+    
+    // 其他用户只能读取
+    if (strcmp(action, "fs.read") == 0) {
+        return 0;
+    }
+    
+    return -EACCES;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// sp/src/sp_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "sp.h"
+#include "sp_ipc.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void sp_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case SP_MSG_ENCRYPT: {
+            sp_crypto_req_t *req = (sp_crypto_req_t *)data;
+            sp_crypto_resp_t resp;
+            // 分配输出缓冲区
+            resp.out_data = kmalloc(req->data_len + 16, GFP_KERNEL);
+            resp.tag = kmalloc(16, GFP_KERNEL);
+            
+            int ret = sp_aead_encrypt(req->cipher, req->key, req->key_len,
+                                       req->iv, req->iv_len,
+                                       req->aad, req->aad_len,
+                                       req->data, req->data_len,
+                                       resp.out_data, &resp.out_len,
+                                       resp.tag, &resp.tag_len);
+            resp.error = ret;
+            
+            // 发送响应（需要发送 out_data 和 tag 作为附加数据）
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case SP_MSG_DECRYPT: {
+            // 类似加密的实现
+            break;
+        }
+        
+        case SP_MSG_HASH: {
+            sp_hash_req_t *req = (sp_hash_req_t *)data;
+            sp_hash_resp_t resp;
+            resp.hash = kmalloc(64, GFP_KERNEL);  // 最大哈希长度
+            
+            int ret = sp_hash_compute(req->hash, req->data, req->data_len,
+                                       resp.hash, &resp.hash_len);
+            resp.error = ret;
+            
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case SP_MSG_GEN_KEY: {
+            sp_genkey_req_t *req = (sp_genkey_req_t *)data;
+            sp_genkey_resp_t resp;
+            
+            // 生成密钥对
+            // 存储密钥
+            resp.key_id = sp_key_store(req->algorithm, resp.pubkey, ...);
+            resp.error = 0;
+            
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case SP_MSG_AUTH: {
+            sp_auth_req_t *req = (sp_auth_req_t *)data;
+            char session_id[64];
+            int ret = sp_authenticate(req->user, req->password, session_id);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case SP_MSG_AUTHORIZE: {
+            sp_authorize_req_t *req = (sp_authorize_req_t *)data;
+            int ret = sp_authorize(req->user, req->action, req->target);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun SP: Unknown IPC message type: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/sp/plugin.yml
+plugin:
+  id: "sp"
+  name: "Security Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 安全协议，提供认证、授权、加密、解密、哈希、签名、密钥管理等安全功能"
+  
+  provides:
+    - protocol: "SP"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+  
+  params:
+    - key: "sp.default_cipher"
+      type: "string"
+      default: "AES-256-GCM"
+      description: "默认加密算法"
+    - key: "sp.key_rotation_days"
+      type: "int"
+      default: 90
+      description: "密钥轮换周期"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/sp.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# sp/Makefile
+
+obj-m += sp.o
+
+sp-objs := sp.o sp_crypto.o sp_hash.o sp_key.o sp_auth.o sp_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 sp.ko /usr/lib/hwrun/plugins/
+```
+
+七、命令行接口
+
+```bash
+# 加密
+hwrun sp encrypt --cipher AES-256-GCM --key <key> --iv <iv> --data "hello"
+
+# 解密
+hwrun sp decrypt --cipher AES-256-GCM --key <key> --iv <iv> --data <ciphertext>
+
+# 哈希
+hwrun sp hash --algo SHA-256 --data "hello"
+
+# 签名
+hwrun sp sign --key-id 1 --data "hello"
+
+# 验签
+hwrun sp verify --key-id 1 --data "hello" --signature <sig>
+
+# 密钥管理
+hwrun sp gen-key --algo RSA-2048
+hwrun sp get-pubkey --key-id 1
+hwrun sp revoke-key --key-id 1
+
+# 认证
+hwrun sp auth --user admin --password hwrun
+
+# 授权
+hwrun sp authorize --user admin --action fs.read --target /etc/hwrun
+```
+
+八、总结
+
+维度 决策
+定位 安全协议，所有安全操作的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~1500-2000 行 C
+提供协议 SP (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP
+加载时机 在 PERMISSION、CLUSTER、CONTAINER 等依赖安全功能的插件之前
+关键功能 认证/授权/加密/解密/哈希/签名/验签/密钥管理
+
+SP 是 HWRun OS 中第五个加载的硬件相关插件（HAP → PMP → FSP → NP → SP）。它作为内核模块运行，直接操作 Linux 内核的安全子系统（Crypto API、Keyring、LSM、IMA），通过 SP 协议向上层插件提供完整的加密、认证、授权、签名、密钥管理等安全功能。上层插件（PERMISSION、CLUSTER、FS_TRANSFER、CONTAINER、NODE_DISCOVERY 等）通过 SP 协议进行安全操作，不直接操作内核安全子系统。

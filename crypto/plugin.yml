@@ -1,0 +1,37 @@
+# HWRun OS CRYPTO 协议插件描述
+# 加密协议（SP 的安全协议子模块，依赖链第 7 环）
+id: "crypto"
+name: "Cryptographic Protocol (SP submodule)"
+version: "1.0.0"
+type: "crypto"
+
+description: "HWRun OS 加密协议，提供对称/非对称加密、哈希、HMAC、签名、密钥管理与安全随机数"
+
+provides:
+  - protocol: "CRYPTO"
+    version: "1.0"
+
+requires:
+  - protocol: "SP"
+    version: "1.0"
+  - protocol: "PARAM"
+    version: "1.0"
+  - protocol: "LOG"
+    version: "1.0"
+  - protocol: "METAPROTO"
+    version: "1.0"
+
+conflicts: []
+
+params:
+  - key: "crypto.keys.default_lifetime"
+    type: "int"
+    default: "86400"
+    description: "默认密钥有效期 (秒)"
+  - key: "crypto.keys.allow_persistent"
+    type: "bool"
+    default: "true"
+    description: "是否允许持久密钥"
+
+build:
+  output: "crypto/build/crypto.so"

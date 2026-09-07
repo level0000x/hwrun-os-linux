@@ -1,0 +1,1472 @@
+﻿HWRun OS CLUSTER 实现文档
+
+模块名称： CLUSTER (Cluster Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 集群管理协议，提供节点发现、成员管理、领导者选举、状态同步等分布式集群管理功能
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、NP（网络协议）、GIT（版本同步）
+提供协议： CLUSTER
+
+一、设计哲学
+
+1.1 核心定位
+
+CLUSTER 是 HWRun OS 的分布式集群核心——所有与节点发现、成员管理、领导者选举、集群状态同步相关的操作都通过 CLUSTER 协议进行。
+
+```
+CLUSTER = 集群管理协议 = 分布式集群操作的统一入口
+
+上层插件 (INSTANCE, NODE_DISCOVERY, CONSENSUS, CROSS_REGION, MONITOR, ...)
+    │
+    │  通过 CLUSTER 协议管理集群
+    ▼
+CLUSTER 插件 (内核模块)
+    │
+    │  Gossip 协议 (成员发现与故障检测)
+    │  Raft 共识 (领导者选举与配置管理)
+    │  Git 同步 (状态持久化与跨节点同步)
+    ▼
+Linux 内核 (网络 / 文件系统)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有集群操作通过 CLUSTER 协议进行
+2. 去中心化：无单点故障，所有节点对等
+3. Gossip 成员管理：基于 SWIM 协议的 gossip 风格成员发现与故障检测
+4. Raft 领导者选举：使用 Raft 共识算法进行领导者选举和集群配置管理
+5. Git 状态同步：通过 Git 仓库同步集群配置和状态
+6. 最终一致性：集群状态最终一致，容忍网络分区
+
+1.3 CLUSTER 插件的本质
+
+CLUSTER 插件 = Gossip 成员管理 + Raft 领导者选举 + Git 状态同步
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CLUSTER 插件架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  CLUSTER 协议接口 (通过 IPC 调用)                                   │   │
+│  │  Join / Leave / GetNodes / GetNodeInfo / GetLeader / Sync          │   │
+│  │  ElectLeader / Membership / Gossip                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  成员管理 (Membership)                                              │   │
+│  │  ├── Gossip 协议 (SWIM 风格)                                      │   │
+│  │  │   ├── PING / INDIRECT-PING / ACK 探测                         │   │
+│  │  │   ├── 随机传播成员更新                                         │   │
+│  │  │   └── 故障检测与标记                                           │   │
+│  │  └── 成员状态维护                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  领导者选举 (Raft Consensus)                                       │   │
+│  │  ├── 领导者选举 (Leader Election)                                 │   │
+│  │  ├── 任期管理 (Term)                                              │   │
+│  │  ├── 心跳检测 (Heartbeat)                                         │   │
+│  │  └── 集群配置变更 (Joint Consensus) [reference:4]                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  状态同步 (Git Sync)                                               │   │
+│  │  ├── 集群配置持久化                                                │   │
+│  │  ├── 跨节点 Git 同步                                              │   │
+│  │  └── 状态冲突解决                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  NP (网络通信) / GIT (状态存储)                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 CLUSTER 插件的组成
+
+```
+CLUSTER 插件 (cluster.ko)
+├── 协议处理层
+│   ├── cluster_ipc_handler()    ← IPC 消息分发
+│   ├── cluster_join()           ← 节点加入集群
+│   ├── cluster_leave()          ← 节点离开集群
+│   ├── cluster_get_nodes()      ← 获取节点列表
+│   ├── cluster_get_leader()     ← 获取领导者节点
+│   ├── cluster_sync()           ← 集群状态同步
+│   └── cluster_elect()          ← 触发领导者选举
+│
+├── 成员管理层
+│   ├── cluster_membership.c     ← 成员管理核心
+│   ├── cluster_gossip.c         ← Gossip 协议实现
+│   └── cluster_failure.c        ← 故障检测
+│
+├── 共识层
+│   ├── cluster_raft.c           ← Raft 共识实现
+│   ├── cluster_raft_log.c       ← Raft 日志管理
+│   └── cluster_raft_election.c  ← 领导者选举
+│
+├── 同步层
+│   └── cluster_sync.c           ← Git 同步实现
+│
+└── 初始化/清理
+    ├── cluster_init()           ← 模块加载
+    └── cluster_exit()           ← 模块卸载
+```
+
+2.2 CLUSTER 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → 其他插件
+                                                                                                   ↑
+                                                                                        CLUSTER 在这里加载
+```
+
+CLUSTER 是第七个加载的核心功能插件。在它之后，依赖集群管理的插件（INSTANCE、NODE_DISCOVERY、CONSENSUS、CROSS_REGION 等）才能正常工作。
+
+2.3 CLUSTER 的上层消费者
+
+上层插件 需要 CLUSTER 提供什么
+INSTANCE（实例管理） 跨节点实例调度、节点选择
+NODE_DISCOVERY（节点发现） 节点发现、成员变更通知
+CONSENSUS（共识协议） Raft 共识底层
+CROSS_REGION（跨地域） 跨地域组网、中继节点发现
+MONITOR（监控） 集群状态监控
+PERMISSION（权限） 集群级权限管理
+
+三、核心数据结构
+
+```c
+// cluster/include/cluster.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   节点状态
+   ============================================================ */
+typedef enum {
+    NODE_STATE_ALIVE = 0,           // 在线
+    NODE_STATE_SUSPECT,             // 疑似离线（待确认）
+    NODE_STATE_DEAD,                // 已确认离线
+    NODE_STATE_LEFT,                // 主动离开
+} node_state_t;
+
+/* ============================================================
+   节点角色 (Raft 角色)
+   ============================================================ */
+typedef enum {
+    RAFT_ROLE_FOLLOWER = 0,
+    RAFT_ROLE_CANDIDATE,
+    RAFT_ROLE_LEADER,
+} raft_role_t;
+
+/* ============================================================
+   节点信息
+   ============================================================ */
+typedef struct cluster_node {
+    char node_id[64];               // 节点唯一 ID
+    char hostname[128];             // 主机名
+    uint32_t ip;                    // IP 地址
+    uint16_t port;                  // 通信端口
+    node_state_t state;             // 节点状态
+    raft_role_t role;               // Raft 角色
+    uint64_t term;                  // 当前任期
+    uint64_t last_heartbeat;        // 最后心跳时间
+    uint64_t joined_at;             // 加入时间
+    uint32_t version;               // 节点版本号（用于冲突检测）
+    uint8_t capabilities[32];       // 能力位掩码
+    struct cluster_node *next;
+} cluster_node_t;
+
+/* ============================================================
+   Gossip 消息
+   ============================================================ */
+typedef enum {
+    GOSSIP_MSG_JOIN = 0,
+    GOSSIP_MSG_LEAVE,
+    GOSSIP_MSG_PING,
+    GOSSIP_MSG_ACK,
+    GOSSIP_MSG_INDIRECT_PING,
+    GOSSIP_MSG_SUSPECT,
+    GOSSIP_MSG_ALIVE,
+    GOSSIP_MSG_DEAD,
+    GOSSIP_MSG_SYNC,
+} gossip_msg_type_t;
+
+typedef struct gossip_message {
+    gossip_msg_type_t type;
+    char sender_id[64];             // 发送者 ID
+    char target_id[64];             // 目标 ID（用于 PING）
+    uint64_t seq;                   // 序列号
+    uint64_t timestamp;
+    uint32_t ttl;                   // 生存时间（跳数）
+    
+    // 携带的成员信息
+    uint32_t member_count;
+    struct {
+        char node_id[64];
+        uint32_t ip;
+        uint16_t port;
+        node_state_t state;
+        uint64_t term;
+    } members[16];
+    
+    // 用户数据
+    uint8_t data[256];
+} gossip_message_t;
+
+/* ============================================================
+   Raft 日志条目
+   ============================================================ */
+typedef enum {
+    RAFT_LOG_COMMAND = 0,
+    RAFT_LOG_CONFIG_CHANGE,
+    RAFT_LOG_NOOP,
+} raft_log_type_t;
+
+typedef struct raft_log_entry {
+    uint64_t index;
+    uint64_t term;
+    raft_log_type_t type;
+    uint32_t data_len;
+    uint8_t *data;
+    struct raft_log_entry *next;
+} raft_log_entry_t;
+
+/* ============================================================
+   Raft 状态
+   ============================================================ */
+typedef struct raft_state {
+    raft_role_t role;
+    uint64_t current_term;
+    char voted_for[64];             // 当前任期投票给谁
+    raft_log_entry_t *log;          // 日志链表
+    uint64_t commit_index;
+    uint64_t last_applied;
+    uint64_t last_log_index;
+    uint64_t last_log_term;
+    uint64_t election_timeout;      // 选举超时 (ms)
+    uint64_t heartbeat_interval;    // 心跳间隔 (ms)
+    uint64_t last_heartbeat_time;
+} raft_state_t;
+
+/* ============================================================
+   集群配置
+   ============================================================ */
+typedef struct cluster_config {
+    char cluster_name[64];          // 集群名称
+    uint64_t cluster_id;
+    uint32_t expected_nodes;
+    uint32_t min_nodes;
+    uint32_t version;
+    uint64_t updated_at;
+} cluster_config_t;
+
+/* ============================================================
+   CLUSTER 上下文
+   ============================================================ */
+typedef struct cluster_context {
+    int initialized;
+    uint64_t cluster_task_id;       // CLUSTER 自身的任务 ID
+    
+    // 节点信息
+    cluster_node_t *nodes;          // 节点列表
+    uint32_t node_count;
+    cluster_node_t *self;           // 自身节点信息
+    
+    // 集群配置
+    cluster_config_t config;
+    
+    // Raft 状态
+    raft_state_t raft;
+    
+    // Gossip 状态
+    uint64_t gossip_seq;
+    uint64_t gossip_interval;       // Gossip 传播间隔 (ms)
+    uint64_t gossip_fanout;         // 每次传播的节点数
+    
+    // 故障检测
+    uint64_t suspect_timeout;       // 怀疑超时 (ms)
+    uint64_t dead_timeout;          // 确认死亡超时 (ms)
+    
+    // 同步状态
+    int sync_enabled;
+    char git_repo_path[256];
+    
+    // 锁
+    void *lock;
+} cluster_context_t;
+```
+
+四、CLUSTER 协议定义
+
+```protobuf
+// protocols/cluster.proto
+syntax = "proto3";
+
+package hwrun.cluster;
+
+service Cluster {
+    // === 节点管理 ===
+    rpc Join(JoinRequest) returns (JoinResponse);
+    rpc Leave(LeaveRequest) returns (LeaveResponse);
+    rpc GetNodes(Empty) returns (GetNodesResponse);
+    rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+    
+    // === 领导者管理 ===
+    rpc GetLeader(Empty) returns (GetLeaderResponse);
+    rpc ElectLeader(ElectLeaderRequest) returns (ElectLeaderResponse);
+    
+    // === 集群管理 ===
+    rpc Sync(SyncRequest) returns (SyncResponse);
+    rpc Membership(MembershipRequest) returns (MembershipResponse);
+    rpc Gossip(GossipRequest) returns (GossipResponse);
+}
+
+message Empty {}
+
+// ============ 节点管理 ============
+
+message JoinRequest {
+    string node_id = 1;
+    string hostname = 2;
+    uint32 ip = 3;
+    uint16 port = 4;
+    string token = 5;
+}
+
+message JoinResponse {
+    bool success = 1;
+    string leader_id = 2;
+    repeated NodeInfo existing_nodes = 3;
+    int32 error = 4;
+}
+
+message LeaveRequest {
+    string node_id = 1;
+}
+
+message LeaveResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message GetNodeInfoRequest {
+    string node_id = 1;
+}
+
+message GetNodeInfoResponse {
+    NodeInfo node = 1;
+    int32 error = 2;
+}
+
+message GetNodesResponse {
+    repeated NodeInfo nodes = 1;
+    uint32 total = 2;
+    string leader_id = 3;
+    int32 error = 4;
+}
+
+message NodeInfo {
+    string node_id = 1;
+    string hostname = 2;
+    uint32 ip = 3;
+    uint16 port = 4;
+    string state = 5;               // "alive", "suspect", "dead", "left"
+    string role = 6;                // "follower", "candidate", "leader"
+    uint64 term = 7;
+    uint64 joined_at = 8;
+    repeated string capabilities = 9;
+}
+
+// ============ 领导者管理 ============
+
+message GetLeaderResponse {
+    string leader_id = 1;
+    string hostname = 2;
+    uint32 ip = 3;
+    uint16 port = 4;
+    uint64 term = 5;
+    int32 error = 6;
+}
+
+message ElectLeaderRequest {
+    string node_id = 1;
+}
+
+message ElectLeaderResponse {
+    bool success = 1;
+    string leader_id = 2;
+    uint64 term = 3;
+    int32 error = 4;
+}
+
+// ============ 集群管理 ============
+
+message SyncRequest {
+    string source_node = 1;
+    uint64 version = 2;
+}
+
+message SyncResponse {
+    bool success = 1;
+    uint64 version = 2;
+    bytes cluster_state = 3;
+    int32 error = 4;
+}
+
+message MembershipRequest {
+    string node_id = 1;
+    string action = 2;              // "add", "remove", "promote", "demote"
+}
+
+message MembershipResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GossipRequest {
+    bytes message = 1;
+}
+
+message GossipResponse {
+    bool success = 1;
+    bytes reply = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// cluster/src/cluster.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include <linux/time.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+#include "cluster_membership.h"
+#include "cluster_gossip.h"
+#include "cluster_raft.h"
+#include "cluster_sync.h"
+#include "cluster_failure.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Cluster Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static cluster_context_t g_cluster_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init cluster_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun CLUSTER: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_cluster_ctx, 0, sizeof(cluster_context_t));
+    g_cluster_ctx.gossip_seq = 1;
+    g_cluster_ctx.gossip_interval = 1000;   // 1秒
+    g_cluster_ctx.gossip_fanout = 3;
+    g_cluster_ctx.suspect_timeout = 5000;   // 5秒
+    g_cluster_ctx.dead_timeout = 15000;     // 15秒
+    
+    // 2. 初始化 Raft 状态
+    g_cluster_ctx.raft.role = RAFT_ROLE_FOLLOWER;
+    g_cluster_ctx.raft.current_term = 0;
+    g_cluster_ctx.raft.election_timeout = 5000;   // 5秒
+    g_cluster_ctx.raft.heartbeat_interval = 1000; // 1秒
+    g_cluster_ctx.raft.last_heartbeat_time = 0;
+    
+    // 3. 注册 IPC 消息处理器
+    ret = cluster_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun CLUSTER: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 CLUSTER 协议（通过 METAPROTO - 通过 IPC）
+    cluster_register_protocol();
+    
+    // 5. 启动 Gossip 周期性任务
+    // 启动 Raft 选举定时器
+    // 启动故障检测定时器
+    
+    g_cluster_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun CLUSTER: Initialized successfully\n");
+    printk(KERN_INFO "  Gossip interval: %lu ms, fanout: %lu\n",
+           g_cluster_ctx.gossip_interval, g_cluster_ctx.gossip_fanout);
+    printk(KERN_INFO "  Election timeout: %lu ms\n",
+           g_cluster_ctx.raft.election_timeout);
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit cluster_exit(void) {
+    printk(KERN_INFO "HWRun CLUSTER: Exiting...\n");
+    
+    cluster_ipc_unregister();
+    
+    // 清理节点列表
+    cluster_cleanup_nodes();
+    
+    // 清理 Raft 日志
+    cluster_cleanup_raft_log();
+    
+    g_cluster_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun CLUSTER: Exited\n");
+}
+
+module_init(cluster_init);
+module_exit(cluster_exit);
+```
+
+5.2 节点加入
+
+```c
+// cluster/src/cluster_membership.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/random.h>
+#include <linux/time.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+#include "cluster_gossip.h"
+
+/* ============================================================
+   节点加入集群
+   ============================================================ */
+int cluster_join(const char *node_id, const char *hostname,
+                  uint32_t ip, uint16_t port, const char *token,
+                  char **leader_id, cluster_node_t **existing_nodes,
+                  uint32_t *existing_count) {
+    cluster_node_t *node;
+    cluster_node_t *leader = NULL;
+    uint32_t count = 0;
+    int ret;
+    
+    // 1. 检查是否已存在
+    node = cluster_find_node(node_id);
+    if (node) {
+        // 节点已存在，更新信息
+        node->state = NODE_STATE_ALIVE;
+        node->last_heartbeat = get_jiffies_64();
+        *leader_id = cluster_get_leader_id();
+        return 0;
+    }
+    
+    // 2. 创建新节点
+    node = kmalloc(sizeof(cluster_node_t), GFP_KERNEL);
+    if (!node) {
+        return -ENOMEM;
+    }
+    
+    memset(node, 0, sizeof(cluster_node_t));
+    strncpy(node->node_id, node_id, sizeof(node->node_id) - 1);
+    strncpy(node->hostname, hostname, sizeof(node->hostname) - 1);
+    node->ip = ip;
+    node->port = port;
+    node->state = NODE_STATE_ALIVE;
+    node->role = RAFT_ROLE_FOLLOWER;
+    node->term = g_cluster_ctx.raft.current_term;
+    node->joined_at = get_jiffies_64();
+    node->last_heartbeat = get_jiffies_64();
+    
+    // 3. 添加到节点列表
+    node->next = g_cluster_ctx.nodes;
+    g_cluster_ctx.nodes = node;
+    g_cluster_ctx.node_count++;
+    
+    // 4. 如果是第一个节点，成为领导者
+    if (g_cluster_ctx.node_count == 1) {
+        g_cluster_ctx.raft.role = RAFT_ROLE_LEADER;
+        g_cluster_ctx.raft.current_term = 1;
+        strncpy(g_cluster_ctx.raft.voted_for, node_id,
+                sizeof(g_cluster_ctx.raft.voted_for) - 1);
+        *leader_id = strdup(node_id);
+    } else {
+        // 查找当前领导者
+        *leader_id = cluster_get_leader_id();
+    }
+    
+    // 5. 通过 Gossip 传播新节点信息
+    cluster_gossip_broadcast(GOSSIP_MSG_JOIN, node_id);
+    
+    // 6. 返回现有节点列表
+    if (existing_nodes && existing_count) {
+        cluster_get_all_nodes(existing_nodes, existing_count);
+    }
+    
+    printk(KERN_INFO "HWRun CLUSTER: Node %s joined cluster\n", node_id);
+    return 0;
+}
+
+/* ============================================================
+   节点离开集群
+   ============================================================ */
+int cluster_leave(const char *node_id) {
+    cluster_node_t *node;
+    cluster_node_t *prev = NULL;
+    int found = 0;
+    
+    // 1. 查找节点
+    node = g_cluster_ctx.nodes;
+    while (node) {
+        if (strcmp(node->node_id, node_id) == 0) {
+            found = 1;
+            break;
+        }
+        prev = node;
+        node = node->next;
+    }
+    
+    if (!found) {
+        return -ENOENT;
+    }
+    
+    // 2. 标记为离开
+    node->state = NODE_STATE_LEFT;
+    
+    // 3. 通过 Gossip 传播离开消息
+    cluster_gossip_broadcast(GOSSIP_MSG_LEAVE, node_id);
+    
+    // 4. 如果是领导者，触发重新选举
+    if (g_cluster_ctx.raft.role == RAFT_ROLE_LEADER &&
+        strcmp(node_id, g_cluster_ctx.self->node_id) == 0) {
+        // 让出领导者地位
+        g_cluster_ctx.raft.role = RAFT_ROLE_FOLLOWER;
+        cluster_raft_start_election();
+    }
+    
+    printk(KERN_INFO "HWRun CLUSTER: Node %s left cluster\n", node_id);
+    return 0;
+}
+
+/* ============================================================
+   查找节点
+   ============================================================ */
+cluster_node_t *cluster_find_node(const char *node_id) {
+    cluster_node_t *node = g_cluster_ctx.nodes;
+    
+    while (node) {
+        if (strcmp(node->node_id, node_id) == 0) {
+            return node;
+        }
+        node = node->next;
+    }
+    
+    return NULL;
+}
+
+/* ============================================================
+   获取领导者 ID
+   ============================================================ */
+char *cluster_get_leader_id(void) {
+    cluster_node_t *node = g_cluster_ctx.nodes;
+    
+    while (node) {
+        if (node->role == RAFT_ROLE_LEADER) {
+            return node->node_id;
+        }
+        node = node->next;
+    }
+    
+    return NULL;
+}
+```
+
+5.3 Gossip 协议
+
+```c
+// cluster/src/cluster_gossip.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include <linux/time.h>
+#include <linux/workqueue.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+
+/* ============================================================
+   Gossip 广播（周期性调用）
+   ============================================================ */
+void cluster_gossip_broadcast(gossip_msg_type_t type, const char *target) {
+    gossip_message_t msg;
+    cluster_node_t *node;
+    int count = 0;
+    
+    memset(&msg, 0, sizeof(msg));
+    msg.type = type;
+    strncpy(msg.sender_id, g_cluster_ctx.self->node_id,
+            sizeof(msg.sender_id) - 1);
+    if (target) {
+        strncpy(msg.target_id, target, sizeof(msg.target_id) - 1);
+    }
+    msg.seq = g_cluster_ctx.gossip_seq++;
+    msg.timestamp = get_jiffies_64();
+    msg.ttl = 3;  // 最多传播 3 跳
+    
+    // 携带当前成员列表（部分）
+    node = g_cluster_ctx.nodes;
+    while (node && count < 16) {
+        strncpy(msg.members[count].node_id, node->node_id,
+                sizeof(msg.members[count].node_id) - 1);
+        msg.members[count].ip = node->ip;
+        msg.members[count].port = node->port;
+        msg.members[count].state = node->state;
+        msg.members[count].term = node->term;
+        count++;
+        node = node->next;
+    }
+    msg.member_count = count;
+    
+    // 随机选择 fanout 个节点发送
+    cluster_gossip_send_to_random(&msg, g_cluster_ctx.gossip_fanout);
+}
+
+/* ============================================================
+   发送 Gossip 消息到随机节点
+   ============================================================ */
+void cluster_gossip_send_to_random(gossip_message_t *msg, uint32_t fanout) {
+    cluster_node_t *node;
+    cluster_node_t *candidates[64];
+    uint32_t count = 0;
+    uint32_t sent = 0;
+    
+    // 收集所有在线节点（排除自己）
+    node = g_cluster_ctx.nodes;
+    while (node && count < 64) {
+        if (strcmp(node->node_id, g_cluster_ctx.self->node_id) != 0 &&
+            node->state == NODE_STATE_ALIVE) {
+            candidates[count++] = node;
+        }
+        node = node->next;
+    }
+    
+    if (count == 0) {
+        return;
+    }
+    
+    // 随机打乱并发送
+    for (uint32_t i = 0; i < count && sent < fanout; i++) {
+        uint32_t idx = get_random_u32() % count;
+        cluster_ipc_send_gossip(candidates[idx], msg);
+        sent++;
+    }
+}
+
+/* ============================================================
+   接收并处理 Gossip 消息
+   ============================================================ */
+void cluster_gossip_receive(gossip_message_t *msg) {
+    cluster_node_t *node;
+    int updated = 0;
+    
+    // 1. 更新发送者信息
+    node = cluster_find_node(msg->sender_id);
+    if (node) {
+        node->last_heartbeat = get_jiffies_64();
+        if (node->state == NODE_STATE_SUSPECT ||
+            node->state == NODE_STATE_DEAD) {
+            node->state = NODE_STATE_ALIVE;
+            updated = 1;
+        }
+    }
+    
+    // 2. 处理消息中的成员列表
+    for (uint32_t i = 0; i < msg->member_count; i++) {
+        node = cluster_find_node(msg->members[i].node_id);
+        if (!node) {
+            // 发现新节点（通过 Gossip）
+            node = kmalloc(sizeof(cluster_node_t), GFP_KERNEL);
+            if (node) {
+                memset(node, 0, sizeof(cluster_node_t));
+                strncpy(node->node_id, msg->members[i].node_id,
+                        sizeof(node->node_id) - 1);
+                node->ip = msg->members[i].ip;
+                node->port = msg->members[i].port;
+                node->state = msg->members[i].state;
+                node->term = msg->members[i].term;
+                node->joined_at = get_jiffies_64();
+                node->last_heartbeat = get_jiffies_64();
+                node->next = g_cluster_ctx.nodes;
+                g_cluster_ctx.nodes = node;
+                g_cluster_ctx.node_count++;
+                updated = 1;
+            }
+        } else if (node->state != msg->members[i].state) {
+            // 状态不一致，以较新的为准
+            if (msg->members[i].term > node->term) {
+                node->state = msg->members[i].state;
+                node->term = msg->members[i].term;
+                updated = 1;
+            }
+        }
+    }
+    
+    // 3. 处理特定消息类型
+    switch (msg->type) {
+        case GOSSIP_MSG_JOIN:
+            printk(KERN_DEBUG "HWRun CLUSTER: Gossip JOIN from %s\n",
+                   msg->sender_id);
+            // 如果消息还要继续传播（TTL > 0）
+            if (msg->ttl > 0) {
+                msg->ttl--;
+                cluster_gossip_send_to_random(msg, 1);
+            }
+            break;
+            
+        case GOSSIP_MSG_LEAVE:
+            printk(KERN_DEBUG "HWRun CLUSTER: Gossip LEAVE from %s\n",
+                   msg->sender_id);
+            node = cluster_find_node(msg->sender_id);
+            if (node) {
+                node->state = NODE_STATE_LEFT;
+            }
+            if (msg->ttl > 0) {
+                msg->ttl--;
+                cluster_gossip_send_to_random(msg, 1);
+            }
+            break;
+            
+        case GOSSIP_MSG_SUSPECT:
+            // 怀疑节点离线
+            cluster_failure_handle_suspect(msg->target_id);
+            break;
+            
+        case GOSSIP_MSG_DEAD:
+            // 确认节点死亡
+            cluster_failure_handle_dead(msg->target_id);
+            break;
+            
+        default:
+            break;
+    }
+}
+```
+
+5.4 故障检测
+
+```c
+// cluster/src/cluster_failure.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/time.h>
+#include <linux/workqueue.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+#include "cluster_gossip.h"
+
+/* ============================================================
+   故障检测定时器（周期性调用）
+   ============================================================ */
+void cluster_failure_detect(void) {
+    cluster_node_t *node;
+    uint64_t now = get_jiffies_64();
+    uint64_t timeout_ms;
+    
+    node = g_cluster_ctx.nodes;
+    while (node) {
+        if (strcmp(node->node_id, g_cluster_ctx.self->node_id) == 0) {
+            node = node->next;
+            continue;
+        }
+        
+        timeout_ms = (node->last_heartbeat == 0) ?
+                     g_cluster_ctx.suspect_timeout :
+                     (now - node->last_heartbeat);
+        
+        // 检查节点状态
+        switch (node->state) {
+            case NODE_STATE_ALIVE:
+                // 如果超时未收到心跳，标记为怀疑
+                if (timeout_ms > g_cluster_ctx.suspect_timeout) {
+                    node->state = NODE_STATE_SUSPECT;
+                    // 广播怀疑消息
+                    cluster_gossip_broadcast(GOSSIP_MSG_SUSPECT, node->node_id);
+                    printk(KERN_WARNING "HWRun CLUSTER: Node %s suspected dead\n",
+                           node->node_id);
+                }
+                break;
+                
+            case NODE_STATE_SUSPECT:
+                // 如果怀疑时间超过死亡超时，确认死亡
+                if (timeout_ms > g_cluster_ctx.dead_timeout) {
+                    node->state = NODE_STATE_DEAD;
+                    cluster_gossip_broadcast(GOSSIP_MSG_DEAD, node->node_id);
+                    printk(KERN_WARNING "HWRun CLUSTER: Node %s confirmed dead\n",
+                           node->node_id);
+                    
+                    // 如果是领导者死亡，触发重新选举
+                    if (strcmp(node->node_id, cluster_get_leader_id()) == 0) {
+                        cluster_raft_start_election();
+                    }
+                }
+                break;
+                
+            default:
+                break;
+        }
+        
+        node = node->next;
+    }
+}
+
+/* ============================================================
+   处理怀疑消息
+   ============================================================ */
+void cluster_failure_handle_suspect(const char *node_id) {
+    cluster_node_t *node = cluster_find_node(node_id);
+    if (node && node->state == NODE_STATE_ALIVE) {
+        // 如果节点仍然活着，可能是误报
+        // 尝试直接 PING 确认
+        if (cluster_failure_ping_node(node) == 0) {
+            // PING 成功，恢复状态
+            node->state = NODE_STATE_ALIVE;
+            node->last_heartbeat = get_jiffies_64();
+            cluster_gossip_broadcast(GOSSIP_MSG_ALIVE, node_id);
+            printk(KERN_INFO "HWRun CLUSTER: Node %s recovered from suspect\n",
+                   node_id);
+        }
+    }
+}
+
+/* ============================================================
+   PING 节点（直接探测）
+   ============================================================ */
+int cluster_failure_ping_node(cluster_node_t *node) {
+    // 通过 NP 协议发送 PING 消息
+    // 等待 ACK 响应
+    // 返回 0 表示成功，-1 表示失败
+    
+    // 实际实现中通过 IPC 调用 NP 协议
+    // 这里给出框架
+    return cluster_ipc_ping_node(node->ip, node->port);
+}
+```
+
+5.5 Raft 领导者选举
+
+```c
+// cluster/src/cluster_raft.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include <linux/time.h>
+#include <linux/workqueue.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+
+/* ============================================================
+   Raft 选举定时器（周期性检查）
+   ============================================================ */
+void cluster_raft_election_timer(void) {
+    uint64_t now = get_jiffies_64();
+    uint64_t elapsed;
+    
+    // 只有 Follower 和 Candidate 才触发选举
+    if (g_cluster_ctx.raft.role == RAFT_ROLE_LEADER) {
+        return;
+    }
+    
+    elapsed = now - g_cluster_ctx.raft.last_heartbeat_time;
+    
+    // 如果超过选举超时时间，开始选举
+    if (elapsed > g_cluster_ctx.raft.election_timeout) {
+        cluster_raft_start_election();
+    }
+}
+
+/* ============================================================
+   开始领导者选举
+   ============================================================ */
+void cluster_raft_start_election(void) {
+    cluster_node_t *node;
+    uint64_t votes = 0;
+    uint64_t needed_votes;
+    
+    // 1. 增加任期
+    g_cluster_ctx.raft.current_term++;
+    g_cluster_ctx.raft.role = RAFT_ROLE_CANDIDATE;
+    strncpy(g_cluster_ctx.raft.voted_for, g_cluster_ctx.self->node_id,
+            sizeof(g_cluster_ctx.raft.voted_for) - 1);
+    
+    printk(KERN_INFO "HWRun CLUSTER: Starting election for term %lu\n",
+           g_cluster_ctx.raft.current_term);
+    
+    // 2. 请求投票
+    needed_votes = (g_cluster_ctx.node_count / 2) + 1;
+    
+    node = g_cluster_ctx.nodes;
+    while (node) {
+        if (strcmp(node->node_id, g_cluster_ctx.self->node_id) != 0 &&
+            node->state == NODE_STATE_ALIVE) {
+            // 请求投票
+            int granted = cluster_raft_request_vote(node);
+            if (granted) {
+                votes++;
+            }
+        }
+        node = node->next;
+    }
+    
+    // 3. 检查是否获得多数票
+    if (votes >= needed_votes) {
+        g_cluster_ctx.raft.role = RAFT_ROLE_LEADER;
+        printk(KERN_INFO "HWRun CLUSTER: Node %s elected as leader for term %lu\n",
+               g_cluster_ctx.self->node_id, g_cluster_ctx.raft.current_term);
+        cluster_gossip_broadcast(GOSSIP_MSG_ALIVE, g_cluster_ctx.self->node_id);
+    } else {
+        // 未获得多数票，回到 Follower 状态
+        g_cluster_ctx.raft.role = RAFT_ROLE_FOLLOWER;
+        // 随机延迟后重试
+        printk(KERN_WARNING "HWRun CLUSTER: Election failed, got %lu/%lu votes\n",
+               votes, needed_votes);
+    }
+}
+
+/* ============================================================
+   请求投票
+   ============================================================ */
+int cluster_raft_request_vote(cluster_node_t *node) {
+    // 通过 NP 协议发送投票请求
+    // 检查目标节点的任期
+    // 如果目标节点的任期更高，放弃选举
+    
+    // 如果目标节点已经投票给其他人，拒绝
+    
+    // 实际实现中通过 IPC 调用 NP 协议
+    // 这里给出框架
+    return cluster_ipc_request_vote(node->ip, node->port,
+                                     g_cluster_ctx.raft.current_term,
+                                     g_cluster_ctx.self->node_id);
+}
+
+/* ============================================================
+   心跳处理（Leader 发送）
+   ============================================================ */
+void cluster_raft_send_heartbeat(void) {
+    cluster_node_t *node;
+    uint64_t now = get_jiffies_64();
+    
+    if (g_cluster_ctx.raft.role != RAFT_ROLE_LEADER) {
+        return;
+    }
+    
+    // 发送心跳到所有节点
+    node = g_cluster_ctx.nodes;
+    while (node) {
+        if (strcmp(node->node_id, g_cluster_ctx.self->node_id) != 0 &&
+            node->state == NODE_STATE_ALIVE) {
+            cluster_ipc_send_heartbeat(node->ip, node->port,
+                                        g_cluster_ctx.raft.current_term);
+        }
+        node = node->next;
+    }
+    
+    g_cluster_ctx.raft.last_heartbeat_time = now;
+}
+
+/* ============================================================
+   心跳接收（Follower 处理）
+   ============================================================ */
+void cluster_raft_receive_heartbeat(uint64_t term, const char *leader_id) {
+    // 检查任期
+    if (term < g_cluster_ctx.raft.current_term) {
+        // 忽略过期的任期
+        return;
+    }
+    
+    if (term > g_cluster_ctx.raft.current_term) {
+        g_cluster_ctx.raft.current_term = term;
+        g_cluster_ctx.raft.role = RAFT_ROLE_FOLLOWER;
+        strncpy(g_cluster_ctx.raft.voted_for, leader_id,
+                sizeof(g_cluster_ctx.raft.voted_for) - 1);
+    }
+    
+    g_cluster_ctx.raft.last_heartbeat_time = get_jiffies_64();
+    
+    // 确认领导者存活
+    cluster_node_t *leader = cluster_find_node(leader_id);
+    if (leader) {
+        leader->last_heartbeat = get_jiffies_64();
+        if (leader->state == NODE_STATE_SUSPECT ||
+            leader->state == NODE_STATE_DEAD) {
+            leader->state = NODE_STATE_ALIVE;
+        }
+    }
+}
+```
+
+5.6 Git 状态同步
+
+```c
+// cluster/src/cluster_sync.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+#include "git_client.h"
+
+/* ============================================================
+   集群状态同步（通过 Git）
+   ============================================================ */
+int cluster_sync(const char *source_node, uint64_t version) {
+    int ret;
+    char *cluster_state;
+    uint64_t local_version;
+    
+    // 1. 获取本地集群状态版本
+    local_version = cluster_get_state_version();
+    
+    // 2. 如果本地版本更新，推送到其他节点
+    if (local_version > version) {
+        ret = cluster_push_state(source_node);
+        if (ret < 0) {
+            return ret;
+        }
+        return 0;
+    }
+    
+    // 3. 如果本地版本较旧，从其他节点拉取
+    if (local_version < version) {
+        ret = cluster_pull_state(source_node, &cluster_state);
+        if (ret < 0) {
+            return ret;
+        }
+        
+        // 应用拉取的状态
+        cluster_apply_state(cluster_state);
+        kfree(cluster_state);
+        return 0;
+    }
+    
+    // 版本相同，无需同步
+    return 0;
+}
+
+/* ============================================================
+   推送集群状态到 Git
+   ============================================================ */
+int cluster_push_state(const char *target_node) {
+    char *state_json;
+    int ret;
+    
+    // 1. 序列化集群状态为 JSON
+    state_json = cluster_serialize_state();
+    if (!state_json) {
+        return -ENOMEM;
+    }
+    
+    // 2. 写入 Git 仓库
+    ret = git_client_write("cluster/state.json", state_json, strlen(state_json));
+    if (ret < 0) {
+        kfree(state_json);
+        return ret;
+    }
+    
+    // 3. Git commit
+    char commit_msg[128];
+    snprintf(commit_msg, sizeof(commit_msg),
+             "Cluster state updated by %s", g_cluster_ctx.self->node_id);
+    ret = git_client_commit(commit_msg);
+    if (ret < 0) {
+        kfree(state_json);
+        return ret;
+    }
+    
+    // 4. Push 到远程仓库（供其他节点拉取）
+    ret = git_client_push();
+    
+    kfree(state_json);
+    return ret;
+}
+
+/* ============================================================
+   从 Git 拉取集群状态
+   ============================================================ */
+int cluster_pull_state(const char *source_node, char **out_state) {
+    char *state_json;
+    int ret;
+    
+    // 1. Git pull 获取最新状态
+    ret = git_client_pull();
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 2. 读取集群状态文件
+    ret = git_client_read("cluster/state.json", &state_json);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    *out_state = state_json;
+    return 0;
+}
+```
+
+5.7 IPC 消息处理
+
+```c
+// cluster/src/cluster_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "cluster.h"
+#include "cluster_ipc.h"
+#include "cluster_membership.h"
+#include "cluster_gossip.h"
+#include "cluster_raft.h"
+#include "cluster_sync.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void cluster_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case CLUSTER_MSG_JOIN: {
+            cluster_join_req_t *req = (cluster_join_req_t *)data;
+            cluster_join_resp_t resp;
+            int ret = cluster_join(req->node_id, req->hostname,
+                                    req->ip, req->port, req->token,
+                                    &resp.leader_id, &resp.existing_nodes,
+                                    &resp.existing_count);
+            resp.success = (ret == 0);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case CLUSTER_MSG_LEAVE: {
+            char *node_id = (char *)data;
+            int ret = cluster_leave(node_id);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case CLUSTER_MSG_GET_NODES: {
+            cluster_node_t *nodes;
+            uint32_t count;
+            cluster_get_all_nodes(&nodes, &count);
+            ipc_reply(from_task, nodes, count * sizeof(cluster_node_t));
+            break;
+        }
+        
+        case CLUSTER_MSG_GOSSIP: {
+            gossip_message_t *msg = (gossip_message_t *)data;
+            cluster_gossip_receive(msg);
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        case CLUSTER_MSG_RAFT_HEARTBEAT: {
+            raft_heartbeat_t *hb = (raft_heartbeat_t *)data;
+            cluster_raft_receive_heartbeat(hb->term, hb->leader_id);
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        case CLUSTER_MSG_RAFT_VOTE: {
+            raft_vote_req_t *req = (raft_vote_req_t *)data;
+            raft_vote_resp_t resp;
+            // 处理投票请求
+            resp.granted = cluster_raft_handle_vote(req);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun CLUSTER: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、启动流程
+
+```
+微内核 _start()
+    │
+    ├── 1. 硬件初始化
+    ├── 2. 内存分配器初始化
+    ├── 3. 中断/时钟初始化
+    ├── 4. 加载 METAPROTO 插件
+    │        └── METAPROTO 注册自己
+    ├── 5. 加载 BUS 插件
+    │        └── BUS 注册自己
+    │        └── BUS 加载 PARAM 插件
+    │        └── BUS 加载 LOG 插件
+    │        └── BUS 加载 GIT 插件
+    │        └── BUS 加载 HAP 插件
+    │        └── BUS 加载 PMP 插件
+    │        └── BUS 加载 FSP 插件
+    │        └── BUS 加载 NP 插件
+    │        └── BUS 加载 SP 插件
+    │        └── BUS 加载 LOADER 插件
+    │        └── BUS 加载 CLUSTER 插件
+    ▼
+cluster_init()
+    │
+    ├── 1. 初始化上下文
+    ├── 2. 初始化 Raft 状态
+    ├── 3. 注册 IPC 消息处理器
+    ├── 4. 注册 CLUSTER 协议
+    ├── 5. 启动 Gossip 周期性任务
+    ├── 6. 启动 Raft 选举定时器
+    ├── 7. 启动故障检测定时器
+    ├── 8. 如果配置了自动加入，发送 Join 请求
+    └── 9. 就绪
+```
+
+七、构建与安装
+
+7.1 插件描述文件
+
+```yaml
+# plugins/cluster/plugin.yml
+plugin:
+  id: "cluster"
+  name: "Cluster Management Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 集群管理协议，提供节点发现、成员管理、领导者选举、状态同步等分布式集群功能"
+  
+  provides:
+    - protocol: "CLUSTER"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "NP"
+      version: "1.0"
+    - protocol: "GIT"
+      version: "1.0"
+  
+  params:
+    - key: "cluster.name"
+      type: "string"
+      default: "hwrun-cluster"
+      description: "集群名称"
+    - key: "cluster.auto_join"
+      type: "bool"
+      default: true
+      description: "启动时自动加入集群"
+    - key: "cluster.seed_nodes"
+      type: "string"
+      default: ""
+      description: "种子节点列表 (逗号分隔)"
+    - key: "cluster.gossip_interval"
+      type: "int"
+      default: 1000
+      description: "Gossip 传播间隔 (ms)"
+    - key: "cluster.election_timeout"
+      type: "int"
+      default: 5000
+      description: "Raft 选举超时 (ms)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/cluster.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+7.2 构建脚本
+
+```makefile
+# cluster/Makefile
+
+obj-m += cluster.o
+
+cluster-objs := cluster.o cluster_membership.o cluster_gossip.o \
+                cluster_failure.o cluster_raft.o cluster_sync.o \
+                cluster_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 cluster.ko /usr/lib/hwrun/plugins/
+```
+
+八、命令行接口
+
+```bash
+# 节点管理
+hwrun cluster join --node-id node-01 --ip 192.168.1.100 --port 8443
+hwrun cluster leave
+hwrun cluster nodes
+hwrun cluster node-info node-02
+
+# 领导者管理
+hwrun cluster leader
+hwrun cluster elect
+
+# 集群管理
+hwrun cluster sync
+hwrun cluster status
+hwrun cluster membership add node-04
+hwrun cluster membership remove node-03
+```
+
+九、总结
+
+维度 决策
+定位 集群管理协议，分布式集群的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~2000-2500 行 C
+提供协议 CLUSTER (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + NP + GIT
+加载时机 在 INSTANCE、CONSENSUS 等依赖集群管理的插件之前
+核心算法 Gossip (SWIM 风格) + Raft (领导者选举) + Git Sync
+
+CLUSTER 是 HWRun OS 中第七个加载的核心功能插件（HAP → PMP → FSP → NP → SP → LOADER → CLUSTER）。它作为内核模块运行，通过 Gossip 协议实现节点发现和成员管理，通过 Raft 共识算法实现领导者选举和集群配置管理，通过 Git 实现集群状态持久化和跨节点同步。CLUSTER 协议向上层插件（INSTANCE、NODE_DISCOVERY、CONSENSUS、CROSS_REGION 等）提供完整的集群管理功能，使 HWRun OS 从单机操作系统变成分布式操作系统。

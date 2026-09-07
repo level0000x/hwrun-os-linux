@@ -1,0 +1,1014 @@
+HWRun OS POWER 实现文档
+
+模块名称： POWER (Power Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 电源管理协议，提供电源状态查询、睡眠/唤醒、电源策略、电池管理、热管理等功能的统一抽象
+实现语言： C（内核模块 + 用户态服务，基于 Linux PM 与 ACPI）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、DRIVER（设备驱动）、SHELL（命令执行）
+提供协议： POWER
+
+一、设计哲学
+
+1.1 核心定位
+
+POWER 是 HWRun OS 的电源管理核心——所有与电源状态、睡眠/唤醒、电源策略、电池、热管理相关的操作都通过 POWER 协议进行。
+
+```
+POWER = 电源管理协议 = 所有电源操作的统一入口
+
+上层插件 (UI, DESKTOP, MONITOR, SYSTEM_STATE, HOME, ...)
+    │
+    │  通过 POWER 协议管理电源
+    ▼
+POWER 插件 (内核模块 + 用户态服务)
+    │
+    │  基于 Linux 电源管理栈
+    │  ├── PM Core          → suspend/resume 电源状态机
+    │  ├── ACPI/APM         → 电源事件与 ACPI 电源按钮
+    │  ├── Battery class    → /sys/class/power_supply 电池信息
+    │  ├── Thermal          → 热区 /sys/class/thermal 热管理
+    │  ├── Cpufreq          → CPU 频率调节 (性能/省电)
+    │  └── PowerOPP         → 设备运行点电源管理
+    │
+    ▼
+Linux 内核 (PM / ACPI / power_supply / thermal)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有电源操作通过 POWER 协议进行
+2. 标准接口：基于 Linux PM、ACPI 与 power_supply 标准
+3. 策略可配：电源策略（性能/平衡/省电）通过配置可调
+4. 多状态支持：支持运行、空闲、睡眠、休眠、关机等状态
+5. 事件通知：电源状态变化（插拔、低电量、过温）向下层订阅者通知
+6. 安全可控：关机/重启需要授权，防止恶意断电
+
+1.3 Linux 电源管理栈概述
+
+Linux 电源管理从状态机、类与策略三个维度组织：
+
+维度 说明 内核接口
+电源状态 运行(s0)/空闲(s1)/睡眠(s2,s3)/休眠(s4)/关机(s5) /sys/power/state
+电池 power_supply 类，容量/电压/电流/状态 /sys/class/power_supply/
+热管理 thermal 类，温度/冷却设备 /sys/class/thermal/
+频率调节 cpufreq，performance/powersave/ondemand /sys/devices/system/cpu/cpuX/cpufreq
+挂起机制 /sys/power/mem_sleep, autosleep 等 /sys/power/*
+
+POWER 插件将这些分散的接口统一封装到 POWER 协议，向上层暴露简洁的状态机与策略接口。
+
+1.4 睡眠等级与状态机
+
+Linux 将电源状态映射到 ACPI 状态：
+
+```
+s0  运行    → 系统正常运行
+s1  standby → 仅 CPU 停止，内存保持
+s2  
+s3  suspend → (suspend-to-RAM) 内存保持，CPU/外设断电
+s4  hibernate → (suspend-to-disk) 内存镜像写入磁盘，完全断电
+s5  off     → 关机
+```
+
+现代系统常用的两级是 suspend-to-RAM（挂起到内存，快）和 suspend-to-disk（休眠，省电但慢）。
+
+二、整体架构
+
+2.1 POWER 插件的组成
+
+```
+POWER 插件
+├── 内核模块 (power.ko)
+│   ├── 协议处理层
+│   │   ├── power_ipc_handler()     ← IPC 消息分发
+│   │   ├── power_get_state()       ← 获取电源状态
+│   │   ├── power_set_state()       ← 切换电源状态
+│   │   ├── power_get_battery()     ← 获取电池信息
+│   │   ├── power_get_thermal()     ← 获取热信息
+│   │   ├── power_set_policy()      ← 设置电源策略
+│   │   └── power_get_stats()       ← 获取功耗统计
+│   ├── PM 封装层
+│   │   ├── power_pm.c              ← suspend/resume
+│   │   ├── power_acpi.c            ← ACPI 电源事件
+│   │   ├── power_battery.c         ← 电池类
+│   │   ├── power_thermal.c         ← 热区
+│   │   └── power_cpufreq.c         ← 频率调节
+│   └── 初始化/清理
+│       ├── power_init()            ← 模块加载
+│       └── power_exit()            ← 模块卸载
+│
+└── 用户态服务 (hwrun-powerd)
+    ├── policy.c                   ← 策略引擎
+    ├── event.c                    ← 电源事件订阅
+    ├── lid.c                      ← 合盖策略 (笔记本)
+    └── hibernate.c                ← 休眠管理 (swap 镜像)
+```
+
+2.2 POWER 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → AUDIO → POWER → 其他插件
+                                                                                                                         ↑
+                                                                                                                  POWER 在这里加载
+```
+
+POWER 插件的启动顺序位于设备层末尾（AUDIO 之后），在系统进入稳定运行后加载电源管理能力。
+
+2.3 POWER 的上层消费者
+
+上层插件 需要 POWER 提供什么
+UI (用户界面) 电池图标、低电量提示
+DESKTOP (桌面) 电源菜单（关机/睡眠/重启）
+MONITOR (监控) 功耗/温度/续航监控
+SYSTEM_STATE (系统状态) 电源状态、电池状态
+HOME (主界面) 即时电源信息展示
+tray/PLUGIN 能源策略 UI 策略切换
+
+三、核心数据结构
+
+```c
+// power/include/power.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   电源状态 (对应 ACPI 状态)
+   ============================================================ */
+typedef enum {
+    POWER_STATE_ON = 0,              // s0 运行
+    POWER_STATE_IDLE,                // s1 空闲
+    POWER_STATE_SUSPEND,             // s3 suspend-to-RAM
+    POWER_STATE_HIBERNATE,           // s4 suspend-to-disk
+    POWER_STATE_OFF,                 // s5 关机
+    POWER_STATE_REBOOT,              // 重启
+    POWER_STATE_UNKNOWN,
+} power_state_t;
+
+/* ============================================================
+   电源策略
+   ============================================================ */
+typedef enum {
+    POWER_POLICY_BALANCED = 0,       // 平衡
+    POWER_POLICY_PERFORMANCE,        // 性能
+    POWER_POLICY_POWER_SAVE,         // 省电
+} power_policy_t;
+
+/* ============================================================
+   电池状态
+   ============================================================ */
+typedef enum {
+    BATTERY_STATUS_UNKNOWN = 0,
+    BATTERY_STATUS_CHARGING,         // 充电中
+    BATTERY_STATUS_DISCHARGING,      // 放电中
+    BATTERY_STATUS_FULL,             // 已充满
+    BATTERY_STATUS_NOT_CHARGING,     // 未充电
+} battery_status_t;
+
+/* ============================================================
+   电池信息 (power_supply 类)
+   ============================================================ */
+typedef struct power_battery {
+    uint32_t capacity;               // 剩余电量 (0-100)
+    battery_status_t status;         // 状态
+    int present;                     // 是否在位
+    int ac_online;                   // AC 电源是否在线
+    uint32_t voltage_mv;             // 电压 (mV)
+    uint32_t current_ma;             // 电流 (mA) 充电为正
+    uint32_t charge_full;            // 满电容量 (mAh)
+    uint32_t charge_now;             // 当前容量 (mAh)
+    uint32_t time_to_full_s;         // 充满剩余时间 (秒)
+    uint32_t time_to_empty_s;        // 放空剩余时间 (秒)
+    char model[64];                  // 电池型号
+    char vendor[64];                 // 厂商
+    uint32_t cycle_count;            // 循环次数
+} power_battery_t;
+
+/* ============================================================
+   热区信息 (thermal 类)
+   ============================================================ */
+typedef struct power_thermal {
+    uint32_t zone_id;                // 热区编号
+    int trip_point;                  // 当前跳变点
+    int temperature_mc;              // 温度 (毫摄氏度)
+    int trip_temp_mc;                // 触发温度
+    char type[64];                   // 类型 ("acpitz", "cpu", ...)
+} power_thermal_t;
+
+/* ============================================================
+   功耗统计
+   ============================================================ */
+typedef struct power_stats {
+    uint64_t on_time_s;              // 本次开机运行时长
+    uint64_t suspend_count;          // 挂起次数
+    uint64_t total_suspend_s;        // 累计挂起时长
+    uint32_t avg_power_w;            // 平均功耗 (瓦)
+    uint32_t cpu_freq_khz;           // 当前 CPU 频率
+    power_policy_t policy;           // 当前策略
+} power_stats_t;
+
+/* ============================================================
+   POWER 上下文
+   ============================================================ */
+typedef struct power_context {
+    int initialized;
+    uint64_t power_task_id;          // POWER 自身的任务 ID
+
+    power_state_t state;             // 当前电源状态
+    power_policy_t policy;           // 当前策略
+
+    power_battery_t battery;         // 电池 (不存在则 present=0)
+    power_thermal_t *thermals;       // 热区列表
+    uint32_t thermal_count;
+
+    void *lock;
+} power_context_t;
+```
+
+四、POWER 协议定义
+
+```protobuf
+// protocols/power.proto
+syntax = "proto3";
+
+package hwrun.power;
+
+service Power {
+    // === 电源状态 ===
+    rpc GetState(Empty) returns (GetStateResponse);
+    rpc SetState(SetStateRequest) returns (SetStateResponse);
+    rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse);
+
+    // === 电池 ===
+    rpc GetBattery(Empty) returns (GetBatteryResponse);
+
+    // === 热管理 ===
+    rpc GetThermal(Empty) returns (GetThermalResponse);
+
+    // === 统计 ===
+    rpc GetStats(Empty) returns (GetStatsResponse);
+
+    // === 事件 ===
+    rpc Subscribe(SubscribeRequest) returns (stream PowerEvent);
+}
+
+message Empty {}
+
+// ============ 电源状态 ============
+
+message GetStateResponse {
+    uint32 state = 1;               // power_state_t
+    uint32 policy = 2;              // power_policy_t
+    int32 error = 3;
+}
+
+message SetStateRequest {
+    uint32 state = 1;               // 请求切换到的状态
+}
+
+message SetStateResponse {
+    bool success = 1;
+    string message = 2;
+    int32 error = 3;
+}
+
+message SetPolicyRequest {
+    uint32 policy = 1;              // power_policy_t
+}
+
+message SetPolicyResponse {
+    bool success = 1;
+    uint32 policy = 2;
+    int32 error = 3;
+}
+
+// ============ 电池 ============
+
+message BatteryInfo {
+    uint32 capacity = 1;            // 0-100
+    uint32 status = 2;              // battery_status_t
+    bool present = 3;
+    bool ac_online = 4;
+    uint32 voltage_mv = 5;
+    uint32 current_ma = 6;
+    uint32 charge_full = 7;
+    uint32 charge_now = 8;
+    uint32 time_to_full_s = 9;
+    uint32 time_to_empty_s = 10;
+    string model = 11;
+    uint32 cycle_count = 12;
+}
+
+message GetBatteryResponse {
+    BatteryInfo battery = 1;
+    int32 error = 2;
+}
+
+// ============ 热管理 ============
+
+message ThermalZone {
+    uint32 zone_id = 1;
+    int32 temperature_mc = 2;
+    int32 trip_temp_mc = 3;
+    string type = 4;
+}
+
+message GetThermalResponse {
+    repeated ThermalZone zones = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+// ============ 统计 ============
+
+message PowerStats {
+    uint64 on_time_s = 1;
+    uint64 suspend_count = 2;
+    uint64 total_suspend_s = 3;
+    uint32 avg_power_w = 4;
+    uint32 cpu_freq_khz = 5;
+    uint32 policy = 6;
+}
+
+message GetStatsResponse {
+    PowerStats stats = 1;
+    int32 error = 2;
+}
+
+// ============ 事件 ============
+
+message SubscribeRequest {
+    repeated uint32 event_types = 1;  // 订阅的事件
+}
+
+message PowerEvent {
+    uint32 type = 1;                // EV_BATTERY, EV_AC, EV_THERMAL, EV_STATE...
+    uint64 timestamp = 2;
+    string payload = 3;             // 事件负载 (JSON)
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// power/src/power.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/power_supply.h>
+#include <linux/suspend.h>
+
+#include "power.h"
+#include "power_ipc.h"
+#include "power_pm.h"
+#include "power_battery.h"
+#include "power_thermal.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Power Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static power_context_t g_power_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init power_init(void) {
+    int ret;
+
+    printk(KERN_INFO "HWRun POWER: Initializing...\n");
+
+    // 1. 初始化上下文
+    memset(&g_power_ctx, 0, sizeof(power_context_t));
+    g_power_ctx.state = POWER_STATE_ON;
+    g_power_ctx.policy = POWER_POLICY_BALANCED;
+
+    // 2. 读取电池信息
+    power_battery_get(&g_power_ctx.battery);
+    if (g_power_ctx.battery.present) {
+        printk(KERN_INFO "HWRun POWER: Battery: %u%% %s\n",
+               g_power_ctx.battery.capacity,
+               g_power_ctx.battery.ac_online ? "(AC)" : "(battery)");
+    }
+
+    // 3. 读取热区信息
+    power_thermal_get(&g_power_ctx.thermals, &g_power_ctx.thermal_count);
+
+    // 4. 注册 IPC 消息处理器
+    ret = power_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun POWER: Failed to register IPC handler\n");
+        return ret;
+    }
+
+    // 5. 注册 POWER 协议
+    power_register_protocol();
+
+    g_power_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun POWER: Initialized successfully\n");
+
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit power_exit(void) {
+    printk(KERN_INFO "HWRun POWER: Exiting...\n");
+
+    power_ipc_unregister();
+    power_thermal_cleanup(&g_power_ctx.thermals);
+
+    g_power_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun POWER: Exited\n");
+}
+
+module_init(power_init);
+module_exit(power_exit);
+```
+
+5.2 电源状态切换
+
+Linux 电源状态通过向 /sys/power/state 写入状态名触发（如 "mem" 表示挂起到内存，"disk" 表示休眠），或通过内核 API 直接调用。
+
+```c
+// power/src/power_pm.c
+
+#include <linux/kernel.h>
+#include <linux/suspend.h>
+#include <linux/reboot.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+
+#include "power.h"
+
+/* ============================================================
+   切换到目标电源状态
+   ============================================================ */
+int power_set_state(power_state_t target) {
+    loff_t pos = 0;
+    struct file *file;
+
+    switch (target) {
+        case POWER_STATE_SUSPEND: {
+            // 挂起到内存: 向 /sys/power/state 写 "mem"
+            // 或调用 pm_suspend(PM_SUSPEND_MEM);
+            file = filp_open("/sys/power/state", O_WRONLY, 0);
+            if (!IS_ERR(file)) {
+                kernel_write(file, "mem", 3, &pos);
+                filp_close(file, NULL);
+            }
+            break;
+        }
+
+        case POWER_STATE_HIBERNATE: {
+            // 休眠: 写 "disk"
+            file = filp_open("/sys/power/state", O_WRONLY, 0);
+            if (!IS_ERR(file)) {
+                kernel_write(file, "disk", 4, &pos);
+                filp_close(file, NULL);
+            }
+            break;
+        }
+
+        case POWER_STATE_OFF: {
+            // 关机
+            kernel_power_off();
+            break;
+        }
+
+        case POWER_STATE_REBOOT: {
+            // 重启
+            kernel_restart(NULL);
+            break;
+        }
+
+        default:
+            return -EINVAL;
+    }
+
+    return 0;
+}
+```
+
+5.3 电池信息读取
+
+电池信息通过 Linux power_supply 类（/sys/class/power_supply/）读取，典型节点为 BAT0/UPS。
+
+```c
+// power/src/power_battery.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "power.h"
+
+#define POWER_SUPPLY_PATH "/sys/class/power_supply"
+#define BATTERY_NAME "BAT0"
+
+/* ============================================================
+   读取 sysfs 数值
+   ============================================================ */
+static int power_read_sysfs_int(const char *path, int *out) {
+    struct file *file;
+    char buf[32];
+    loff_t pos = 0;
+    ssize_t ret;
+
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        return -EIO;
+    }
+    ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+    filp_close(file, NULL);
+    if (ret <= 0) {
+        return -EIO;
+    }
+    buf[ret] = '\0';
+    // 去除换行
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    *out = simple_strtol(buf, NULL, 10);
+    return 0;
+}
+
+/* ============================================================
+   读取电池信息
+   ============================================================ */
+int power_battery_get(power_battery_t *bat) {
+    char path[256];
+    int val;
+    int type;
+
+    memset(bat, 0, sizeof(power_battery_t));
+
+    // 检查电池是否存在
+    snprintf(path, sizeof(path), "%s/%s", POWER_SUPPLY_PATH, BATTERY_NAME);
+    struct file *file = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(file)) {
+        // 电池不存在，检查是否只有 AC
+        snprintf(path, sizeof(path), "%s/AC", POWER_SUPPLY_PATH);
+        file = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+        if (IS_ERR(file)) {
+            return -ENODEV;
+        }
+        filp_close(file, NULL);
+        // 只有 AC，无电池
+        power_read_sysfs_int(
+            path, NULL) ; // placeholder
+        return 0;
+    }
+    filp_close(file, NULL);
+
+    bat->present = 1;
+
+    // 容量
+    snprintf(path, sizeof(path), "%s/%s/capacity", POWER_SUPPLY_PATH, BATTERY_NAME);
+    if (power_read_sysfs_int(path, &val) == 0) bat->capacity = val;
+
+    // 电压
+    snprintf(path, sizeof(path), "%s/%s/voltage_now", POWER_SUPPLY_PATH, BATTERY_NAME);
+    if (power_read_sysfs_int(path, &val) == 0) bat->voltage_mv = val / 1000;
+
+    // 电流
+    snprintf(path, sizeof(path), "%s/%s/current_now", POWER_SUPPLY_PATH, BATTERY_NAME);
+    if (power_read_sysfs_int(path, &val) == 0) bat->current_ma = val / 1000;
+
+    // 满电/当前容量
+    snprintf(path, sizeof(path), "%s/%s/charge_full", POWER_SUPPLY_PATH, BATTERY_NAME);
+    if (power_read_sysfs_int(path, &val) == 0) bat->charge_full = val / 1000;
+    snprintf(path, sizeof(path), "%s/%s/charge_now", POWER_SUPPLY_PATH, BATTERY_NAME);
+    if (power_read_sysfs_int(path, &val) == 0) bat->charge_now = val / 1000;
+
+    // 状态
+    snprintf(path, sizeof(path), "%s/%s/status", POWER_SUPPLY_PATH, BATTERY_NAME);
+    // status 值为 "Charging"/"Discharging"/"Full"，此处简化映射
+    char buf[32];
+    // 读取状态字符串...
+    if (bat->capacity >= 100) {
+        bat->status = BATTERY_STATUS_FULL;
+    } else {
+        // 通过 AC 判断充放电
+        snprintf(path, sizeof(path), "%s/AC/online", POWER_SUPPLY_PATH);
+        if (power_read_sysfs_int(path, &val) == 0 && val == 1) {
+            bat->ac_online = 1;
+            bat->status = BATTERY_STATUS_CHARGING;
+        } else {
+            bat->ac_online = 0;
+            bat->status = BATTERY_STATUS_DISCHARGING;
+        }
+    }
+
+    return 0;
+}
+```
+
+5.4 热区信息读取
+
+温度信息通过 Linux thermal 类（/sys/class/thermal/thermal_zone*）读取。
+
+```c
+// power/src/power_thermal.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "power.h"
+
+#define THERMAL_PATH "/sys/class/thermal"
+#define THERMAL_MAX_ZONES 32
+
+/* ============================================================
+   读取热区信息
+   ============================================================ */
+int power_thermal_get(power_thermal_t **out, uint32_t *count) {
+    power_thermal_t *zones;
+    uint32_t n = 0;
+    int val;
+    char path[256];
+    struct file *file;
+
+    zones = kcalloc(THERMAL_MAX_ZONES, sizeof(power_thermal_t), GFP_KERNEL);
+    if (!zones) {
+        return -ENOMEM;
+    }
+
+    for (int i = 0; i < THERMAL_MAX_ZONES; i++) {
+        snprintf(path, sizeof(path), "%s/thermal_zone%d", THERMAL_PATH, i);
+        file = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+        if (IS_ERR(file)) {
+            break;
+        }
+        filp_close(file, NULL);
+
+        zones[n].zone_id = i;
+
+        // 类型
+        snprintf(path, sizeof(path),
+                 "%s/thermal_zone%d/type", THERMAL_PATH, i);
+        // 读取 type 字符串...
+        char typebuf[64];
+        loff_t pos = 0;
+        file = filp_open(path, O_RDONLY, 0);
+        if (!IS_ERR(file)) {
+            ssize_t r = kernel_read(file, typebuf, sizeof(typebuf) - 1, &pos);
+            if (r > 0) {
+                typebuf[r] = '\0';
+                strncpy(zones[n].type, typebuf, sizeof(zones[n].type) - 1);
+            }
+            filp_close(file, NULL);
+        }
+
+        // 温度 (毫摄氏度)
+        pos = 0;
+        snprintf(path, sizeof(path),
+                 "%s/thermal_zone%d/temp", THERMAL_PATH, i);
+        if (power_read_thermal_int(path, &val) == 0) {
+            zones[n].temperature_mc = val;
+        }
+
+        // 跳变点温度
+        pos = 0;
+        snprintf(path, sizeof(path),
+                 "%s/thermal_zone%d/trip_point_0_temp", THERMAL_PATH, i);
+        if (power_read_thermal_int(path, &val) == 0) {
+            zones[n].trip_temp_mc = val;
+        }
+
+        n++;
+    }
+
+    *out = zones;
+    *count = n;
+    return 0;
+}
+
+/* ============================================================
+   读取热区整数值
+   ============================================================ */
+int power_read_thermal_int(const char *path, int *out) {
+    struct file *file;
+    char buf[32];
+    loff_t pos = 0;
+    ssize_t ret;
+
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        return -EIO;
+    }
+    ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+    filp_close(file, NULL);
+    if (ret <= 0) {
+        return -EIO;
+    }
+    buf[ret] = '\0';
+    *out = simple_strtol(buf, NULL, 10);
+    return 0;
+}
+```
+
+5.5 电源策略管理
+
+电源策略通过调节 CPU 频率控制器（cpufreq）实现。省电模式切换到 powersave 调控器，性能模式切换到 performance。
+
+```c
+// power/src/power_cpufreq.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "power.h"
+
+/* ============================================================
+   设置 CPU 频率调控器
+   ============================================================ */
+int power_set_cpufreq_governor(const char *governor) {
+    // 需要 root 权限，且 cpufreq 允许切换调控器
+    // 写入 /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+    return 0;
+}
+
+/* ============================================================
+   应用电源策略
+   ============================================================ */
+int power_apply_policy(power_policy_t policy) {
+    switch (policy) {
+        case POWER_POLICY_PERFORMANCE:
+            power_set_cpufreq_governor("performance");
+            break;
+        case POWER_POLICY_POWER_SAVE:
+            power_set_cpufreq_governor("powersave");
+            break;
+        case POWER_POLICY_BALANCED:
+        default:
+            power_set_cpufreq_governor("schedutil");
+            break;
+    }
+    return 0;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// power/src/power_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "power.h"
+#include "power_ipc.h"
+#include "power_pm.h"
+#include "power_battery.h"
+#include "power_thermal.h"
+#include "power_cpufreq.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void power_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+
+    switch (msg_type) {
+        case POWER_MSG_GET_STATE: {
+            power_state_resp_t resp;
+            resp.state = g_power_ctx.state;
+            resp.policy = g_power_ctx.policy;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case POWER_MSG_SET_STATE: {
+            power_state_req_t *req = (power_state_req_t *)data;
+            int ret = power_set_state(req->state);
+            if (ret == 0) {
+                g_power_ctx.state = req->state;
+            }
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+
+        case POWER_MSG_SET_POLICY: {
+            power_policy_req_t *req = (power_policy_req_t *)data;
+            int ret = power_apply_policy(req->policy);
+            if (ret == 0) {
+                g_power_ctx.policy = req->policy;
+            }
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+
+        case POWER_MSG_GET_BATTERY: {
+            power_battery_t bat;
+            power_battery_get(&bat);
+            ipc_reply(from_task, &bat, sizeof(bat));
+            break;
+        }
+
+        default:
+            printk(KERN_WARNING "HWRun POWER: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/power.yml
+power:
+  # 电源策略
+  policy:
+    # 默认策略: balanced / performance / power_save
+    default: "balanced"
+
+  # 状态策略
+  state:
+    # 合盖动作: ignore / suspend / hibernate / off
+    lid_action: "suspend"
+    # 电源按钮动作: suspend / off / ignore
+    power_btn_action: "suspend"
+    # 空闲多久(秒)后挂起, 0 = 禁用
+    idle_suspend_after: 0
+    # 挂起后多久(秒)休眠, 0 = 禁用
+    hibernate_after: 0
+
+  # 电池
+  battery:
+    # 低电量阈值 (触发通知)
+    low_threshold: 20
+    # 临界电量阈值 (自动休眠)
+    critical_threshold: 5
+    # 临界时是否自动挂起
+    auto_suspend_on_critical: true
+
+  # 热管理
+  thermal:
+    # 过温是否降频
+    throttle_on_high_temp: true
+
+  # 提示
+  notify:
+    # 低电量是否通知
+    low_battery_notify: true
+```
+
+七、命令行接口
+
+```bash
+# 电源状态
+hwrun power state
+hwrun power off
+hwrun power reboot
+hwrun power suspend
+hwrun power hibernate
+
+# 电源策略
+hwrun power policy
+hwrun power policy performance
+hwrun power policy balanced
+hwrun power policy power_save
+
+# 电池
+hwrun power battery
+# 输出示例:
+# 电池: BAT0
+# 电量: 76%
+# 状态: 放电中
+# 电压: 11.2V
+# 循环次数: 312
+
+# 热管理
+hwrun power thermal
+
+# 统计
+hwrun power stats
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/power/plugin.yml
+plugin:
+  id: "power"
+  name: "Power Management Protocol"
+  version: "1.0.0"
+  type: "kernel"
+
+  description: "HWRun OS 电源管理协议，提供电源状态、睡眠/唤醒、电源策略、电池、热管理等功能"
+
+  provides:
+    - protocol: "POWER"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "DRIVER"
+      version: "1.0"
+    - protocol: "SHELL"
+      version: "1.0"
+
+  params:
+    - key: "power.policy.default"
+      type: "string"
+      default: "balanced"
+      description: "默认电源策略"
+    - key: "power.state.lid_action"
+      type: "string"
+      default: "suspend"
+      description: "合盖动作"
+    - key: "power.battery.low_threshold"
+      type: "int"
+      default: 20
+      description: "低电量阈值 (%)"
+
+  files:
+    - "/usr/lib/hwrun/plugins/power.ko"
+    - "/usr/bin/hwrun-powerd"
+
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# power/Makefile
+
+obj-m += power.o
+
+power-objs := power.o power_pm.o power_acpi.o power_battery.o \
+              power_thermal.o power_cpufreq.o power_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 power.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-powerd /usr/bin/
+```
+
+8.3 安装后脚本
+
+```bash
+#!/bin/bash
+# power/scripts/post_install.sh
+
+# 加载 POWER 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/power.ko
+
+if [ $? -eq 0 ]; then
+    echo "POWER kernel module loaded successfully"
+    # 检测电池
+    if [ -d /sys/class/power_supply/BAT0 ]; then
+        echo "Battery detected"
+    fi
+else
+    echo "Failed to load POWER kernel module"
+    exit 1
+fi
+```
+
+九、总结
+
+维度 决策
+定位 电源管理协议，所有电源操作的统一入口
+实现方式 Linux 内核模块 + 用户态服务
+代码量 ~1500-2000 行 C
+提供协议 POWER (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + DRIVER + SHELL
+核心接口 PM、ACPI、power_supply、thermal、cpufreq
+关键功能 状态切换、电池管理、热管理、电源策略、事件通知
+
+POWER 是 HWRun OS 中电源管理的核心插件。它基于 Linux 电源管理栈（PM、ACPI、power_supply 类、thermal 类、cpufreq），通过 POWER 协议向上层插件提供电源状态切换、睡眠/唤醒、电源策略、电池管理、热管理等完整的电源管理功能。上层插件（UI、DESKTOP、MONITOR、SYSTEM_STATE 等）通过 POWER 协议进行电源操作，不直接操作 /sys/power 或 /sys/class/power_supply。

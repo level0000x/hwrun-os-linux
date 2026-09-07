@@ -1,0 +1,714 @@
+﻿HWRun OS BUILD 实现文档
+
+模块名称： BUILD (Build System)
+版本： 1.0.0
+状态： 设计冻结
+定位： 构建系统，负责将 HWRun OS 源码编译成可运行的操作系统镜像
+依赖工具： GNU Make, GCC, NASM, debootstrap, live-build, dpkg-buildpackage, reprepro
+输出产物： 内核镜像 (.bin/.ko)、用户态插件 (.so)、APT 仓库、可启动 ISO
+
+一、设计哲学
+
+1.1 核心定位
+
+BUILD 是 HWRun OS 的“制造工厂”——将所有源码编译、打包、组装成可启动的操作系统镜像。
+
+```
+BUILD = 构建系统 = 将源码转化为可运行系统的完整工具链
+
+源码仓库
+    │
+    ▼
+BUILD 系统
+    ├── 阶段 1: 编译微内核 (kernel.bin)
+    ├── 阶段 2: 编译内核模块 (HAP, PMP, FSP, NP, SP, LOADER, CLUSTER, INSTANCE, ...)
+    ├── 阶段 3: 编译用户态插件 (BUS, PARAM, LOG, GIT, UI, SHELL, DESKTOP, ...)
+    ├── 阶段 4: 构建 Debian 基础系统 (debootstrap)
+    ├── 阶段 5: 组装可启动 ISO (live-build)
+    └── 阶段 6: 生成 APT 仓库 (reprepro)
+    │
+    ▼
+输出产物
+├── kernel.bin                 ← 微内核 (ELF64)
+├── *.ko                        ← 内核模块 (HAP, PMP, FSP, NP, SP, ...)
+├── *.so                        ← 用户态插件 (BUS, PARAM, LOG, ...)
+├── hwrun-os-amd64.iso          ← 可启动 ISO
+└── APT 仓库                    ← 软件包仓库
+```
+
+1.2 设计原则
+
+1. 分层构建：从底层到上层逐层构建，每层产物作为下一层的输入
+2. 可重现：相同源码 + 相同环境 → 相同二进制
+3. 模块化：每个插件独立构建，可单独编译、测试、打包
+4. 容器化：构建环境封装在 Docker 容器中，保证环境一致性
+5. 自动化：全流程一键构建，支持 CI/CD
+
+1.3 构建工具链
+
+工具 用途 说明
+GNU Make 构建流程控制 顶层 Makefile 驱动整个构建
+GCC 编译 C 代码 用户态插件和部分内核模块
+x86_64-elf-gcc 编译微内核 交叉编译工具链
+NASM 汇编 Legacy BIOS 引导加载器
+GNU EFI UEFI 开发库 UEFI 引导加载器
+debootstrap Debian 基础系统 创建最小 Debian rootfs
+live-build ISO 构建 生成可启动 ISO
+dpkg-buildpackage Debian 打包 生成 .deb 包
+reprepro APT 仓库管理 管理私有软件源
+
+二、整体架构
+
+2.1 构建流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HWRun OS 构建流程                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 0: 构建环境准备                                              │   │
+│  │  └── Docker 镜像 (hwrun-builder)                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 1: 微内核构建 (Microkernel)                                 │   │
+│  │  └── kernel.bin (ELF64, < 100KB)                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 2: 内核模块构建 (Kernel Modules)                            │   │
+│  │  ├── hap.ko, pmp.ko, fsp.ko, np.ko, sp.ko                        │   │
+│  │  ├── loader.ko, cluster.ko, instance.ko                          │   │
+│  │  └── (所有硬件相关插件)                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 3: 用户态插件构建 (User-space Plugins)                     │   │
+│  │  ├── metaproto.so, bus.so, param.so, log.so, git.so              │   │
+│  │  ├── ui.so, shell.so, console.so, desktop.so                     │   │
+│  │  ├── pkgmgr.so, monitor.so, sandbox.so                          │   │
+│  │  └── (所有系统管理和应用插件)                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 4: 引导加载器构建 (Bootloader)                              │   │
+│  │  ├── BOOTX64.EFI (UEFI)                                            │   │
+│  │  └── boot.bin (Legacy BIOS)                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 5: Debian 基础系统构建                                      │   │
+│  │  └── rootfs (Debian 12 Bookworm 最小系统)                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 6: Debian 包打包 (dpkg-buildpackage)                       │   │
+│  │  └── *.deb (所有组件打包)                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 7: ISO 组装 (live-build)                                   │   │
+│  │  └── hwrun-os-amd64.hybrid.iso                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stage 8: APT 仓库生成 (reprepro)                                 │   │
+│  │  └── APT 仓库 (pool/ + dists/)                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+2.2 构建目录结构
+
+```
+build/
+├── env/                          # 构建环境
+│   ├── Dockerfile                # 构建容器定义
+│   └── requirements.txt          # 构建依赖列表
+│
+├── src/                          # 源码 (软链接到项目)
+│   ├── kernel/                   → ../../kernel
+│   ├── modules/                  → ../../plugins/* (内核模块)
+│   ├── plugins/                  → ../../plugins/* (用户态)
+│   ├── bootloader/               → ../../bootloader
+│   └── debian/                   → ../../debian
+│
+├── out/                          # 构建产物
+│   ├── kernel/                   # 微内核
+│   │   └── kernel.bin
+│   ├── modules/                  # 内核模块
+│   │   ├── hap.ko
+│   │   ├── pmp.ko
+│   │   └── ...
+│   ├── plugins/                  # 用户态插件
+│   │   ├── metaproto.so
+│   │   ├── bus.so
+│   │   └── ...
+│   ├── bootloader/               # 引导加载器
+│   │   ├── BOOTX64.EFI
+│   │   └── boot.bin
+│   ├── debian/                   # Debian 包
+│   │   ├── linux-image-hwrun_*.deb
+│   │   ├── hwrun-bus_*.deb
+│   │   └── ...
+│   ├── rootfs/                   # Debian 根文件系统
+│   │   └── (squashfs)
+│   └── iso/                      # ISO
+│       └── hwrun-os-amd64.hybrid.iso
+│
+├── repo/                         # APT 仓库
+│   ├── conf/
+│   │   └── distributions
+│   ├── pool/
+│   └── dists/
+│
+└── logs/                         # 构建日志
+    ├── build-$(date).log
+    └── errors.log
+```
+
+三、核心构建脚本
+
+3.1 顶层 Makefile
+
+```makefile
+# Makefile — HWRun OS 顶层构建文件
+
+.PHONY: all clean distclean install build-env \
+        kernel modules plugins bootloader debian iso repo
+
+VERSION := $(shell cat VERSION)
+BUILD_DIR := $(shell pwd)/build
+OUT_DIR := $(BUILD_DIR)/out
+
+all: kernel modules plugins bootloader debian iso repo
+
+# ============================================================
+# 构建环境
+# ============================================================
+build-env:
+	@echo "==> Setting up build environment..."
+	@mkdir -p $(BUILD_DIR)/out
+	@docker build -t hwrun-builder -f $(BUILD_DIR)/env/Dockerfile .
+
+# ============================================================
+# Stage 1: 微内核
+# ============================================================
+kernel: $(OUT_DIR)/kernel/kernel.bin
+
+$(OUT_DIR)/kernel/kernel.bin:
+	@echo "==> Building microkernel..."
+	@mkdir -p $(OUT_DIR)/kernel
+	$(MAKE) -C kernel -j$(shell nproc)
+	@cp kernel/kernel.bin $(OUT_DIR)/kernel/
+
+# ============================================================
+# Stage 2: 内核模块
+# ============================================================
+modules: $(OUT_DIR)/modules/hap.ko $(OUT_DIR)/modules/pmp.ko \
+         $(OUT_DIR)/modules/fsp.ko $(OUT_DIR)/modules/np.ko \
+         $(OUT_DIR)/modules/sp.ko $(OUT_DIR)/modules/loader.ko \
+         $(OUT_DIR)/modules/cluster.ko $(OUT_DIR)/modules/instance.ko
+
+$(OUT_DIR)/modules/%.ko:
+	@echo "==> Building kernel module: $*"
+	@mkdir -p $(OUT_DIR)/modules
+	$(MAKE) -C plugins/$* -j$(shell nproc)
+	@cp plugins/$*/$*.ko $(OUT_DIR)/modules/
+
+# ============================================================
+# Stage 3: 用户态插件
+# ============================================================
+plugins: $(OUT_DIR)/plugins/metaproto.so $(OUT_DIR)/plugins/bus.so \
+         $(OUT_DIR)/plugins/param.so $(OUT_DIR)/plugins/log.so \
+         $(OUT_DIR)/plugins/git.so $(OUT_DIR)/plugins/ui.so \
+         $(OUT_DIR)/plugins/shell.so $(OUT_DIR)/plugins/desktop.so \
+         $(OUT_DIR)/plugins/pkgmgr.so $(OUT_DIR)/plugins/monitor.so \
+         $(OUT_DIR)/plugins/sandbox.so
+
+$(OUT_DIR)/plugins/%.so:
+	@echo "==> Building plugin: $*"
+	@mkdir -p $(OUT_DIR)/plugins
+	$(MAKE) -C plugins/$* -j$(shell nproc)
+	@cp plugins/$*/$*.so $(OUT_DIR)/plugins/
+
+# ============================================================
+# Stage 4: 引导加载器
+# ============================================================
+bootloader: $(OUT_DIR)/bootloader/BOOTX64.EFI $(OUT_DIR)/bootloader/boot.bin
+
+$(OUT_DIR)/bootloader/BOOTX64.EFI:
+	@echo "==> Building UEFI bootloader..."
+	@mkdir -p $(OUT_DIR)/bootloader
+	$(MAKE) -C bootloader/uefi -j$(shell nproc)
+	@cp bootloader/uefi/BOOTX64.EFI $(OUT_DIR)/bootloader/
+
+$(OUT_DIR)/bootloader/boot.bin:
+	@echo "==> Building Legacy BIOS bootloader..."
+	@mkdir -p $(OUT_DIR)/bootloader
+	$(MAKE) -C bootloader/legacy
+	@cp bootloader/legacy/boot.bin $(OUT_DIR)/bootloader/
+
+# ============================================================
+# Stage 5: Debian 包打包
+# ============================================================
+debian: $(OUT_DIR)/debian/linux-image-hwrun_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-bus_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-param_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-log_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-git_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-ui_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-shell_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-desktop_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-pkgmgr_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-monitor_$(VERSION)_amd64.deb \
+        $(OUT_DIR)/debian/hwrun-sandbox_$(VERSION)_amd64.deb
+
+$(OUT_DIR)/debian/%.deb:
+	@echo "==> Building Debian package: $*"
+	@mkdir -p $(OUT_DIR)/debian
+	@# 对于每个组件，调用 dpkg-buildpackage
+	@cd debian/$* && dpkg-buildpackage -us -uc -b
+	@mv debian/*.deb $(OUT_DIR)/debian/
+
+# ============================================================
+# Stage 6: ISO 构建
+# ============================================================
+iso: $(OUT_DIR)/iso/hwrun-os-amd64.hybrid.iso
+
+$(OUT_DIR)/iso/hwrun-os-amd64.hybrid.iso:
+	@echo "==> Building ISO..."
+	@mkdir -p $(OUT_DIR)/iso
+	@cd iso && ./build-iso.sh $(OUT_DIR)
+
+# ============================================================
+# Stage 7: APT 仓库
+# ============================================================
+repo:
+	@echo "==> Generating APT repository..."
+	@cd repo && ./build-repo.sh $(OUT_DIR)/debian
+
+# ============================================================
+# 清理
+# ============================================================
+clean:
+	@echo "==> Cleaning build artifacts..."
+	@rm -rf $(OUT_DIR)
+	@$(MAKE) -C kernel clean 2>/dev/null || true
+	@for d in plugins/*; do $(MAKE) -C $$d clean 2>/dev/null || true; done
+	@$(MAKE) -C bootloader/uefi clean 2>/dev/null || true
+	@$(MAKE) -C bootloader/legacy clean 2>/dev/null || true
+
+distclean: clean
+	@echo "==> Deep cleaning..."
+	@rm -rf $(BUILD_DIR)
+	@rm -rf repo/pool repo/dists
+
+install:
+	@echo "==> Installing build artifacts..."
+	@cp -r $(OUT_DIR)/* /usr/local/hwrun/
+```
+
+3.2 构建环境 Dockerfile
+
+```dockerfile
+# build/env/Dockerfile
+
+FROM debian:bookworm
+
+# 构建依赖
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc-12 \
+    g++-12 \
+    gcc-x86-64-linux-gnu \
+    nasm \
+    xorriso \
+    mtools \
+    dosfstools \
+    squashfs-tools \
+    debootstrap \
+    live-build \
+    dpkg-dev \
+    devscripts \
+    fakeroot \
+    reprepro \
+    wget \
+    curl \
+    git \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-yaml \
+    python3-tomli \
+    && rm -rf /var/lib/apt/lists/*
+
+# GNU EFI (UEFI 开发库)
+RUN apt-get install -y gnu-efi && rm -rf /var/lib/apt/lists/*
+
+# 设置环境变量
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+
+# 创建工作目录
+WORKDIR /build
+
+# 默认命令
+CMD ["make", "-j$(nproc)"]
+```
+
+3.3 内核模块通用 Makefile 模板
+
+```makefile
+# plugins/<module>/Makefile
+
+obj-m := $(MODULE_NAME).o
+
+# 多文件模块
+$(MODULE_NAME)-objs := $(MODULE_NAME)_main.o $(MODULE_NAME)_sub.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 $(MODULE_NAME).ko /usr/lib/hwrun/plugins/
+```
+
+3.4 用户态插件通用 Makefile 模板
+
+```makefile
+# plugins/<plugin>/Makefile
+
+CC = gcc
+CFLAGS = -fPIC -Wall -Wextra -O2 -Iinclude
+LDFLAGS = -shared
+
+TARGET = $(PLUGIN_NAME).so
+OBJS = $(PLUGIN_NAME).o $(PLUGIN_NAME)_sub.o
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+install:
+	install -D -m 644 $(TARGET) /usr/lib/hwrun/plugins/
+```
+
+四、ISO 构建
+
+4.1 ISO 构建脚本
+
+```bash
+#!/bin/bash
+# iso/build-iso.sh
+
+set -e
+
+OUT_DIR="$1"
+ISO_DIR="$(pwd)/iso"
+VERSION=$(cat VERSION)
+
+echo "==> HWRun OS ISO Build v$VERSION"
+
+# 1. 准备 live-build 配置
+lb config \
+    -a amd64 \
+    -d bookworm \
+    --archive-areas "main contrib non-free" \
+    --mirror-bootstrap http://deb.debian.org/debian \
+    --mirror-binary http://deb.debian.org/debian \
+    --bootloaders "syslinux,grub-efi" \
+    --binary-images iso-hybrid \
+    --iso-application "HWRun OS" \
+    --iso-preparer "HWRun Team" \
+    --iso-publisher "HWRun OS" \
+    --iso-volume "HWRun OS $VERSION" \
+    --cache-packages true
+
+# 2. 添加软件包列表
+cat > config/package-lists/hwrun.list.chroot <<EOF
+linux-image-hwrun
+linux-headers-hwrun
+hwrun-bus
+hwrun-param
+hwrun-log
+hwrun-git
+hwrun-ui
+hwrun-shell
+hwrun-desktop
+hwrun-pkgmgr
+hwrun-monitor
+hwrun-sandbox
+openssh-server
+sudo
+systemd-sysv
+EOF
+
+# 3. 添加 HWRun APT 源
+mkdir -p config/archives
+cat > config/archives/hwrun.list.chroot <<EOF
+deb [trusted=yes] http://repo.hwrun.org/debian bookworm main
+EOF
+
+# 4. 添加 HWRun 公钥
+cp repo/repo.key config/archives/
+
+# 5. 添加预置配置 (自动安装)
+mkdir -p config/includes.installer/preseed
+cat > config/includes.installer/preseed/hwrun.seed <<'EOF'
+# HWRun OS 自动安装配置
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i netcfg/choose_interface select auto
+d-i netcfg/dhcp_timeout string 60
+d-i netcfg/get_hostname string hwrun-node
+d-i time/zone string UTC
+d-i clock-setup/utc boolean true
+d-i partman-auto/method string regular
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string HWRun User
+d-i passwd/username string hwrun
+d-i passwd/user-password password hwrun
+d-i passwd/user-password-again password hwrun
+d-i passwd/user-default-groups string sudo
+tasksel tasksel/first multiselect standard
+d-i pkgsel/include string openssh-server hwrun-core
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean true
+d-i finish-install/reboot_in_progress note
+EOF
+
+# 6. 添加首次启动脚本
+mkdir -p config/includes.chroot/usr/lib/hwrun/firstboot/
+cat > config/includes.chroot/usr/lib/hwrun/firstboot/01-hwrun-init.sh <<'EOF'
+#!/bin/bash
+if [ ! -f /var/lib/hwrun/firstboot.done ]; then
+    echo "HWRun OS v1.0: 首次启动初始化..."
+    hwrun probe
+    hwrun setup --auto
+    touch /var/lib/hwrun/firstboot.done
+    echo "HWRun OS v1.0: 已就绪。"
+fi
+EOF
+chmod +x config/includes.chroot/usr/lib/hwrun/firstboot/01-hwrun-init.sh
+
+# 7. 添加 /etc/issue 横幅
+mkdir -p config/includes.chroot/etc
+cat > config/includes.chroot/etc/issue <<'EOF'
+
+     ██╗  ██╗██╗    ██╗██████╗ ██╗   ██╗███╗   ██╗
+     ██║  ██║██║    ██║██╔══██╗██║   ██║████╗  ██║
+     ███████║██║ █╗ ██║██████╔╝██║   ██║██╔██╗ ██║
+     ██╔══██║██║███╗██║██╔══██╗██║   ██║██║╚██╗██║
+     ██║  ██║╚███╔███╔╝██║  ██║╚██████╔╝██║ ╚████║
+     ╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+
+    HWRun OS v1.0
+    Any Hardware, One Result.
+
+    快速开始: hwrun --help
+EOF
+
+# 8. 添加 Shell 提示符
+mkdir -p config/includes.chroot/etc/skel
+cat > config/includes.chroot/etc/skel/.bashrc <<'EOF'
+PS1='\[\033[38;2;0;212;255m\]┌─\[\033[0m\]\[\033[38;2;100;200;255m\]\u\[\033[0m\]\[\033[38;2;0;212;255m\]@\[\033[0m\]\[\033[38;2;100;200;255m\]\h\[\033[0m\]\[\033[38;2;0;212;255m\]─\[\033[0m\]\[\033[38;2;88;88;128m\]\w\[\033[0m\]\n\[\033[38;2;0;212;255m\]└─\[\033[0m\]\[\033[38;2;0;212;255m\]▶\[\033[0m\] '
+EOF
+
+# 9. 添加 GRUB 主题
+mkdir -p config/includes.chroot/boot/grub/themes/hwrun
+# (复制 GRUB 主题文件)
+
+# 10. 构建 ISO
+sudo lb build
+
+# 11. 复制产物
+cp live-image-amd64.hybrid.iso "$OUT_DIR/iso/hwrun-os-amd64.hybrid.iso"
+
+echo "==> ISO build complete: $OUT_DIR/iso/hwrun-os-amd64.hybrid.iso"
+```
+
+五、APT 仓库构建
+
+5.1 仓库配置
+
+```bash
+# repo/conf/distributions
+
+Origin: HWRun OS
+Label: HWRun OS Repository
+Codename: bookworm
+Architectures: amd64 arm64
+Components: main
+Description: HWRun OS Official Repository
+SignWith: repo@hwrun.org
+```
+
+5.2 仓库构建脚本
+
+```bash
+#!/bin/bash
+# repo/build-repo.sh
+
+set -e
+
+DEB_DIR="$1"
+REPO_DIR="$(pwd)/repo"
+
+echo "==> Building APT repository..."
+
+# 1. 创建 GPG 密钥（如果不存在）
+if [ ! -f "$REPO_DIR/repo.key" ]; then
+    gpg --batch --gen-key <<EOF
+%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Subkey-Type: RSA
+Subkey-Length: 4096
+Name-Real: HWRun OS Repository
+Name-Email: repo@hwrun.org
+Expire-Date: 0
+EOF
+    gpg --armor --export repo@hwrun.org > "$REPO_DIR/repo.key"
+fi
+
+# 2. 添加 .deb 包到仓库
+for deb in "$DEB_DIR"/*.deb; do
+    echo "Adding: $(basename $deb)"
+    reprepro -b "$REPO_DIR" includedeb bookworm "$deb"
+done
+
+# 3. 生成仓库元数据
+reprepro -b "$REPO_DIR" export bookworm
+
+echo "==> APT repository built: $REPO_DIR"
+```
+
+六、CI/CD 流水线
+
+6.1 GitHub Actions 配置
+
+```yaml
+# .github/workflows/build.yml
+
+name: Build HWRun OS
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build builder image
+        run: docker build -t hwrun-builder -f build/env/Dockerfile .
+      
+      - name: Build HWRun OS
+        run: |
+          docker run --rm \
+            -v $(pwd):/build \
+            -w /build \
+            hwrun-builder \
+            make -j$(nproc) all
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwrun-os
+          path: |
+            build/out/iso/*.iso
+            build/out/debian/*.deb
+      
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/out/iso/*.iso
+            build/out/debian/*.deb
+```
+
+七、构建命令
+
+```bash
+# 完整构建
+make all
+
+# 只构建特定阶段
+make kernel          # 只构建微内核
+make modules         # 只构建内核模块
+make plugins         # 只构建用户态插件
+make bootloader      # 只构建引导加载器
+make debian          # 只构建 Debian 包
+make iso             # 只构建 ISO
+make repo            # 只构建 APT 仓库
+
+# 清理
+make clean           # 清理构建产物
+make distclean       # 深度清理
+
+# 在 Docker 容器中构建
+docker run --rm -v $(pwd):/build -w /build hwrun-builder make all
+
+# 交叉编译 (ARM64)
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- all
+```
+
+八、总结
+
+维度 决策
+构建工具 GNU Make + Docker
+微内核 x86_64-elf-gcc 交叉编译
+内核模块 Linux kbuild 系统
+用户态插件 GCC 编译为 .so
+引导加载器 NASM (Legacy) + GNU EFI (UEFI)
+基础系统 debootstrap (Debian 12)
+打包格式 .deb (dpkg-buildpackage)
+ISO 构建 live-build
+APT 仓库 reprepro
+CI/CD GitHub Actions
+产物大小 ISO ~200-500MB
+
+BUILD 是 HWRun OS 的构建系统，将分散的源码（微内核、内核模块、用户态插件、引导加载器）编译、打包、组装成可启动的操作系统镜像。构建流程分为 8 个阶段，从微内核到 ISO 逐层构建，最终输出可启动 ISO 和 APT 仓库。整个构建过程可通过 Makefile 一键完成，也支持分阶段构建和 CI/CD 自动化。

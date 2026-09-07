@@ -1,0 +1,1158 @@
+﻿HWRun OS CONSENSUS 实现文档
+
+模块名称： CONSENSUS (Consensus Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 共识协议，基于 Raft 算法实现分布式集群的领导者选举、日志复制和状态机一致性管理
+实现语言： C（基于 libraft 库）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、NP（网络协议）、CLUSTER（集群管理）、STORAGE（持久化存储）
+提供协议： CONSENSUS
+
+一、设计哲学
+
+1.1 核心定位
+
+CONSENSUS 是 HWRun OS 的分布式共识核心——让集群中的多个节点能够就某个值达成一致，确保在部分节点故障的情况下系统仍能正确运行。
+
+```
+CONSENSUS = 共识协议 = 分布式系统一致性的保障
+
+客户端请求
+    │
+    ▼
+Leader 节点
+    │
+    │  1. 接收请求 → 创建日志条目
+    │  2. 并行复制到所有 Follower
+    │  3. 等待多数节点确认
+    │  4. 提交日志 → 应用到状态机
+    │  5. 返回响应给客户端
+    ▼
+所有节点状态一致
+```
+
+1.2 设计原则
+
+1. 强领导者：只有一个 Leader 处理客户端请求，简化决策流程
+2. 日志复制：Leader 将请求作为日志条目复制到所有 Follower
+3. 多数派提交：只有超过半数节点确认后，日志才被提交
+4. 安全性优先：确保所有节点最终状态一致，即使发生故障
+5. 成员变更：支持集群成员的动态添加和移除（Joint Consensus）
+6. 持久化：日志和元数据持久化存储，节点重启后恢复
+
+1.3 Raft 核心机制
+
+Raft 将共识问题分解为三个子问题：
+
+子问题 说明
+Leader 选举 当 Leader 失效时，选举新的 Leader
+日志复制 Leader 将日志复制到所有 Follower
+安全性 确保所有节点状态一致，防止脑裂
+
+节点角色：
+
+角色 职责
+Leader 处理客户端请求，复制日志到所有节点
+Follower 被动接收 Leader 的指令，响应投票和日志复制请求
+Candidate 临时角色，用于发起选举
+
+二、整体架构
+
+2.1 CONSENSUS 插件的组成
+
+```
+CONSENSUS 插件
+├── 协议处理层
+│   ├── consensus_ipc_handler()   ← IPC 消息分发
+│   ├── consensus_propose()       ← 提议新的值
+│   ├── consensus_vote()          ← 投票请求
+│   ├── consensus_append_entries()← 日志复制请求
+│   ├── consensus_get_state()     ← 获取共识状态
+│   └── consensus_transfer_leadership() ← 转移领导权
+│
+├── Raft 核心引擎 (基于 libraft)
+│   ├── raft.c                    ← Raft 核心算法逻辑[reference:12]
+│   ├── raft_log.c                ← 日志管理
+│   ├── raft_election.c           ← 领导者选举[reference:13]
+│   ├── raft_replication.c        ← 日志复制
+│   └── raft_persistence.c        ← 持久化存储
+│
+├── RPC 通信层
+│   ├── consensus_rpc.c           ← 节点间 RPC 通信
+│   └── consensus_network.c       ← 网络层封装
+│
+└── 初始化/清理
+    ├── consensus_init()          ← 插件加载
+    └── consensus_exit()          ← 插件卸载
+```
+
+2.2 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CONSENSUS 插件架构                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  CONSENSUS 协议接口 (通过 IPC 调用)                                 │   │
+│  │  Propose / Vote / AppendEntries / GetState / TransferLeadership   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层                                                         │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 消息序列化                                                     │   │
+│  │  └── 权限检查                                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Raft 核心引擎 (libraft)                                            │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  Leader 选举 (Election)                                    │   │   │
+│  │  │  ├── 选举超时定时器 (Election Timer)                       │   │   │
+│  │  │  ├── 任期递增 (Term Increment)                             │   │   │
+│  │  │  ├── 请求投票 (RequestVote RPC)                           │   │   │
+│  │  │  └── 投票计数与晋升 (Vote Counting)                       │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  日志复制 (Log Replication)                                │   │   │
+│  │  │  ├── 日志条目追加 (AppendEntries RPC)                     │   │   │
+│  │  │  ├── 日志匹配属性 (Log Matching)                          │   │   │
+│  │  │  ├── 多数派确认 (Majority Commit)                        │   │   │
+│  │  │  └── 状态机应用 (Apply to State Machine)                 │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │  │  安全性 (Safety)                                           │   │   │
+│  │  │  ├── 选举限制 (Election Restriction)                      │   │   │
+│  │  │  ├── 领导者完整性 (Leader Completeness)                   │   │   │
+│  │  │  └── 日志匹配 (Log Matching)                              │   │   │
+│  │  └─────────────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  持久化存储 (STORAGE 协议)                                         │   │
+│  │  ├── 日志条目持久化                                                 │   │
+│  │  ├── 元数据持久化 (Term, Vote)                                    │   │
+│  │  └── 快照管理                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  网络通信 (NP 协议)                                                 │   │
+│  │  ├── RequestVote RPC                                              │   │
+│  │  ├── AppendEntries RPC                                            │   │
+│  │  └── 心跳 (Heartbeat)                                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+三、核心数据结构
+
+```c
+// consensus/include/consensus.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   节点状态 (Raft 角色)
+   ============================================================ */
+typedef enum {
+    RAFT_STATE_FOLLOWER = 0,
+    RAFT_STATE_CANDIDATE,
+    RAFT_STATE_LEADER,
+} raft_state_t;
+
+/* ============================================================
+   日志条目
+   ============================================================ */
+typedef struct raft_log_entry {
+    uint64_t index;                 // 日志索引
+    uint64_t term;                  // 任期号
+    uint32_t type;                  // 条目类型 (0=普通, 1=配置变更)
+    uint32_t data_len;              // 数据长度
+    uint8_t *data;                  // 数据内容
+    struct raft_log_entry *next;
+} raft_log_entry_t;
+
+/* ============================================================
+   Raft 节点信息
+   ============================================================ */
+typedef struct raft_node {
+    uint64_t id;                    // 节点 ID
+    char address[64];               // 节点地址 (IP:Port)
+    int voting;                     // 是否有投票权
+    int active;                     // 是否活跃
+    struct raft_node *next;
+} raft_node_t;
+
+/* ============================================================
+   Raft 状态
+   ============================================================ */
+typedef struct raft_state {
+    raft_state_t role;              // 当前角色
+    uint64_t current_term;          // 当前任期
+    uint64_t voted_for;             // 当前任期投票给了谁 (0=未投票)
+    uint64_t commit_index;          // 已提交的最高日志索引
+    uint64_t last_applied;          // 已应用的最高日志索引
+    uint64_t last_log_index;        // 日志中最后一条的索引
+    uint64_t last_log_term;         // 日志中最后一条的任期
+    uint64_t election_timeout_ms;   // 选举超时 (毫秒)[reference:14]
+    uint64_t heartbeat_interval_ms; // 心跳间隔 (毫秒)
+    uint64_t last_heartbeat_time;   // 最后心跳时间
+} raft_state_t;
+
+/* ============================================================
+   选举请求
+   ============================================================ */
+typedef struct request_vote_req {
+    uint64_t term;                  // 候选人的任期
+    uint64_t candidate_id;          // 候选人 ID
+    uint64_t last_log_index;        // 候选人最后日志索引
+    uint64_t last_log_term;         // 候选人最后日志任期
+} request_vote_req_t;
+
+/* ============================================================
+   选举响应
+   ============================================================ */
+typedef struct request_vote_resp {
+    uint64_t term;                  // 当前任期 (用于候选人更新)
+    int vote_granted;               // 是否投票给候选人
+} request_vote_resp_t;
+
+/* ============================================================
+   日志追加请求 (AppendEntries RPC)
+   ============================================================ */
+typedef struct append_entries_req {
+    uint64_t term;                  // 领导者的任期
+    uint64_t leader_id;             // 领导者 ID
+    uint64_t prev_log_index;        // 前一条日志的索引
+    uint64_t prev_log_term;         // 前一条日志的任期
+    raft_log_entry_t *entries;      // 要追加的日志条目
+    uint32_t entry_count;           // 日志条目数量
+    uint64_t leader_commit;         // 领导者的 commit_index
+} append_entries_req_t;
+
+/* ============================================================
+   日志追加响应
+   ============================================================ */
+typedef struct append_entries_resp {
+    uint64_t term;                  // 当前任期 (用于领导者更新)
+    int success;                    // 是否成功 (日志匹配)
+    uint64_t last_log_index;        // 节点当前最后日志索引
+} append_entries_resp_t;
+
+/* ============================================================
+   CONSENSUS 上下文
+   ============================================================ */
+typedef struct consensus_context {
+    int initialized;
+    uint64_t consensus_task_id;     // CONSENSUS 自身的任务 ID
+    
+    raft_state_t state;             // Raft 状态
+    raft_node_t *nodes;             // 集群节点列表
+    uint32_t node_count;
+    uint64_t self_id;               // 自身节点 ID
+    
+    raft_log_entry_t *log;          // 日志链表
+    uint32_t log_count;
+    
+    // 选举定时器
+    void *election_timer;
+    
+    // 持久化存储句柄
+    void *storage;
+    
+    // 网络层句柄
+    void *network;
+    
+    void *lock;
+} consensus_context_t;
+```
+
+四、CONSENSUS 协议定义
+
+```protobuf
+// protocols/consensus.proto
+syntax = "proto3";
+
+package hwrun.consensus;
+
+service Consensus {
+    // === 共识操作 ===
+    rpc Propose(ProposeRequest) returns (ProposeResponse);
+    rpc GetState(Empty) returns (GetStateResponse);
+    rpc TransferLeadership(TransferRequest) returns (TransferResponse);
+    
+    // === 集群成员管理 ===
+    rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
+    rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+    rpc ListNodes(Empty) returns (ListNodesResponse);
+}
+
+message Empty {}
+
+// ============ 共识操作 ============
+
+message ProposeRequest {
+    bytes data = 1;                 // 要提议的数据
+    uint32 timeout_ms = 2;          // 超时时间 (可选)
+}
+
+message ProposeResponse {
+    uint64 index = 1;               // 日志索引
+    uint64 term = 2;                // 任期号
+    bool success = 3;
+    int32 error = 4;
+}
+
+message GetStateResponse {
+    string role = 1;                // "leader", "follower", "candidate"
+    uint64 term = 2;
+    uint64 commit_index = 3;
+    uint64 last_log_index = 4;
+    uint64 leader_id = 5;
+    int32 error = 6;
+}
+
+message TransferRequest {
+    uint64 target_node_id = 1;      // 目标节点 ID
+}
+
+message TransferResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 集群成员管理 ============
+
+message AddNodeRequest {
+    uint64 node_id = 1;
+    string address = 2;             // IP:Port
+    bool voting = 3;
+}
+
+message AddNodeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message RemoveNodeRequest {
+    uint64 node_id = 1;
+}
+
+message RemoveNodeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message NodeInfo {
+    uint64 id = 1;
+    string address = 2;
+    bool voting = 3;
+    bool active = 4;
+    string role = 5;                // "leader", "follower", "candidate"
+}
+
+message ListNodesResponse {
+    repeated NodeInfo nodes = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// consensus/src/consensus.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+
+#include <raft.h>
+
+#include "consensus.h"
+#include "consensus_ipc.h"
+#include "consensus_raft.h"
+#include "consensus_rpc.h"
+#include "consensus_storage.h"
+
+static consensus_context_t g_cons_ctx = {0};
+
+/* ============================================================
+   插件初始化
+   ============================================================ */
+int consensus_init(void) {
+    int ret;
+    
+    log_info("CONSENSUS: Initializing...");
+    
+    // 1. 初始化上下文
+    memset(&g_cons_ctx, 0, sizeof(consensus_context_t));
+    
+    // 2. 加载配置
+    consensus_load_config(&g_cons_ctx);
+    
+    // 3. 初始化 Raft 状态
+    g_cons_ctx.state.role = RAFT_STATE_FOLLOWER;
+    g_cons_ctx.state.current_term = 0;
+    g_cons_ctx.state.voted_for = 0;
+    g_cons_ctx.state.commit_index = 0;
+    g_cons_ctx.state.last_applied = 0;
+    g_cons_ctx.state.election_timeout_ms = 300;   // 150-300ms 随机[reference:15]
+    g_cons_ctx.state.heartbeat_interval_ms = 100;
+    
+    // 4. 加载持久化状态
+    ret = consensus_storage_load(&g_cons_ctx);
+    if (ret < 0) {
+        log_warn("CONSENSUS: No persisted state, starting fresh");
+    }
+    
+    // 5. 初始化 RPC 通信层
+    ret = consensus_rpc_init(&g_cons_ctx);
+    if (ret < 0) {
+        log_error("CONSENSUS: Failed to initialize RPC");
+        return ret;
+    }
+    
+    // 6. 启动选举定时器
+    consensus_start_election_timer(&g_cons_ctx);
+    
+    // 7. 注册 IPC 消息处理器
+    ret = consensus_ipc_register();
+    if (ret < 0) {
+        log_error("CONSENSUS: Failed to register IPC handler");
+        return ret;
+    }
+    
+    // 8. 注册 CONSENSUS 协议
+    consensus_register_protocol();
+    
+    g_cons_ctx.initialized = 1;
+    log_info("CONSENSUS: Initialized successfully");
+    log_info("  Node ID: %lu, Role: %s, Term: %lu",
+             g_cons_ctx.self_id,
+             g_cons_ctx.state.role == RAFT_STATE_FOLLOWER ? "Follower" :
+             g_cons_ctx.state.role == RAFT_STATE_CANDIDATE ? "Candidate" : "Leader",
+             g_cons_ctx.state.current_term);
+    
+    return 0;
+}
+```
+
+5.2 Leader 选举
+
+Raft 的 Leader 选举通过定时器和心跳机制实现。当 Follower 没有在一段时间内收到 Leader 的心跳时，它会进入选举状态。
+
+```c
+// consensus/src/consensus_raft.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <raft.h>
+
+#include "consensus.h"
+#include "consensus_raft.h"
+#include "consensus_rpc.h"
+
+/* ============================================================
+   选举超时处理
+   ============================================================ */
+void consensus_handle_election_timeout(consensus_context_t *ctx) {
+    // 只有 Follower 才能发起选举
+    if (ctx->state.role != RAFT_STATE_FOLLOWER) {
+        return;
+    }
+    
+    log_info("CONSENSUS: Election timeout, starting election");
+    
+    // 1. 增加任期
+    ctx->state.current_term++;
+    ctx->state.role = RAFT_STATE_CANDIDATE;
+    ctx->state.voted_for = ctx->self_id;  // 投给自己
+    
+    log_info("CONSENSUS: Became candidate for term %lu", ctx->state.current_term);
+    
+    // 2. 发送投票请求到所有其他节点
+    request_vote_req_t req;
+    req.term = ctx->state.current_term;
+    req.candidate_id = ctx->self_id;
+    req.last_log_index = ctx->state.last_log_index;
+    req.last_log_term = ctx->state.last_log_term;
+    
+    int votes = 1;  // 自己投自己
+    raft_node_t *node = ctx->nodes;
+    
+    while (node) {
+        if (node->id != ctx->self_id && node->active) {
+            request_vote_resp_t resp;
+            int ret = consensus_rpc_request_vote(ctx, node, &req, &resp);
+            if (ret == 0 && resp.vote_granted) {
+                votes++;
+            }
+            // 如果返回的任期比当前大，更新任期
+            if (ret == 0 && resp.term > ctx->state.current_term) {
+                ctx->state.current_term = resp.term;
+                ctx->state.role = RAFT_STATE_FOLLOWER;
+                ctx->state.voted_for = 0;
+                log_info("CONSENSUS: Term updated to %lu, stepping down", resp.term);
+                return;
+            }
+        }
+        node = node->next;
+    }
+    
+    // 3. 检查是否获得多数票
+    int needed = (ctx->node_count / 2) + 1;
+    if (votes >= needed) {
+        ctx->state.role = RAFT_STATE_LEADER;
+        log_info("CONSENSUS: Node %lu elected as Leader for term %lu",
+                 ctx->self_id, ctx->state.current_term);
+        
+        // 发送心跳 (空 AppendEntries RPC)
+        consensus_send_heartbeat(ctx);
+        
+        // 启动心跳定时器
+        consensus_start_heartbeat_timer(ctx);
+    } else {
+        // 未获得多数票，回到 Follower 状态
+        ctx->state.role = RAFT_STATE_FOLLOWER;
+        log_warn("CONSENSUS: Election failed, got %d/%d votes", votes, needed);
+        
+        // 随机延迟后重试 (避免多个节点同时发起选举)[reference:18]
+        int delay = 100 + rand() % 300;
+        usleep(delay * 1000);
+        consensus_handle_election_timeout(ctx);
+    }
+}
+
+/* ============================================================
+   处理投票请求 (其他节点发来的)
+   ============================================================ */
+int consensus_handle_request_vote(consensus_context_t *ctx,
+                                   request_vote_req_t *req,
+                                   request_vote_resp_t *resp) {
+    resp->term = ctx->state.current_term;
+    resp->vote_granted = 0;
+    
+    // 1. 如果请求的任期小于当前任期，拒绝投票
+    if (req->term < ctx->state.current_term) {
+        return 0;
+    }
+    
+    // 2. 如果请求的任期大于当前任期，更新任期
+    if (req->term > ctx->state.current_term) {
+        ctx->state.current_term = req->term;
+        ctx->state.role = RAFT_STATE_FOLLOWER;
+        ctx->state.voted_for = 0;
+        resp->term = ctx->state.current_term;
+    }
+    
+    // 3. 检查是否已经投票给其他人
+    if (ctx->state.voted_for != 0 && ctx->state.voted_for != req->candidate_id) {
+        return 0;  // 已经投给其他人
+    }
+    
+    // 4. 选举限制：候选人的日志必须至少和本地一样新[reference:19]
+    if (req->last_log_term < ctx->state.last_log_term) {
+        return 0;  // 候选人的日志更旧
+    }
+    if (req->last_log_term == ctx->state.last_log_term &&
+        req->last_log_index < ctx->state.last_log_index) {
+        return 0;  // 候选人的日志更短
+    }
+    
+    // 5. 投票给候选人
+    ctx->state.voted_for = req->candidate_id;
+    resp->vote_granted = 1;
+    
+    log_info("CONSENSUS: Node %lu voted for candidate %lu (term %lu)",
+             ctx->self_id, req->candidate_id, req->term);
+    
+    // 持久化投票状态
+    consensus_storage_save_vote(ctx);
+    
+    return 0;
+}
+```
+
+5.3 日志复制
+
+Raft 的日志复制遵循“先复制后提交”原则，确保多数节点达成共识后才应用日志。
+
+```c
+// consensus/src/consensus_replication.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "consensus.h"
+#include "consensus_replication.h"
+#include "consensus_rpc.h"
+
+/* ============================================================
+   客户端提议 (Leader 接收客户端请求)
+   ============================================================ */
+int consensus_propose(consensus_context_t *ctx, const uint8_t *data,
+                       uint32_t data_len, uint64_t *out_index) {
+    // 只有 Leader 才能处理客户端请求[reference:21]
+    if (ctx->state.role != RAFT_STATE_LEADER) {
+        return -ENOTLEADER;
+    }
+    
+    // 1. 创建日志条目
+    raft_log_entry_t *entry = malloc(sizeof(raft_log_entry_t));
+    if (!entry) {
+        return -ENOMEM;
+    }
+    
+    entry->index = ctx->state.last_log_index + 1;
+    entry->term = ctx->state.current_term;
+    entry->type = 0;  // 普通条目
+    entry->data_len = data_len;
+    entry->data = malloc(data_len);
+    if (entry->data) {
+        memcpy(entry->data, data, data_len);
+    }
+    entry->next = NULL;
+    
+    // 2. 追加到本地日志
+    consensus_append_log(ctx, entry);
+    
+    // 3. 并行复制到所有 Follower
+    append_entries_req_t req;
+    req.term = ctx->state.current_term;
+    req.leader_id = ctx->self_id;
+    req.prev_log_index = ctx->state.last_log_index - 1;
+    req.prev_log_term = consensus_get_log_term(ctx, req.prev_log_index);
+    req.entries = entry;
+    req.entry_count = 1;
+    req.leader_commit = ctx->state.commit_index;
+    
+    int success_count = 1;  // 自己算一个
+    raft_node_t *node = ctx->nodes;
+    
+    while (node) {
+        if (node->id != ctx->self_id && node->active) {
+            append_entries_resp_t resp;
+            int ret = consensus_rpc_append_entries(ctx, node, &req, &resp);
+            if (ret == 0 && resp.success) {
+                success_count++;
+            }
+            // 如果返回的任期更大，更新任期
+            if (ret == 0 && resp.term > ctx->state.current_term) {
+                ctx->state.current_term = resp.term;
+                ctx->state.role = RAFT_STATE_FOLLOWER;
+                ctx->state.voted_for = 0;
+                log_info("CONSENSUS: Term updated to %lu, stepping down", resp.term);
+                return -ESTALE;
+            }
+        }
+        node = node->next;
+    }
+    
+    // 4. 检查是否获得多数派确认
+    int needed = (ctx->node_count / 2) + 1;
+    if (success_count >= needed) {
+        // 提交日志[reference:22]
+        ctx->state.commit_index = entry->index;
+        log_info("CONSENSUS: Log entry %lu committed (term %lu)",
+                 entry->index, ctx->state.current_term);
+        
+        // 应用到状态机[reference:23]
+        consensus_apply_to_state_machine(ctx, entry);
+        ctx->state.last_applied = entry->index;
+        
+        *out_index = entry->index;
+        return 0;
+    }
+    
+    // 5. 未获得多数派确认，需要重试或超时
+    log_warn("CONSENSUS: Log entry %lu not confirmed by majority", entry->index);
+    return -EAGAIN;
+}
+
+/* ============================================================
+   处理 AppendEntries RPC (Follower 接收 Leader 的日志)
+   ============================================================ */
+int consensus_handle_append_entries(consensus_context_t *ctx,
+                                     append_entries_req_t *req,
+                                     append_entries_resp_t *resp) {
+    resp->term = ctx->state.current_term;
+    resp->success = 0;
+    resp->last_log_index = ctx->state.last_log_index;
+    
+    // 1. 检查任期
+    if (req->term < ctx->state.current_term) {
+        return 0;  // 拒绝旧的 Leader
+    }
+    
+    // 2. 如果请求的任期大于当前任期，更新任期
+    if (req->term > ctx->state.current_term) {
+        ctx->state.current_term = req->term;
+        ctx->state.role = RAFT_STATE_FOLLOWER;
+        ctx->state.voted_for = 0;
+        resp->term = ctx->state.current_term;
+    }
+    
+    // 3. 更新心跳时间 (防止选举超时)
+    ctx->state.last_heartbeat_time = time(NULL);
+    
+    // 4. 检查前一条日志是否匹配[reference:24]
+    if (req->prev_log_index > 0) {
+        raft_log_entry_t *prev = consensus_find_log(ctx, req->prev_log_index);
+        if (!prev || prev->term != req->prev_log_term) {
+            // 日志不匹配，拒绝
+            resp->last_log_index = ctx->state.last_log_index;
+            return 0;
+        }
+    }
+    
+    // 5. 追加新日志
+    raft_log_entry_t *entry = req->entries;
+    while (entry) {
+        // 检查是否已存在 (相同索引和任期)
+        raft_log_entry_t *existing = consensus_find_log(ctx, entry->index);
+        if (existing) {
+            // 如果任期相同，跳过
+            if (existing->term == entry->term) {
+                entry = entry->next;
+                continue;
+            }
+            // 任期不同，删除后续日志 (冲突)
+            consensus_truncate_log(ctx, entry->index);
+        }
+        
+        // 追加日志
+        consensus_append_log(ctx, entry);
+        entry = entry->next;
+    }
+    
+    // 6. 更新 commit_index
+    if (req->leader_commit > ctx->state.commit_index) {
+        ctx->state.commit_index = req->leader_commit;
+        
+        // 应用所有未应用的日志
+        while (ctx->state.last_applied < ctx->state.commit_index) {
+            raft_log_entry_t *applied = consensus_find_log(ctx,
+                                                           ctx->state.last_applied + 1);
+            if (applied) {
+                consensus_apply_to_state_machine(ctx, applied);
+                ctx->state.last_applied = applied->index;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    // 7. 持久化
+    consensus_storage_save_log(ctx);
+    
+    resp->success = 1;
+    resp->last_log_index = ctx->state.last_log_index;
+    return 0;
+}
+```
+
+5.4 心跳机制
+
+心跳是 Leader 维持权威的关键机制。Leader 通过周期性发送空 AppendEntries RPC 来防止 Follower 发起选举。
+
+```c
+// consensus/src/consensus_heartbeat.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "consensus.h"
+#include "consensus_heartbeat.h"
+#include "consensus_rpc.h"
+
+/* ============================================================
+   发送心跳 (空 AppendEntries RPC)
+   ============================================================ */
+void consensus_send_heartbeat(consensus_context_t *ctx) {
+    if (ctx->state.role != RAFT_STATE_LEADER) {
+        return;
+    }
+    
+    // 构建空 AppendEntries 请求 (心跳)
+    append_entries_req_t req;
+    req.term = ctx->state.current_term;
+    req.leader_id = ctx->self_id;
+    req.prev_log_index = ctx->state.last_log_index;
+    req.prev_log_term = ctx->state.last_log_term;
+    req.entries = NULL;
+    req.entry_count = 0;
+    req.leader_commit = ctx->state.commit_index;
+    
+    // 发送到所有 Follower
+    raft_node_t *node = ctx->nodes;
+    while (node) {
+        if (node->id != ctx->self_id && node->active) {
+            append_entries_resp_t resp;
+            int ret = consensus_rpc_append_entries(ctx, node, &req, &resp);
+            if (ret == 0 && resp.term > ctx->state.current_term) {
+                // 有更新的任期，让出领导权
+                ctx->state.current_term = resp.term;
+                ctx->state.role = RAFT_STATE_FOLLOWER;
+                ctx->state.voted_for = 0;
+                log_info("CONSENSUS: Stepping down, term %lu", resp.term);
+                return;
+            }
+        }
+        node = node->next;
+    }
+}
+
+/* ============================================================
+   心跳定时器
+   ============================================================ */
+void *consensus_heartbeat_timer(void *arg) {
+    consensus_context_t *ctx = (consensus_context_t *)arg;
+    
+    while (ctx->initialized) {
+        // 每隔 heartbeat_interval_ms 发送一次心跳
+        usleep(ctx->state.heartbeat_interval_ms * 1000);
+        
+        if (ctx->state.role == RAFT_STATE_LEADER) {
+            consensus_send_heartbeat(ctx);
+        }
+    }
+    
+    return NULL;
+}
+```
+
+5.5 持久化存储
+
+Raft 要求日志条目和元数据持久化存储，以便节点重启后恢复。
+
+```c
+// consensus/src/consensus_storage.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "consensus.h"
+#include "consensus_storage.h"
+
+/* ============================================================
+   保存 Raft 状态
+   ============================================================ */
+int consensus_storage_save(consensus_context_t *ctx) {
+    int fd;
+    char path[256];
+    raft_state_t *state = &ctx->state;
+    
+    // 使用 STORAGE 协议保存
+    // 实际实现中通过 IPC 调用 STORAGE 插件
+    
+    return 0;
+}
+
+/* ============================================================
+   加载 Raft 状态
+   ============================================================ */
+int consensus_storage_load(consensus_context_t *ctx) {
+    // 从持久化存储加载状态
+    // 包括：current_term, voted_for, 日志条目
+    
+    return 0;
+}
+```
+
+5.6 成员变更
+
+Raft 使用 Joint Consensus 实现安全的成员变更。
+
+```c
+// consensus/src/consensus_membership.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "consensus.h"
+#include "consensus_membership.h"
+
+/* ============================================================
+   添加节点 (使用 Joint Consensus)
+   ============================================================ */
+int consensus_add_node(consensus_context_t *ctx, uint64_t node_id,
+                        const char *address, int voting) {
+    if (ctx->state.role != RAFT_STATE_LEADER) {
+        return -ENOTLEADER;
+    }
+    
+    // 1. 创建配置变更日志条目 (联合共识)[reference:28]
+    // 旧配置 (Cold) + 新配置 (Cnew) = Joint Consensus
+    
+    // 2. 复制到所有节点 (包括新节点)
+    
+    // 3. 等待 Joint Consensus 提交[reference:29]
+    
+    // 4. 切换到新配置 (Cnew)
+    
+    // 5. 更新节点列表
+    
+    log_info("CONSENSUS: Node %lu added to cluster", node_id);
+    return 0;
+}
+
+/* ============================================================
+   移除节点
+   ============================================================ */
+int consensus_remove_node(consensus_context_t *ctx, uint64_t node_id) {
+    if (ctx->state.role != RAFT_STATE_LEADER) {
+        return -ENOTLEADER;
+    }
+    
+    // 类似添加节点，使用 Joint Consensus
+    
+    log_info("CONSENSUS: Node %lu removed from cluster", node_id);
+    return 0;
+}
+```
+
+5.7 IPC 消息处理
+
+```c
+// consensus/src/consensus_ipc.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "consensus.h"
+#include "consensus_ipc.h"
+#include "consensus_raft.h"
+#include "consensus_replication.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void consensus_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case CONSENSUS_MSG_PROPOSE: {
+            consensus_propose_req_t *req = (consensus_propose_req_t *)data;
+            consensus_propose_resp_t resp;
+            int ret = consensus_propose(&g_cons_ctx, req->data, req->data_len,
+                                         &resp.index);
+            resp.success = (ret == 0);
+            resp.term = g_cons_ctx.state.current_term;
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case CONSENSUS_MSG_GET_STATE: {
+            consensus_get_state_resp_t resp;
+            resp.role = g_cons_ctx.state.role;
+            resp.term = g_cons_ctx.state.current_term;
+            resp.commit_index = g_cons_ctx.state.commit_index;
+            resp.last_log_index = g_cons_ctx.state.last_log_index;
+            resp.leader_id = consensus_get_leader_id(&g_cons_ctx);
+            resp.error = 0;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case CONSENSUS_MSG_ADD_NODE: {
+            consensus_add_node_req_t *req = (consensus_add_node_req_t *)data;
+            int ret = consensus_add_node(&g_cons_ctx, req->node_id,
+                                          req->address, req->voting);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case CONSENSUS_MSG_LIST_NODES: {
+            // 返回节点列表
+            ipc_reply(from_task, g_cons_ctx.nodes,
+                      g_cons_ctx.node_count * sizeof(raft_node_t));
+            break;
+        }
+        
+        case CONSENSUS_MSG_REQUEST_VOTE: {
+            request_vote_req_t *req = (request_vote_req_t *)data;
+            request_vote_resp_t resp;
+            consensus_handle_request_vote(&g_cons_ctx, req, &resp);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case CONSENSUS_MSG_APPEND_ENTRIES: {
+            append_entries_req_t *req = (append_entries_req_t *)data;
+            append_entries_resp_t resp;
+            consensus_handle_append_entries(&g_cons_ctx, req, &resp);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        default:
+            log_warn("CONSENSUS: Unknown IPC message type: %u", msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/consensus.yml
+consensus:
+  # 节点 ID (必须唯一)
+  node_id: 1
+  
+  # 集群配置
+  cluster:
+    nodes:
+      - id: 1
+        address: "192.168.1.101:8443"
+        voting: true
+      - id: 2
+        address: "192.168.1.102:8443"
+        voting: true
+      - id: 3
+        address: "192.168.1.103:8443"
+        voting: true
+  
+  # 超时配置[reference:30]
+  election_timeout_ms: 300       # 150-300ms
+  heartbeat_interval_ms: 100
+  
+  # 日志配置
+  log:
+    max_entries: 10000
+    compact_threshold: 5000      # 超过此数量触发快照
+```
+
+七、命令行接口
+
+```bash
+# 查看共识状态
+hwrun consensus state
+# 输出:
+# Role: Leader, Term: 5, Commit Index: 1024
+# Leader ID: 1
+
+# 提议新值
+hwrun consensus propose --data "hello world"
+
+# 节点管理
+hwrun consensus nodes
+hwrun consensus node add --id 4 --address 192.168.1.104:8443
+hwrun consensus node remove --id 4
+
+# 转移领导权
+hwrun consensus transfer --target 2
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/consensus/plugin.yml
+plugin:
+  id: "consensus"
+  name: "Consensus Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 共识协议，基于 Raft 算法实现分布式一致性"
+  
+  provides:
+    - protocol: "CONSENSUS"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "NP"
+      version: "1.0"
+    - protocol: "CLUSTER"
+      version: "1.0"
+    - protocol: "STORAGE"
+      version: "1.0"
+  
+  params:
+    - key: "consensus.node_id"
+      type: "int"
+      required: true
+      description: "节点 ID"
+    - key: "consensus.cluster"
+      type: "list"
+      required: true
+      description: "集群节点列表"
+    - key: "consensus.election_timeout_ms"
+      type: "int"
+      default: 300
+      description: "选举超时 (毫秒)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/consensus.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# consensus/Makefile
+
+obj-m += consensus.o
+
+consensus-objs := consensus.o consensus_raft.o \
+                  consensus_replication.o consensus_heartbeat.o \
+                  consensus_storage.o consensus_membership.o \
+                  consensus_rpc.o consensus_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 consensus.ko /usr/lib/hwrun/plugins/
+```
+
+九、总结
+
+维度 决策
+定位 共识协议，分布式一致性的核心保障
+算法 Raft (强领导者、日志复制、多数派提交)
+实现方式 Linux 内核模块，基于 libraft
+代码量 ~1500-2000 行 C
+提供协议 CONSENSUS (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + NP + CLUSTER + STORAGE
+核心机制 Leader 选举、日志复制、心跳维持、成员变更 (Joint Consensus)
+
+CONSENSUS 是 HWRun OS 中分布式一致性的核心插件。它基于 Raft 算法，通过强领导者模型、日志复制和多数派提交机制，确保集群中所有节点最终达成一致状态。CONSENSUS 协议向上层插件（CLUSTER、INSTANCE 等）提供分布式共识服务，使 HWRun OS 从单机系统成为真正的分布式操作系统。

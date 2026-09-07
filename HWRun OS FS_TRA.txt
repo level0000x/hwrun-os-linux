@@ -1,0 +1,1106 @@
+﻿HWRun OS FS_TRANSFER 实现文档
+
+模块名称： FS_TRANSFER (File System Transfer Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 文件传输协议，提供跨节点、跨实例的高效文件传输功能，支持零拷贝、增量同步、断点续传
+实现语言： C（内核模块 + 用户态辅助服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统协议）、NP（网络协议）、STORAGE（存储后端）
+提供协议： FS_TRANSFER
+
+一、设计哲学
+
+1.1 核心定位
+
+FS_TRANSFER 是 HWRun OS 的文件传输核心——让文件能够在不同节点、不同实例之间高效、可靠地传输。
+
+```
+FS_TRANSFER = 文件传输协议 = 所有跨节点文件传输的统一入口
+
+用户/上层插件 (CLUSTER, INSTANCE, PKGMGR, ...)
+    │
+    │  通过 FS_TRANSFER 协议传输文件
+    ▼
+FS_TRANSFER 插件
+    │
+    │  基于 Linux 内核零拷贝机制
+    │  ├── 本地传输: splice() / sendfile()
+    │  ├── 跨节点传输: 基于 NP 协议 + 零拷贝管道
+    │  ├── 增量同步: rsync 算法 (用户态)
+    │  └── 断点续传: 分块 + 校验和
+    │
+    ▼
+Linux 内核 (splice / sendfile / pipe / 网络栈)
+```
+
+1.2 设计原则
+
+1. 零拷贝优先：利用 Linux 内核的 splice() 和 sendfile() 系统调用，实现内核态数据直接传输，减少 CPU 拷贝和上下文切换
+2. 协议驱动：所有文件传输操作通过 FS_TRANSFER 协议进行
+3. 多传输模式：支持本地传输、跨节点传输、流式传输
+4. 增量同步：支持文件差异传输，只传输变化的部分
+5. 断点续传：支持传输中断后从断点继续
+6. 校验和验证：传输完成后验证文件完整性
+
+1.3 Linux 零拷贝机制
+
+FS_TRANSFER 基于 Linux 内核的零拷贝机制实现高效文件传输：
+
+机制 说明 适用场景
+splice() 在两个文件描述符之间移动数据，无需经过用户空间 文件到文件、文件到管道、管道到文件
+sendfile() 将文件数据直接发送到 socket，内核 2.6.23 后基于 splice 实现 文件到网络 socket
+tee() 在两个管道之间复制数据 管道数据复制
+SCM_RIGHTS 通过 Unix domain socket 传递文件描述符 跨进程文件句柄传递
+
+splice() 系统调用通过内核的管道缓冲区（pipe buffer）机制实现零拷贝，数据在物理内存页框之间传递指针而非复制数据本身。
+
+二、整体架构
+
+2.1 FS_TRANSFER 插件的组成
+
+```
+FS_TRANSFER 插件
+├── 协议处理层
+│   ├── fstransfer_ipc_handler()   ← IPC 消息分发
+│   ├── fstransfer_upload()        ← 上传文件
+│   ├── fstransfer_download()      ← 下载文件
+│   ├── fstransfer_sync()          ← 增量同步
+│   ├── fstransfer_list_remote()   ← 列出远程文件
+│   └── fstransfer_get_status()    ← 获取传输状态
+│
+├── 本地传输引擎 (基于 splice)
+│   ├── fstransfer_local.c         ← 本地文件复制
+│   └── fstransfer_splice.c        ← splice 零拷贝封装
+│
+├── 网络传输引擎
+│   ├── fstransfer_network.c       ← 跨节点传输
+│   ├── fstransfer_protocol.c      ← 传输协议封装
+│   └── fstransfer_chunk.c         ← 分块传输
+│
+├── 增量同步引擎
+│   ├── fstransfer_rsync.c         ← rsync 算法实现
+│   └── fstransfer_diff.c          ← 差异计算
+│
+└── 初始化/清理
+    ├── fstransfer_init()          ← 插件加载
+    └── fstransfer_exit()          ← 插件卸载
+```
+
+2.2 FS_TRANSFER 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → FS_TRANSFER → 其他插件
+                                                                                                                                    ↑
+                                                                                                                          FS_TRANSFER 在这里加载
+```
+
+FS_TRANSFER 在 CONSENSUS 之后加载，为系统提供文件传输能力。
+
+2.3 FS_TRANSFER 的上层消费者
+
+上层插件 需要 FS_TRANSFER 提供什么
+CLUSTER (集群管理) 集群配置文件分发
+INSTANCE (实例管理) 实例镜像传输
+PKGMGR (包管理) 包文件下载
+NODE_DISCOVERY 节点间文件交换
+
+三、核心数据结构
+
+```c
+// fstransfer/include/fstransfer.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   传输模式
+   ============================================================ */
+typedef enum {
+    TRANSFER_MODE_LOCAL = 0,        // 本地文件复制
+    TRANSFER_MODE_REMOTE,           // 远程节点传输
+    TRANSFER_MODE_STREAM,           // 流式传输
+    TRANSFER_MODE_SYNC,             // 增量同步
+} transfer_mode_t;
+
+/* ============================================================
+   传输状态
+   ============================================================ */
+typedef enum {
+    TRANSFER_STATUS_PENDING = 0,
+    TRANSFER_STATUS_RUNNING,
+    TRANSFER_STATUS_PAUSED,
+    TRANSFER_STATUS_COMPLETED,
+    TRANSFER_STATUS_FAILED,
+    TRANSFER_STATUS_CANCELLED,
+} transfer_status_t;
+
+/* ============================================================
+   文件传输请求
+   ============================================================ */
+typedef struct fstransfer_request {
+    char id[64];                    // 传输 ID
+    transfer_mode_t mode;           // 传输模式
+    char source_path[256];          // 源路径
+    char target_path[256];          // 目标路径
+    char target_node[64];           // 目标节点 (远程模式)
+    uint64_t offset;                // 起始偏移 (断点续传)
+    uint64_t size;                  // 传输大小 (0 = 整个文件)
+    int preserve_attrs;             // 是否保留属性
+    int compress;                   // 是否压缩
+    int encrypt;                    // 是否加密
+    uint64_t created_at;            // 创建时间
+    transfer_status_t status;       // 状态
+    uint64_t transferred;           // 已传输字节数
+    char checksum[64];              // 校验和 (SHA-256)
+    struct fstransfer_request *next;
+} fstransfer_request_t;
+
+/* ============================================================
+   文件同步请求 (增量)
+   ============================================================ */
+typedef struct fstransfer_sync_req {
+    char id[64];
+    char source_path[256];
+    char target_path[256];
+    char target_node[64];
+    int recursive;                  // 是否递归
+    int delete_missing;             // 是否删除目标中多余文件
+    int dry_run;                    // 试运行
+} fstransfer_sync_req_t;
+
+/* ============================================================
+   传输统计
+   ============================================================ */
+typedef struct fstransfer_stats {
+    uint64_t total_transfers;
+    uint64_t total_bytes;
+    uint64_t total_time_ms;
+    uint64_t average_speed_bps;
+    uint64_t active_transfers;
+} fstransfer_stats_t;
+
+/* ============================================================
+   FS_TRANSFER 上下文
+   ============================================================ */
+typedef struct fstransfer_context {
+    int initialized;
+    uint64_t fstransfer_task_id;    // FS_TRANSFER 自身的任务 ID
+    
+    fstransfer_request_t *requests; // 传输请求列表
+    fstransfer_stats_t stats;
+    
+    // 传输管道 (用于 splice)
+    int pipe_fd[2];
+    
+    void *lock;
+} fstransfer_context_t;
+```
+
+四、FS_TRANSFER 协议定义
+
+```protobuf
+// protocols/fstransfer.proto
+syntax = "proto3";
+
+package hwrun.fstransfer;
+
+service FileTransfer {
+    // === 文件传输 ===
+    rpc Upload(stream UploadRequest) returns (UploadResponse);
+    rpc Download(DownloadRequest) returns (stream DownloadResponse);
+    
+    // === 文件同步 ===
+    rpc Sync(SyncRequest) returns (SyncResponse);
+    rpc SyncStatus(SyncStatusRequest) returns (SyncStatusResponse);
+    
+    // === 远程操作 ===
+    rpc ListRemote(ListRemoteRequest) returns (ListRemoteResponse);
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+message Empty {}
+
+// ============ 上传 ============
+
+message UploadRequest {
+    string transfer_id = 1;         // 传输 ID
+    string target_path = 2;         // 目标路径
+    string target_node = 3;         // 目标节点
+    bytes data = 4;                 // 数据块
+    uint64 offset = 5;              // 偏移量
+    bool last_chunk = 6;            // 是否最后一块
+    bool compress = 7;              // 是否压缩
+    bool encrypt = 8;               // 是否加密
+}
+
+message UploadResponse {
+    bool success = 1;
+    uint64 transferred = 2;
+    string checksum = 3;
+    int32 error = 4;
+}
+
+// ============ 下载 ============
+
+message DownloadRequest {
+    string transfer_id = 1;
+    string source_path = 2;
+    string source_node = 3;
+    uint64 offset = 4;              // 起始偏移
+    uint64 size = 5;                // 下载大小
+}
+
+message DownloadResponse {
+    bytes data = 1;
+    uint64 offset = 2;
+    bool last_chunk = 3;
+    uint64 total_size = 4;
+}
+
+// ============ 同步 ============
+
+message SyncRequest {
+    string sync_id = 1;
+    string source_path = 2;
+    string target_path = 3;
+    string target_node = 4;
+    bool recursive = 5;
+    bool delete_missing = 6;
+    bool dry_run = 7;
+}
+
+message SyncResponse {
+    bool success = 1;
+    uint32 files_added = 2;
+    uint32 files_updated = 3;
+    uint32 files_deleted = 4;
+    uint64 bytes_transferred = 5;
+    int32 error = 6;
+}
+
+message SyncStatusRequest {
+    string sync_id = 1;
+}
+
+message SyncStatusResponse {
+    string state = 1;               // "running", "completed", "failed"
+    uint32 total_files = 2;
+    uint32 processed_files = 3;
+    uint64 total_bytes = 4;
+    uint64 transferred_bytes = 5;
+    int32 error = 6;
+}
+
+// ============ 远程操作 ============
+
+message FileInfo {
+    string path = 1;
+    uint64 size = 2;
+    uint64 modified = 3;
+    uint32 mode = 4;
+    bool is_dir = 5;
+    bool is_link = 6;
+}
+
+message ListRemoteRequest {
+    string path = 1;
+    string node = 2;
+    bool recursive = 3;
+}
+
+message ListRemoteResponse {
+    repeated FileInfo files = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetStatusRequest {
+    string transfer_id = 1;
+}
+
+message GetStatusResponse {
+    string state = 1;
+    uint64 transferred = 2;
+    uint64 total = 3;
+    uint64 speed_bps = 4;
+    int32 error = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// fstransfer/src/fstransfer.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/pipe_fs_i.h>
+#include <linux/splice.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+
+#include "fstransfer.h"
+#include "fstransfer_ipc.h"
+#include "fstransfer_local.h"
+#include "fstransfer_network.h"
+#include "fstransfer_sync.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS File System Transfer Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static fstransfer_context_t g_ft_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init fstransfer_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun FS_TRANSFER: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_ft_ctx, 0, sizeof(fstransfer_context_t));
+    
+    // 2. 创建管道 (用于 splice)
+    ret = pipe2(g_ft_ctx.pipe_fd, O_NONBLOCK);
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun FS_TRANSFER: Failed to create pipe\n");
+        // 继续运行，splice 功能不可用
+    }
+    
+    // 3. 注册 IPC 消息处理器
+    ret = fstransfer_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun FS_TRANSFER: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 FS_TRANSFER 协议
+    fstransfer_register_protocol();
+    
+    g_ft_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun FS_TRANSFER: Initialized successfully\n");
+    printk(KERN_INFO "  splice: %s\n",
+           g_ft_ctx.pipe_fd[0] >= 0 ? "available" : "unavailable");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit fstransfer_exit(void) {
+    printk(KERN_INFO "HWRun FS_TRANSFER: Exiting...\n");
+    
+    if (g_ft_ctx.pipe_fd[0] >= 0) {
+        close(g_ft_ctx.pipe_fd[0]);
+        close(g_ft_ctx.pipe_fd[1]);
+    }
+    
+    fstransfer_ipc_unregister();
+    fstransfer_cleanup_requests();
+    
+    g_ft_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun FS_TRANSFER: Exited\n");
+}
+
+module_init(fstransfer_init);
+module_exit(fstransfer_exit);
+```
+
+5.2 本地文件传输 (基于 splice 零拷贝)
+
+splice() 系统调用在 Linux 内核 2.6.17 中引入，它通过管道缓冲区在内核空间直接移动数据，无需将数据复制到用户空间。在 2.6.23 之后，sendfile() 也是通过 splice() 实现的。
+
+```c
+// fstransfer/src/fstransfer_splice.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/splice.h>
+#include <linux/pipe_fs_i.h>
+#include <linux/slab.h>
+
+#include "fstransfer.h"
+
+extern fstransfer_context_t g_ft_ctx;
+
+/* ============================================================
+   使用 splice 零拷贝复制文件
+   ============================================================ */
+int fstransfer_splice_copy(const char *src_path, const char *dst_path,
+                            uint64_t size, uint64_t *out_copied) {
+    struct file *src_file, *dst_file;
+    struct pipe_inode_info *pipe;
+    loff_t src_off = 0, dst_off = 0;
+    uint64_t total = 0;
+    int ret;
+    
+    // 1. 打开源文件
+    src_file = filp_open(src_path, O_RDONLY, 0);
+    if (IS_ERR(src_file)) {
+        return PTR_ERR(src_file);
+    }
+    
+    // 2. 打开目标文件
+    dst_file = filp_open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (IS_ERR(dst_file)) {
+        filp_close(src_file, NULL);
+        return PTR_ERR(dst_file);
+    }
+    
+    // 3. 如果 size 为 0，获取文件大小
+    if (size == 0) {
+        struct kstat stat;
+        ret = vfs_getattr(&src_file->f_path, &stat);
+        if (ret < 0) {
+            filp_close(src_file, NULL);
+            filp_close(dst_file, NULL);
+            return ret;
+        }
+        size = stat.size;
+    }
+    
+    // 4. 使用 splice 零拷贝传输
+    // splice 通过管道在内核空间直接传输数据
+    // 不需要将数据复制到用户空间
+    while (total < size) {
+        uint64_t remaining = size - total;
+        uint64_t chunk = (remaining > 1024 * 1024) ? 1024 * 1024 : remaining;
+        ssize_t copied;
+        
+        // 从源文件 splice 到管道
+        copied = do_splice_to(src_file, &src_off,
+                              g_ft_ctx.pipe_fd[1], chunk, 0);
+        if (copied <= 0) {
+            if (copied < 0) {
+                ret = copied;
+                goto out;
+            }
+            break;
+        }
+        
+        // 从管道 splice 到目标文件
+        copied = do_splice_from(g_ft_ctx.pipe_fd[0], &dst_off,
+                                 dst_file, copied, 0);
+        if (copied <= 0) {
+            if (copied < 0) {
+                ret = copied;
+                goto out;
+            }
+            break;
+        }
+        
+        total += copied;
+    }
+    
+    *out_copied = total;
+    ret = 0;
+    
+out:
+    filp_close(src_file, NULL);
+    filp_close(dst_file, NULL);
+    return ret;
+}
+
+/* ============================================================
+   使用 splice 从文件传输到网络 socket
+   ============================================================ */
+int fstransfer_splice_to_socket(const char *src_path, int sock_fd,
+                                 uint64_t size, uint64_t *out_sent) {
+    struct file *src_file;
+    loff_t src_off = 0;
+    uint64_t total = 0;
+    int ret;
+    
+    // 1. 打开源文件
+    src_file = filp_open(src_path, O_RDONLY, 0);
+    if (IS_ERR(src_file)) {
+        return PTR_ERR(src_file);
+    }
+    
+    // 2. 获取文件大小
+    if (size == 0) {
+        struct kstat stat;
+        ret = vfs_getattr(&src_file->f_path, &stat);
+        if (ret < 0) {
+            filp_close(src_file, NULL);
+            return ret;
+        }
+        size = stat.size;
+    }
+    
+    // 3. 使用 splice 零拷贝传输到 socket
+    // splice 可以直接将文件数据通过管道传输到 socket
+    // 数据在内核空间直接从文件缓存传输到 socket 缓冲区
+    while (total < size) {
+        uint64_t remaining = size - total;
+        uint64_t chunk = (remaining > 1024 * 1024) ? 1024 * 1024 : remaining;
+        ssize_t sent;
+        
+        // splice 从文件到管道
+        sent = do_splice_to(src_file, &src_off,
+                            g_ft_ctx.pipe_fd[1], chunk, 0);
+        if (sent <= 0) {
+            if (sent < 0) {
+                ret = sent;
+                goto out;
+            }
+            break;
+        }
+        
+        // splice 从管道到 socket
+        sent = do_splice_from(g_ft_ctx.pipe_fd[0], NULL,
+                              sock_fd, sent, 0);
+        if (sent <= 0) {
+            if (sent < 0) {
+                ret = sent;
+                goto out;
+            }
+            break;
+        }
+        
+        total += sent;
+    }
+    
+    *out_sent = total;
+    ret = 0;
+    
+out:
+    filp_close(src_file, NULL);
+    return ret;
+}
+```
+
+5.3 跨节点传输
+
+跨节点文件传输通过 NP 协议在节点间建立连接，然后使用 splice 零拷贝传输数据。
+
+```c
+// fstransfer/src/fstransfer_network.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <net/sock.h>
+
+#include "fstransfer.h"
+#include "fstransfer_network.h"
+#include "fstransfer_splice.h"
+
+/* ============================================================
+   上传文件到远程节点
+   ============================================================ */
+int fstransfer_upload(const char *src_path, const char *dst_path,
+                       const char *target_node, uint64_t offset,
+                       char *out_id) {
+    struct socket *sock;
+    int ret;
+    uint64_t sent;
+    char transfer_id[64];
+    
+    // 1. 生成传输 ID
+    fstransfer_generate_id(transfer_id, sizeof(transfer_id));
+    if (out_id) {
+        strncpy(out_id, transfer_id, 63);
+    }
+    
+    // 2. 通过 NP 协议连接到目标节点
+    ret = fstransfer_connect_node(target_node, &sock);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 3. 发送传输元数据 (协议头)
+    // 格式: [4-byte type][4-byte size][variable data]
+    // type = 0x05 (native write_file)[reference:9]
+    ret = fstransfer_send_metadata(sock, transfer_id, dst_path, offset);
+    if (ret < 0) {
+        sock_release(sock);
+        return ret;
+    }
+    
+    // 4. 使用 splice 零拷贝传输文件数据
+    ret = fstransfer_splice_to_socket(src_path, sock->sk->sk_socket->file->f_path.dentry,
+                                      0, &sent);
+    if (ret < 0) {
+        sock_release(sock);
+        return ret;
+    }
+    
+    // 5. 接收确认
+    ret = fstransfer_recv_ack(sock);
+    
+    sock_release(sock);
+    return ret;
+}
+
+/* ============================================================
+   从远程节点下载文件
+   ============================================================ */
+int fstransfer_download(const char *src_path, const char *dst_path,
+                         const char *source_node, uint64_t offset,
+                         uint64_t size, char *out_id) {
+    struct socket *sock;
+    int ret;
+    uint64_t received = 0;
+    struct file *dst_file;
+    char transfer_id[64];
+    
+    // 1. 生成传输 ID
+    fstransfer_generate_id(transfer_id, sizeof(transfer_id));
+    if (out_id) {
+        strncpy(out_id, transfer_id, 63);
+    }
+    
+    // 2. 连接到源节点
+    ret = fstransfer_connect_node(source_node, &sock);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 3. 发送下载请求
+    ret = fstransfer_send_download_req(sock, src_path, offset, size);
+    if (ret < 0) {
+        sock_release(sock);
+        return ret;
+    }
+    
+    // 4. 打开目标文件
+    dst_file = filp_open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (IS_ERR(dst_file)) {
+        sock_release(sock);
+        return PTR_ERR(dst_file);
+    }
+    
+    // 5. 从 socket 接收数据并写入文件
+    // 使用 splice 从 socket 到管道再到文件
+    while (received < size || size == 0) {
+        // 从 socket splice 到管道
+        // 从管道 splice 到文件
+        // ...
+    }
+    
+    filp_close(dst_file, NULL);
+    sock_release(sock);
+    return 0;
+}
+```
+
+5.4 文件描述符传递 (SCM_RIGHTS)
+
+通过 Unix domain socket 的 SCM_RIGHTS 机制，可以在进程间传递打开的文件描述符。FS_TRANSFER 利用这一机制实现文件句柄的跨进程传递。
+
+```c
+// fstransfer/src/fstransfer_fd.c
+
+#include <linux/kernel.h>
+#include <linux/socket.h>
+#include <linux/un.h>
+#include <net/sock.h>
+#include <linux/file.h>
+
+/* ============================================================
+   通过 SCM_RIGHTS 发送文件描述符
+   ============================================================ */
+int fstransfer_send_fd(int sock_fd, int fd_to_send) {
+    struct msghdr msg;
+    struct iovec iov;
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+    char data = 0;
+    int ret;
+    
+    memset(&msg, 0, sizeof(msg));
+    
+    // 1. 设置数据 (SCM_RIGHTS 需要至少一个字节的数据)[reference:11]
+    iov.iov_base = &data;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    
+    // 2. 设置控制消息
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+    
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;  // 传递文件描述符[reference:12]
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    *(int *)CMSG_DATA(cmsg) = fd_to_send;
+    
+    msg.msg_controllen = cmsg->cmsg_len;
+    
+    // 3. 发送消息
+    ret = sock_sendmsg(sock_fd, &msg);
+    return ret;
+}
+
+/* ============================================================
+   通过 SCM_RIGHTS 接收文件描述符
+   ============================================================ */
+int fstransfer_recv_fd(int sock_fd) {
+    struct msghdr msg;
+    struct iovec iov;
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+    char data;
+    int fd = -1;
+    int ret;
+    
+    memset(&msg, 0, sizeof(msg));
+    
+    // 1. 准备接收数据
+    iov.iov_base = &data;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+    
+    // 2. 接收消息
+    ret = sock_recvmsg(sock_fd, &msg, 0);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 3. 提取文件描述符
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS) {
+        fd = *(int *)CMSG_DATA(cmsg);
+    }
+    
+    return fd;
+}
+```
+
+5.5 增量同步 (rsync 算法)
+
+增量同步基于 rsync 算法的思想：将文件分块计算校验和，只传输变化的部分。
+
+```c
+// fstransfer/src/fstransfer_sync.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+
+#include "fstransfer.h"
+#include "fstransfer_sync.h"
+
+/* ============================================================
+   计算文件块的弱校验和 (滚动校验和)
+   ============================================================ */
+static uint32_t fstransfer_weak_checksum(const uint8_t *data, uint32_t len) {
+    uint32_t sum = 0;
+    uint32_t sum2 = 0;
+    
+    for (uint32_t i = 0; i < len; i++) {
+        sum += data[i];
+        sum2 += (len - i) * data[i];
+    }
+    
+    return (sum & 0xffff) | ((sum2 & 0xffff) << 16);
+}
+
+/* ============================================================
+   计算文件块的强校验和 (SHA-256)
+   ============================================================ */
+int fstransfer_strong_checksum(const uint8_t *data, uint32_t len,
+                                uint8_t *out_hash) {
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int ret;
+    
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+    
+    desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(tfm),
+                   GFP_KERNEL);
+    if (!desc) {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+    
+    desc->tfm = tfm;
+    ret = crypto_shash_digest(desc, data, len, out_hash);
+    
+    kfree(desc);
+    crypto_free_shash(tfm);
+    return ret;
+}
+
+/* ============================================================
+   执行增量同步 (rsync 风格)
+   ============================================================ */
+int fstransfer_sync_files(const char *src_path, const char *dst_path,
+                           int recursive, int delete_missing,
+                           int dry_run) {
+    // 1. 扫描源目录，获取文件列表
+    // 2. 扫描目标目录，获取文件列表
+    // 3. 计算差异:
+    //    - 新增文件 → 需要上传
+    //    - 删除文件 → 需要删除 (如果 delete_missing)
+    //    - 修改文件 → 需要更新
+    // 4. 对于修改的文件:
+    //    a. 分块 (block size = 1024 字节)
+    //    b. 计算每块的弱校验和 (滚动校验和)
+    //    c. 发送弱校验和到目标端
+    //    d. 目标端匹配校验和，返回匹配的块索引
+    //    e. 只传输不匹配的块
+    // 5. 应用变更
+    
+    return 0;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// fstransfer/src/fstransfer_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "fstransfer.h"
+#include "fstransfer_ipc.h"
+#include "fstransfer_network.h"
+#include "fstransfer_sync.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void fstransfer_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case FSTRANSFER_MSG_UPLOAD: {
+            fstransfer_upload_req_t *req = (fstransfer_upload_req_t *)data;
+            fstransfer_upload_resp_t resp;
+            char transfer_id[64];
+            int ret = fstransfer_upload(req->source_path, req->target_path,
+                                         req->target_node, req->offset,
+                                         transfer_id);
+            resp.success = (ret == 0);
+            strncpy(resp.transfer_id, transfer_id, sizeof(resp.transfer_id) - 1);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case FSTRANSFER_MSG_DOWNLOAD: {
+            fstransfer_download_req_t *req = (fstransfer_download_req_t *)data;
+            // 处理下载请求
+            break;
+        }
+        
+        case FSTRANSFER_MSG_SYNC: {
+            fstransfer_sync_req_t *req = (fstransfer_sync_req_t *)data;
+            fstransfer_sync_resp_t resp;
+            int ret = fstransfer_sync_files(req->source_path, req->target_path,
+                                             req->recursive, req->delete_missing,
+                                             req->dry_run);
+            resp.success = (ret == 0);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case FSTRANSFER_MSG_LIST_REMOTE: {
+            // 列出远程目录
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun FS_TRANSFER: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/fstransfer.yml
+fstransfer:
+  # 传输配置
+  chunk_size: 1048576            # 1MB
+  max_concurrent: 4              # 最大并发传输数
+  
+  # 零拷贝
+  zero_copy: true                # 启用 splice 零拷贝
+  
+  # 增量同步
+  sync:
+    block_size: 1024             # 分块大小 (字节)
+    checksum_type: "sha256"      # 校验和算法
+  
+  # 压缩
+  compress:
+    enabled: true
+    algorithm: "zstd"            # zstd / gzip
+  
+  # 加密
+  encrypt:
+    enabled: false
+    algorithm: "aes-256-gcm"
+```
+
+七、命令行接口
+
+```bash
+# 上传文件到远程节点
+hwrun fstransfer upload /local/file.txt node-02:/remote/file.txt
+
+# 下载文件
+hwrun fstransfer download node-02:/remote/file.txt /local/file.txt
+
+# 列出远程目录
+hwrun fstransfer ls node-02:/remote/dir/
+
+# 增量同步
+hwrun fstransfer sync /local/dir/ node-02:/remote/dir/ --recursive
+hwrun fstransfer sync /local/dir/ node-02:/remote/dir/ --delete-missing
+hwrun fstransfer sync /local/dir/ node-02:/remote/dir/ --dry-run
+
+# 查看传输状态
+hwrun fstransfer status <transfer-id>
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/fstransfer/plugin.yml
+plugin:
+  id: "fstransfer"
+  name: "File System Transfer Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 文件传输协议，提供跨节点、跨实例的高效文件传输功能"
+  
+  provides:
+    - protocol: "FS_TRANSFER"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "NP"
+      version: "1.0"
+    - protocol: "STORAGE"
+      version: "1.0"
+  
+  params:
+    - key: "fstransfer.chunk_size"
+      type: "int"
+      default: 1048576
+      description: "分块大小 (字节)"
+    - key: "fstransfer.max_concurrent"
+      type: "int"
+      default: 4
+      description: "最大并发传输数"
+    - key: "fstransfer.zero_copy"
+      type: "bool"
+      default: true
+      description: "是否启用零拷贝"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/fstransfer.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# fstransfer/Makefile
+
+obj-m += fstransfer.o
+
+fstransfer-objs := fstransfer.o fstransfer_splice.o \
+                   fstransfer_network.o fstransfer_fd.o \
+                   fstransfer_sync.o fstransfer_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 fstransfer.ko /usr/lib/hwrun/plugins/
+```
+
+九、传输协议二进制格式
+
+跨节点传输使用二进制协议，以提升性能并减少开销：
+
+```
+FS_TRANSFER 二进制协议格式:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  [4-byte total length] [1-byte type] [4-byte sequence] [variable payload]  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  类型 (1 byte):                                                             │
+│  0x01 = 元数据 (文件名、大小、权限)                                         │
+│  0x02 = 数据块                                                              │
+│  0x03 = 校验和                                                              │
+│  0x04 = 确认 (ACK)                                                          │
+│  0x05 = 错误 (NACK)                                                         │
+│  0x06 = 完成 (DONE)                                                         │
+│                                                                             │
+│  元数据格式:                                                                 │
+│  [4-byte path_len][path][8-byte size][4-byte mode][16-byte checksum]        │
+│                                                                             │
+│  数据块格式:                                                                 │
+│  [8-byte offset][4-byte data_len][data]                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+十、总结
+
+维度 决策
+定位 文件传输协议，跨节点、跨实例文件传输的统一入口
+零拷贝 基于 Linux 内核 splice() / sendfile() 实现
+文件描述符传递 基于 SCM_RIGHTS over Unix domain socket
+增量同步 基于 rsync 算法 (滚动校验和 + SHA-256)
+协议格式 二进制协议，减少开销
+实现方式 Linux 内核模块
+代码量 ~1200-1500 行 C
+提供协议 FS_TRANSFER (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + NP + STORAGE
+
+FS_TRANSFER 是 HWRun OS 中文件传输的核心插件。它基于 Linux 内核的 splice() 零拷贝机制实现高效的文件传输，通过 SCM_RIGHTS 实现文件描述符的跨进程传递，通过 rsync 算法实现增量同步。FS_TRANSFER 协议向上层插件（CLUSTER、INSTANCE、PKGMGR 等）提供跨节点、跨实例的文件上传、下载、同步和远程操作功能。

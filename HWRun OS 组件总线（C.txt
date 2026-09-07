@@ -1,0 +1,1260 @@
+﻿HWRun OS 组件总线（Component Bus）完整设计
+
+模块名称： Component Bus (BUS)
+版本： 2.0.0
+状态： 设计冻结
+依赖： 微内核（极简版，~3000行）
+依赖协议： METAPROTO, PARAM, LOG, GIT
+提供协议： BUS
+实现语言： C
+设计目标： 插件管理器，是微内核加载的第一个插件，负责发现、安装、加载、启动、停止、卸载、替换所有其他插件
+
+一、设计哲学
+
+1.1 核心定位
+
+组件总线是微内核加载的第一个插件，是所有其他插件的管理者。
+
+```
+微内核（~3000行）
+    │ 只做三件事：
+    │ 1. 启动硬件
+    │ 2. 加载第一个插件 → 就是组件总线
+    │ 3. 提供最简IPC
+    ▼
+组件总线（BUS）
+    │ 管理所有其他插件：
+    │ 1. 发现插件（扫描 plugin.yml）
+    │ 2. 安装插件（git clone）
+    │ 3. 加载插件（dlopen / insmod）
+    │ 4. 启动/停止插件
+    │ 5. 卸载插件（可撤销副作用）
+    │ 6. 替换插件（运行时热切换）
+    │ 7. 协议注册（通过 METAPROTO）
+    │ 8. Git 版本控制（所有操作自动 commit）
+    ▼
+其他插件（FSP, NP, SP, DRIVER, UI, ...）
+```
+
+1.2 设计原则
+
+1. 极简依赖：组件总线只依赖微内核提供的最基础功能（任务创建、IPC、内存分配）
+2. 自举优先：组件总线自身不依赖任何其他插件，它是一切插件的起点
+3. 协议驱动：所有插件间通信通过标准化协议，组件总线本身也注册 BUS 协议
+4. 可撤销副作用：所有安装操作可追溯、可逆，卸载时完全清理
+5. Git 原生：每个插件是一个 Git 仓库，所有操作自动 commit
+
+二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         组件总线（Component Bus）                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                         BUS 协议接口                                   │  │
+│  │  Scan / Install / Uninstall / Load / Unload / Start / Stop / Replace │  │
+│  │  Status / List / Resolve / GetDeps / Update / Rollback / Clean      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      插件生命周期管理器                                │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  │  │
+│  │  │发现    │→│安装    │→│加载    │→│启动    │→│运行    │  │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘  │  │
+│  │       ↑            │            │            │            │        │  │
+│  │       └────────────┴────────────┴────────────┴────────────┘        │  │
+│  │                        停止 → 卸载 → 清理                           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                        依赖解析器                                     │  │
+│  │  ├── 读取 plugin.yml 中的 requires                                   │  │
+│  │  ├── 通过 METAPROTO 查询协议提供者                                   │  │
+│  │  ├── 检查版本兼容性                                                  │  │
+│  │  └── 自动安装缺失的依赖（可选）                                      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                        副作用记录器                                    │  │
+│  │  ├── 记录所有安装操作（文件复制、模块加载、服务启动、挂载）          │  │
+│  │  ├── 记录所有配置修改                                                │  │
+│  │  └── 卸载时逆向执行（可撤销副作用）                                  │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                        Git 集成                                       │  │
+│  │  ├── 安装插件 = git clone <repo>                                     │  │
+│  │  ├── 更新插件 = git pull                                             │  │
+│  │  ├── 切换版本 = git checkout <tag>                                   │  │
+│  │  ├── 所有操作自动 commit                                             │  │
+│  │  └── 历史自动管理（git-compact）                                     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                        存储路径                                        │  │
+│  │  ├── /var/lib/hwrun/git/         ← Git 仓库根目录                     │  │
+│  │  ├── /var/lib/hwrun/git/plugins/ ← 插件源码                          │  │
+│  │  ├── /usr/lib/hwrun/plugins/     ← 已安装插件的二进制文件             │  │
+│  │  ├── /etc/hwrun/                 ← 配置文件                          │  │
+│  │  └── /var/lib/hwrun/records/     ← 安装记录（用于撤销副作用）        │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    依赖的微内核接口（极简）                           │  │
+│  │  ├── task_create()      → 创建任务                                   │  │
+│  │  ├── task_switch()      → 切换任务                                   │  │
+│  │  ├── ipc_send()         → 发送 IPC 消息                              │  │
+│  │  ├── ipc_recv()         → 接收 IPC 消息                              │  │
+│  │  ├── kmalloc()          → 内存分配                                   │  │
+│  │  ├── kfree()            → 内存释放                                   │  │
+│  │  └── yield()            → 让出 CPU                                   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+三、核心数据结构
+
+```c
+// bus/include/bus.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   插件状态（与微内核任务状态对应）
+   ============================================================ */
+typedef enum {
+    PLUGIN_STATE_UNINSTALLED = 0,  // 未安装
+    PLUGIN_STATE_INSTALLED,         // 已安装（文件已复制，未加载）
+    PLUGIN_STATE_LOADED,            // 已加载（已加载到内存，未启动）
+    PLUGIN_STATE_STARTED,           // 已启动（正在运行）
+    PLUGIN_STATE_STOPPED,           // 已停止（保留状态）
+    PLUGIN_STATE_ERROR,             // 错误状态
+} plugin_state_t;
+
+/* ============================================================
+   插件类型
+   ============================================================ */
+typedef enum {
+    PLUGIN_TYPE_KERNEL,     // 内核插件（.ko）
+    PLUGIN_TYPE_LIBC,       // C 库插件
+    PLUGIN_TYPE_INIT,       // 初始化系统
+    PLUGIN_TYPE_FS,         // 文件系统
+    PLUGIN_TYPE_NETWORK,    // 网络栈
+    PLUGIN_TYPE_SECURITY,   // 安全模块
+    PLUGIN_TYPE_STORAGE,    // 存储后端
+    PLUGIN_TYPE_LOGGING,    // 日志
+    PLUGIN_TYPE_SCHEDULER,  // 调度器
+    PLUGIN_TYPE_GIT,        // Git 操作
+    PLUGIN_TYPE_LOADER,     // 格式加载器
+    PLUGIN_TYPE_UI,         // 用户界面
+    PLUGIN_TYPE_TOOLS,      // 命令行工具
+    PLUGIN_TYPE_MANAGEMENT, // 管理插件
+    PLUGIN_TYPE_DRIVER,     // 设备驱动
+    PLUGIN_TYPE_CONTAINER,  // 容器
+    PLUGIN_TYPE_UNKNOWN,    // 未知类型
+} plugin_type_t;
+
+/* ============================================================
+   插件描述符（完整版）
+   ============================================================ */
+typedef struct plugin {
+    /* 标识信息 */
+    char id[64];                    // 唯一标识符，如 "linux-kernel"
+    char name[128];                 // 显示名称，如 "Linux 内核"
+    char version[32];               // 版本号，如 "6.1.0"
+    plugin_type_t type;             // 插件类型
+    plugin_state_t state;           // 当前状态
+    char description[256];          // 描述信息
+    
+    /* Git 信息 */
+    char repo_url[256];             // Git 仓库地址
+    char branch[64];                // 分支名
+    char tag[64];                   // 标签
+    
+    /* 协议信息 */
+    char **provides;                // 提供的协议列表
+    int provides_count;
+    char **requires;                // 依赖的协议列表
+    int requires_count;
+    char **conflicts;               // 冲突的插件列表
+    int conflicts_count;
+    
+    /* 文件信息 */
+    char **files;                   // 安装的文件列表
+    int files_count;
+    size_t size;                    // 总大小（字节）
+    
+    /* 生命周期函数指针 */
+    int (*init)(struct plugin *self);
+    int (*start)(struct plugin *self);
+    int (*stop)(struct plugin *self);
+    int (*destroy)(struct plugin *self);
+    int (*configure)(struct plugin *self, const char *key, const char *value);
+    void *(*get_interface)(const char *protocol);
+    
+    /* 内部数据 */
+    void *private_data;             // 插件私有数据
+    void *handle;                   // 动态库句柄 (dlopen) 或模块指针
+    uint64_t load_time;             // 加载时间戳
+    int ref_count;                  // 引用计数
+    struct plugin *next;            // 链表指针
+    
+    /* 钩子脚本 */
+    char pre_install[128];          // 安装前脚本
+    char post_install[128];         // 安装后脚本
+    char pre_uninstall[128];        // 卸载前脚本
+    char post_uninstall[128];       // 卸载后脚本
+    
+    /* 参数默认值 */
+    struct param *default_params;
+    
+    /* 微内核任务 ID（插件运行在微内核任务中） */
+    uint64_t task_id;
+} plugin_t;
+
+/* ============================================================
+   安装记录（用于撤销副作用）
+   ============================================================ */
+typedef struct install_record {
+    char plugin_id[64];             // 插件 ID
+    uint64_t timestamp;             // 安装时间
+    uint64_t task_id;               // 安装时运行的任务 ID
+    
+    /* 记录所有操作 */
+    char **files_copied;            // 复制的文件路径列表
+    int files_copied_count;
+    char **modules_loaded;          // 加载的内核模块名列表
+    int modules_loaded_count;
+    char **services_started;        // 启动的 systemd 服务名列表
+    int services_started_count;
+    char **mount_points;            // 挂载点列表
+    int mount_points_count;
+    char **config_changed;          // 修改的配置文件路径列表
+    int config_changed_count;
+    
+    struct install_record *next;
+} install_record_t;
+
+/* ============================================================
+   协议提供者信息
+   ============================================================ */
+typedef struct protocol_provider {
+    char protocol[64];              // 协议名称
+    char version[16];               // 协议版本
+    char plugin_id[64];             // 提供该协议的插件 ID
+    void *implementation;           // 协议实现指针
+    struct protocol_provider *next;
+} protocol_provider_t;
+
+/* ============================================================
+   组件总线上下文
+   ============================================================ */
+typedef struct component_bus {
+    /* 核心数据 */
+    plugin_t *plugins;              // 已安装/加载的插件链表
+    install_record_t *records;      // 安装历史记录
+    protocol_provider_t *providers; // 协议提供者列表
+    
+    /* 配置 */
+    char scan_paths[8][256];        // 扫描路径列表
+    int scan_paths_count;
+    int auto_install_deps;
+    int dry_run;
+    char git_remote[256];           // 默认 Git 仓库地址
+    
+    /* 回调 */
+    int (*on_install)(plugin_t *p);
+    int (*on_uninstall)(plugin_t *p);
+    int (*on_replace)(plugin_t *old, plugin_t *new);
+    void (*on_state_change)(plugin_t *p, plugin_state_t old, plugin_state_t new);
+    
+    /* 依赖的外部模块（通过 IPC 通信） */
+    void *metaproto_client;         // METAPROTO 客户端句柄（通过 IPC）
+    void *git_storage_client;       // Git 存储客户端句柄（通过 IPC）
+    void *param_client;             // 参数系统客户端句柄（通过 IPC）
+    void *log_client;               // 日志系统客户端句柄（通过 IPC）
+    
+    /* 微内核任务 ID（BUS 自身运行的任务） */
+    uint64_t bus_task_id;
+    
+    /* 是否已初始化 */
+    int initialized;
+} component_bus_t;
+
+/* ============================================================
+   插件发现信息（从 plugin.yml 解析）
+   ============================================================ */
+typedef struct plugin_discovery {
+    char id[64];
+    char name[128];
+    char version[32];
+    char type[32];
+    char repo[256];
+    char branch[64];
+    char tag[64];
+    char *provides[32];
+    int provides_count;
+    char *requires[32];
+    int requires_count;
+    char *conflicts[16];
+    int conflicts_count;
+    char *files[64];
+    int files_count;
+    size_t size;
+    char license[32];
+    char author[128];
+    char maintainer[128];
+    char url[256];
+    char pre_install[128];
+    char post_install[128];
+    char pre_uninstall[128];
+    char post_uninstall[128];
+    struct param *params;
+    struct plugin_discovery *next;
+} plugin_discovery_t;
+```
+
+四、BUS 协议定义
+
+```protobuf
+// protocols/bus.proto
+syntax = "proto3";
+
+package hwrun.bus;
+
+service ComponentBus {
+    // === 插件管理 ===
+    rpc Scan(ScanRequest) returns (ScanResponse);
+    rpc Install(InstallRequest) returns (InstallResponse);
+    rpc Uninstall(UninstallRequest) returns (UninstallResponse);
+    rpc Load(LoadRequest) returns (LoadResponse);
+    rpc Unload(UnloadRequest) returns (UnloadResponse);
+    rpc Start(StartRequest) returns (StartResponse);
+    rpc Stop(StopRequest) returns (StopResponse);
+    rpc Replace(ReplaceRequest) returns (ReplaceResponse);
+    
+    // === 查询 ===
+    rpc Status(StatusRequest) returns (StatusResponse);
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Resolve(ResolveRequest) returns (ResolveResponse);
+    rpc GetDeps(DepsRequest) returns (DepsResponse);
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+    
+    // === 维护 ===
+    rpc Update(UpdateRequest) returns (UpdateResponse);
+    rpc Rollback(RollbackRequest) returns (RollbackResponse);
+    rpc Clean(CleanRequest) returns (CleanResponse);
+}
+
+// ============ 请求/响应消息 ============
+
+message ScanRequest {
+    repeated string paths = 1;
+}
+
+message ScanResponse {
+    repeated PluginInfo plugins = 1;
+    int32 total = 2;
+    int32 error = 3;
+}
+
+message InstallRequest {
+    string id = 1;
+    string version = 2;             // 可选
+    string repo = 3;                // 可选
+    bool install_deps = 4;
+}
+
+message InstallResponse {
+    bool success = 1;
+    string installed_id = 2;
+    string version = 3;
+    repeated string installed_deps = 4;
+    int32 error = 5;
+}
+
+message UninstallRequest {
+    string id = 1;
+    bool force = 2;
+}
+
+message UninstallResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message LoadRequest {
+    string id = 1;
+}
+
+message LoadResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UnloadRequest {
+    string id = 1;
+}
+
+message UnloadResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StartRequest {
+    string id = 1;
+}
+
+message StartResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StopRequest {
+    string id = 1;
+}
+
+message StopResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message ReplaceRequest {
+    string old_id = 1;
+    string new_id = 2;
+    bool preserve_config = 3;
+}
+
+message ReplaceResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StatusRequest {
+    string id = 1;
+}
+
+message StatusResponse {
+    PluginStatus status = 1;
+    repeated PluginStatus all = 2;
+    int32 error = 3;
+}
+
+message ListRequest {
+    string filter = 1;
+    string state = 2;               // "installed", "loaded", "started", "all"
+}
+
+message ListResponse {
+    repeated PluginInfo plugins = 1;
+    int32 total = 2;
+    int32 error = 3;
+}
+
+message ResolveRequest {
+    string protocol = 1;
+    string version = 2;
+}
+
+message ResolveResponse {
+    string plugin_id = 1;
+    string protocol_version = 2;
+    int32 error = 3;
+}
+
+message DepsRequest {
+    string id = 1;
+    bool recursive = 2;
+}
+
+message DepsResponse {
+    repeated string dependencies = 1;
+    int32 error = 2;
+}
+
+message GetInfoRequest {
+    string id = 1;
+}
+
+message GetInfoResponse {
+    PluginInfo info = 1;
+    int32 error = 2;
+}
+
+message UpdateRequest {
+    string id = 1;
+    string version = 2;
+}
+
+message UpdateResponse {
+    bool success = 1;
+    string old_version = 2;
+    string new_version = 3;
+    int32 error = 4;
+}
+
+message RollbackRequest {
+    string id = 1;
+    string version = 2;
+}
+
+message RollbackResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message CleanRequest {
+    bool dry_run = 1;
+}
+
+message CleanResponse {
+    int64 freed_bytes = 1;
+    repeated string removed_files = 2;
+    int32 error = 3;
+}
+
+// ============ 数据结构 ============
+
+message PluginInfo {
+    string id = 1;
+    string name = 2;
+    string version = 3;
+    string type = 4;
+    string state = 5;
+    string description = 6;
+    repeated string provides = 7;
+    repeated string requires = 8;
+    repeated string conflicts = 9;
+    uint64 size = 10;
+    string license = 11;
+    string author = 12;
+    uint64 installed_at = 13;
+}
+
+message PluginStatus {
+    string id = 1;
+    string state = 2;
+    uint64 uptime = 3;
+    uint64 memory_used = 4;
+    uint32 pid = 5;
+    string error = 6;
+}
+```
+
+五、核心函数实现
+
+5.1 初始化与自举
+
+```c
+// bus/src/bus.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#include "bus.h"
+#include "kernel_ipc.h"      // 微内核 IPC 接口
+#include "kernel_task.h"     // 微内核任务接口
+#include "kernel_mm.h"       // 微内核内存接口
+
+/* 全局组件总线实例 */
+static component_bus_t g_bus = {0};
+
+/* ============================================================
+   初始化组件总线（被微内核调用）
+   ============================================================ */
+int bus_init(uint64_t bus_task_id) {
+    memset(&g_bus, 0, sizeof(g_bus));
+    
+    // 1. 记录 BUS 自身的任务 ID
+    g_bus.bus_task_id = bus_task_id;
+    
+    // 2. 设置默认扫描路径
+    strcpy(g_bus.scan_paths[0], "/var/lib/hwrun/git/plugins");
+    strcpy(g_bus.scan_paths[1], "/usr/lib/hwrun/plugins");
+    g_bus.scan_paths_count = 2;
+    
+    // 3. 初始化 METAPROTO 客户端（通过 IPC）
+    // 注意：METAPROTO 已经由微内核加载，BUS 只需要连接它
+    g_bus.metaproto_client = metaproto_client_connect();
+    if (!g_bus.metaproto_client) {
+        // METAPROTO 可能还没就绪，等待
+        int retries = 10;
+        while (retries-- > 0) {
+            yield();
+            g_bus.metaproto_client = metaproto_client_connect();
+            if (g_bus.metaproto_client) break;
+        }
+        if (!g_bus.metaproto_client) {
+            bus_log("Failed to connect to METAPROTO");
+            return -1;
+        }
+    }
+    
+    // 4. 注册 BUS 协议（通过 METAPROTO）
+    ProtocolInfo proto_info = {
+        .name = "BUS",
+        .version = "1.0.0",
+        .description = "Component Bus Protocol",
+        .provider_plugin = "component-bus",
+        .status = "active",
+    };
+    if (metaproto_register(g_bus.metaproto_client, &proto_info) != 0) {
+        bus_log("Failed to register BUS protocol");
+    }
+    
+    // 5. 尝试连接其他核心服务
+    g_bus.git_storage_client = git_storage_client_connect();
+    g_bus.param_client = param_client_connect();
+    g_bus.log_client = log_client_connect();
+    
+    // 6. 设置回调
+    g_bus.on_install = bus_default_on_install;
+    g_bus.on_uninstall = bus_default_on_uninstall;
+    g_bus.on_replace = bus_default_on_replace;
+    g_bus.on_state_change = bus_default_on_state_change;
+    
+    g_bus.initialized = 1;
+    bus_log("Component Bus initialized successfully");
+    return 0;
+}
+
+/* ============================================================
+   扫描可用插件
+   ============================================================ */
+int bus_scan(const char **paths, int path_count) {
+    plugin_discovery_t *list = NULL;
+    int total = 0;
+    
+    if (paths == NULL || path_count == 0) {
+        paths = (const char **)g_bus.scan_paths;
+        path_count = g_bus.scan_paths_count;
+    }
+    
+    bus_log("Scanning plugins...");
+    
+    for (int i = 0; i < path_count; i++) {
+        DIR *dir = opendir(paths[i]);
+        if (!dir) continue;
+        
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            
+            char plugin_path[512];
+            snprintf(plugin_path, sizeof(plugin_path), "%s/%s", paths[i], entry->d_name);
+            
+            struct stat st;
+            if (stat(plugin_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;
+            }
+            
+            char yml_path[512];
+            snprintf(yml_path, sizeof(yml_path), "%s/plugin.yml", plugin_path);
+            if (access(yml_path, R_OK) != 0) {
+                continue;
+            }
+            
+            plugin_discovery_t *discovery = parse_plugin_yml(yml_path);
+            if (discovery) {
+                discovery->next = list;
+                list = discovery;
+                total++;
+                bus_log("Found plugin: %s (%s)", discovery->id, discovery->version);
+            }
+        }
+        closedir(dir);
+    }
+    
+    bus_log("Scan completed, found %d plugins", total);
+    return total;
+}
+```
+
+5.2 插件安装实现
+
+```c
+// bus/src/install.c
+
+/* ============================================================
+   安装插件
+   ============================================================ */
+int bus_install(const char *id, const char *version, int install_deps) {
+    if (g_bus.dry_run) {
+        bus_log("DRY RUN: Would install plugin %s", id);
+        return 0;
+    }
+    
+    // 1. 查找插件
+    plugin_discovery_t *discovery = find_discovery(id);
+    if (!discovery) {
+        bus_log("Plugin %s not found", id);
+        return -1;
+    }
+    
+    // 2. 检查是否已安装
+    plugin_t *existing = find_plugin(id);
+    if (existing && existing->state != PLUGIN_STATE_UNINSTALLED) {
+        bus_log("Plugin %s is already installed", id);
+        return -2;
+    }
+    
+    // 3. 检查依赖（通过 METAPROTO）
+    if (install_deps || g_bus.auto_install_deps) {
+        int deps_ok = install_dependencies(discovery);
+        if (deps_ok < 0) {
+            bus_log("Failed to install dependencies for %s", id);
+            return -3;
+        }
+    }
+    
+    // 4. 创建插件对象
+    plugin_t *p = plugin_create(discovery);
+    if (!p) {
+        bus_log("Failed to create plugin object for %s", id);
+        return -4;
+    }
+    
+    // 5. 克隆 Git 仓库（通过 git-storage 客户端）
+    if (discovery->repo[0] != '\0') {
+        char repo_path[512];
+        snprintf(repo_path, sizeof(repo_path), "/var/lib/hwrun/git/plugins/%s", id);
+        
+        if (git_storage_clone(g_bus.git_storage_client, discovery->repo, repo_path) != 0) {
+            bus_log("Failed to clone repository for %s", id);
+            plugin_destroy(p);
+            return -5;
+        }
+        
+        if (discovery->tag[0] != '\0') {
+            git_storage_checkout(g_bus.git_storage_client, discovery->tag);
+        } else if (discovery->branch[0] != '\0') {
+            git_storage_checkout(g_bus.git_storage_client, discovery->branch);
+        }
+    }
+    
+    // 6. 创建安装记录
+    install_record_t *record = calloc(1, sizeof(install_record_t));
+    strcpy(record->plugin_id, id);
+    record->timestamp = time(NULL);
+    record->task_id = g_bus.bus_task_id;
+    
+    // 7. 复制文件到系统目录
+    for (int i = 0; i < discovery->files_count; i++) {
+        char src[512], dst[512];
+        snprintf(src, sizeof(src), "/var/lib/hwrun/git/plugins/%s/%s", id, discovery->files[i]);
+        snprintf(dst, sizeof(dst), "/usr/lib/hwrun/plugins/%s", 
+                 strrchr(discovery->files[i], '/') ? strrchr(discovery->files[i], '/') + 1 : discovery->files[i]);
+        
+        if (copy_file(src, dst) == 0) {
+            add_to_record(record, "file", dst);
+        }
+    }
+    
+    // 8. 如果是内核模块，加载到内核
+    for (int i = 0; i < discovery->files_count; i++) {
+        if (strstr(discovery->files[i], ".ko")) {
+            char mod_path[512];
+            snprintf(mod_path, sizeof(mod_path), "/usr/lib/hwrun/plugins/%s", 
+                     strrchr(discovery->files[i], '/') ? strrchr(discovery->files[i], '/') + 1 : discovery->files[i]);
+            
+            if (load_kernel_module(mod_path) == 0) {
+                add_to_record(record, "module", mod_path);
+            }
+        }
+    }
+    
+    // 9. 如果是 systemd 服务，启动服务
+    // （实际实现中需要检查 .service 文件）
+    
+    // 10. 执行 post_install 钩子
+    if (p->post_install[0] != '\0') {
+        run_hook(p->post_install, p);
+    }
+    
+    // 11. 更新状态
+    p->state = PLUGIN_STATE_INSTALLED;
+    p->private_data = record;
+    p->task_id = task_create(p->name, NULL);  // 为插件创建微内核任务
+    
+    // 12. 添加到链表
+    p->next = g_bus.plugins;
+    g_bus.plugins = p;
+    record->next = g_bus.records;
+    g_bus.records = record;
+    
+    // 13. Git commit
+    if (g_bus.git_storage_client) {
+        char commit_msg[256];
+        snprintf(commit_msg, sizeof(commit_msg), "安装插件 %s v%s", id, p->version);
+        git_storage_commit(g_bus.git_storage_client, commit_msg);
+    }
+    
+    // 14. 触发回调
+    if (g_bus.on_install) {
+        g_bus.on_install(p);
+    }
+    
+    bus_log("Plugin %s installed successfully", id);
+    return 0;
+}
+```
+
+5.3 插件加载实现
+
+```c
+// bus/src/load.c
+
+/* ============================================================
+   加载插件（到内存）
+   ============================================================ */
+int bus_load(const char *id) {
+    plugin_t *p = find_plugin(id);
+    if (!p) {
+        bus_log("Plugin %s not found", id);
+        return -1;
+    }
+    
+    if (p->state != PLUGIN_STATE_INSTALLED) {
+        bus_log("Plugin %s is not in installed state", id);
+        return -2;
+    }
+    
+    // 1. 检查依赖（通过 METAPROTO）
+    for (int i = 0; i < p->requires_count; i++) {
+        if (!metaproto_resolve(g_bus.metaproto_client, p->requires[i], NULL)) {
+            bus_log("Required protocol %s not available for plugin %s", p->requires[i], id);
+            return -3;
+        }
+    }
+    
+    // 2. 加载动态库
+    void *handle = NULL;
+    char lib_path[512];
+    
+    for (int i = 0; i < p->files_count; i++) {
+        if (strstr(p->files[i], ".so")) {
+            snprintf(lib_path, sizeof(lib_path), "/usr/lib/hwrun/plugins/%s", 
+                     strrchr(p->files[i], '/') ? strrchr(p->files[i], '/') + 1 : p->files[i]);
+            
+            handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
+            if (!handle) {
+                bus_log("Failed to load plugin %s: %s", id, dlerror());
+                return -4;
+            }
+            
+            // 查找插件函数
+            char func_name[128];
+            snprintf(func_name, sizeof(func_name), "%s_init", id);
+            p->init = (int (*)(plugin_t *))dlsym(handle, func_name);
+            
+            snprintf(func_name, sizeof(func_name), "%s_start", id);
+            p->start = (int (*)(plugin_t *))dlsym(handle, func_name);
+            
+            snprintf(func_name, sizeof(func_name), "%s_stop", id);
+            p->stop = (int (*)(plugin_t *))dlsym(handle, func_name);
+            
+            snprintf(func_name, sizeof(func_name), "%s_destroy", id);
+            p->destroy = (int (*)(plugin_t *))dlsym(handle, func_name);
+            
+            snprintf(func_name, sizeof(func_name), "%s_get_interface", id);
+            p->get_interface = (void *(*)(const char *))dlsym(handle, func_name);
+            
+            p->handle = handle;
+            break;
+        }
+    }
+    
+    if (!handle) {
+        bus_log("No loadable file found for plugin %s", id);
+        return -5;
+    }
+    
+    // 3. 调用 init
+    if (p->init) {
+        if (p->init(p) != 0) {
+            bus_log("Plugin %s init failed", id);
+            dlclose(handle);
+            return -6;
+        }
+    }
+    
+    // 4. 注册协议（通过 METAPROTO）
+    for (int i = 0; i < p->provides_count; i++) {
+        void *impl = p->get_interface ? p->get_interface(p->provides[i]) : NULL;
+        if (impl) {
+            ProtocolInfo info = {
+                .name = p->provides[i],
+                .version = "1.0.0",
+                .provider_plugin = p->id,
+                .status = "active",
+            };
+            metaproto_register(g_bus.metaproto_client, &info);
+            
+            protocol_provider_t *provider = calloc(1, sizeof(protocol_provider_t));
+            strcpy(provider->protocol, p->provides[i]);
+            strcpy(provider->version, "1.0.0");
+            strcpy(provider->plugin_id, p->id);
+            provider->implementation = impl;
+            provider->next = g_bus.providers;
+            g_bus.providers = provider;
+        }
+    }
+    
+    p->state = PLUGIN_STATE_LOADED;
+    p->load_time = time(NULL);
+    
+    bus_log("Plugin %s loaded successfully", id);
+    return 0;
+}
+```
+
+5.4 插件卸载实现（可撤销副作用）
+
+```c
+// bus/src/uninstall.c
+
+/* ============================================================
+   卸载插件（可撤销副作用）
+   ============================================================ */
+int bus_uninstall(const char *id, int force) {
+    plugin_t *p = find_plugin(id);
+    if (!p) {
+        bus_log("Plugin %s not found", id);
+        return -1;
+    }
+    
+    // 1. 检查依赖
+    if (!force) {
+        plugin_t *consumer = find_consumer(id);
+        if (consumer) {
+            bus_log("Plugin %s is required by %s, use --force", id, consumer->id);
+            return -2;
+        }
+    }
+    
+    // 2. 如果正在运行，先停止
+    if (p->state == PLUGIN_STATE_STARTED) {
+        bus_stop(id);
+    }
+    if (p->state == PLUGIN_STATE_LOADED) {
+        bus_unload(id);
+    }
+    
+    // 3. 执行 pre_uninstall
+    if (p->pre_uninstall[0] != '\0') {
+        run_hook(p->pre_uninstall, p);
+    }
+    
+    // 4. 逆向执行安装记录（可撤销副作用）
+    install_record_t *record = find_record(id);
+    if (record) {
+        // 逆向顺序：最后安装的先卸载
+        for (int i = record->services_started_count - 1; i >= 0; i--) {
+            stop_service(record->services_started[i]);
+            remove_service_file(record->services_started[i]);
+        }
+        for (int i = record->modules_loaded_count - 1; i >= 0; i--) {
+            unload_kernel_module(record->modules_loaded[i]);
+        }
+        for (int i = record->mount_points_count - 1; i >= 0; i--) {
+            umount(record->mount_points[i]);
+        }
+        for (int i = record->config_changed_count - 1; i >= 0; i--) {
+            remove(record->config_changed[i]);
+        }
+        for (int i = record->files_copied_count - 1; i >= 0; i--) {
+            remove(record->files_copied[i]);
+        }
+    }
+    
+    // 5. 从 Git 仓库移除
+    if (g_bus.git_storage_client) {
+        git_storage_remove_submodule(g_bus.git_storage_client, p->id);
+    }
+    
+    // 6. 注销协议
+    remove_protocol_providers(p->id);
+    
+    // 7. 清理微内核任务
+    if (p->task_id > 0) {
+        task_destroy(p->task_id);
+    }
+    
+    // 8. 从列表移除
+    remove_plugin_from_list(p);
+    
+    // 9. Git commit
+    if (g_bus.git_storage_client) {
+        char commit_msg[128];
+        snprintf(commit_msg, sizeof(commit_msg), "卸载插件 %s", id);
+        git_storage_commit(g_bus.git_storage_client, commit_msg);
+    }
+    
+    plugin_destroy(p);
+    bus_log("Plugin %s uninstalled successfully", id);
+    return 0;
+}
+```
+
+六、BUS 协议接口实现
+
+```c
+// bus/src/bus_service.c
+
+/* ============================================================
+   BUS 协议服务端实现（RPC 接口）
+   ============================================================ */
+
+#include "bus_service.h"
+#include "bus.h"
+
+/* 扫描插件 */
+int bus_service_scan(const char **paths, int path_count, 
+                     plugin_info_t **out, int *out_count) {
+    return bus_scan(paths, path_count);
+}
+
+/* 安装插件 */
+int bus_service_install(const char *id, const char *version, int install_deps) {
+    return bus_install(id, version, install_deps);
+}
+
+/* 卸载插件 */
+int bus_service_uninstall(const char *id, int force) {
+    return bus_uninstall(id, force);
+}
+
+/* 加载插件 */
+int bus_service_load(const char *id) {
+    return bus_load(id);
+}
+
+/* 启动插件 */
+int bus_service_start(const char *id) {
+    return bus_start(id);
+}
+
+/* 停止插件 */
+int bus_service_stop(const char *id) {
+    return bus_stop(id);
+}
+
+/* 替换插件 */
+int bus_service_replace(const char *old_id, const char *new_id, int preserve_config) {
+    return bus_replace(old_id, new_id);
+}
+
+/* 查询插件状态 */
+int bus_service_status(const char *id, plugin_status_t *out) {
+    plugin_t *p = find_plugin(id);
+    if (!p) return -1;
+    out->id = strdup(p->id);
+    out->state = p->state;
+    out->uptime = (p->state == PLUGIN_STATE_STARTED) ? (time(NULL) - p->load_time) : 0;
+    return 0;
+}
+
+/* 列出所有插件 */
+int bus_service_list(const char *filter, const char *state, 
+                     plugin_info_t **out, int *out_count) {
+    plugin_t *p = g_bus.plugins;
+    int count = 0;
+    while (p) {
+        if (match_filter(p->id, filter) && match_state(p->state, state)) {
+            count++;
+        }
+        p = p->next;
+    }
+    *out_count = count;
+    return 0;
+}
+
+/* 解析协议 */
+int bus_service_resolve(const char *protocol, const char *version, 
+                        char *out_plugin_id, size_t size) {
+    protocol_provider_t *pp = g_bus.providers;
+    while (pp) {
+        if (strcmp(pp->protocol, protocol) == 0) {
+            if (version == NULL || check_version_compatibility(version, pp->version)) {
+                strncpy(out_plugin_id, pp->plugin_id, size);
+                return 0;
+            }
+        }
+        pp = pp->next;
+    }
+    // 通过 METAPROTO 查询
+    char provider[64];
+    if (metaproto_resolve(g_bus.metaproto_client, protocol, version, provider, sizeof(provider)) == 0) {
+        strncpy(out_plugin_id, provider, size);
+        return 0;
+    }
+    return -1;
+}
+```
+
+七、启动流程与自举
+
+7.1 系统启动自举流程
+
+```
+微内核 _start()
+    │
+    ├── 1. 硬件初始化
+    ├── 2. 内存分配器初始化
+    ├── 3. 中断/时钟初始化
+    ├── 4. 加载 METAPROTO 插件（硬编码路径）
+    │        └── METAPROTO 注册自己
+    ├── 5. plugin_load("/usr/lib/hwrun/plugins/bus.so")
+    ├── 6. task_create("bus", entry)
+    ├── 7. task_switch(bus)
+    │
+    ▼
+bus_init()  ← BUS 插件启动
+    │
+    ├── 1. 连接 METAPROTO
+    ├── 2. 注册 BUS 协议
+    ├── 3. 扫描插件目录
+    ├── 4. 加载 PARAM（参数系统）
+    ├── 5. 加载 LOG（日志系统）
+    ├── 6. 加载 GIT（Git 存储）
+    ├── 7. 读取参数，加载默认插件
+    │        ├── kernel.type → 内核插件
+    │        ├── init.type → init 插件
+    │        └── fs.type → 文件系统插件
+    └── 8. 系统就绪
+```
+
+7.2 BUS 启动时加载的插件顺序
+
+```
+BUS 启动后按以下顺序加载插件：
+
+1. PARAM     → 参数系统（必须最先加载，其他插件依赖参数）
+2. LOG       → 日志系统（尽早加载，记录后续所有操作）
+3. GIT       → Git 存储（尽早加载，记录后续所有变更）
+4. 根据参数决定的其他插件：
+   ├── kernel.type  → 内核插件（HAP 协议）
+   ├── init.type    → init 插件（INIT 协议）
+   ├── fs.type      → 文件系统插件（FSP 协议）
+   ├── network.type → 网络插件（NP 协议）
+   ├── sp.type      → 安全插件（SP 协议）
+   ├── scheduler.type → 调度器插件（SCHED 协议）
+   └── ui.type      → 用户界面插件（UI 协议）
+```
+
+八、配置文件
+
+```yaml
+# /etc/hwrun/bus.yml
+bus:
+  # 插件扫描路径
+  scan_paths:
+    - "/var/lib/hwrun/git/plugins"
+    - "/usr/lib/hwrun/plugins"
+  
+  # 是否自动安装依赖
+  auto_install_deps: true
+  
+  # 空跑模式（不实际执行）
+  dry_run: false
+  
+  # Git 配置
+  git:
+    remote: "https://hwrun.org/plugins/"
+    branch: "main"
+    auto_commit: true
+  
+  # 日志
+  log:
+    level: "info"
+    file: "/var/log/hwrun/bus.log"
+  
+  # 插件加载顺序
+  load_order:
+    - "param-system"
+    - "log-system"
+    - "git-storage"
+    # 其他插件由参数决定
+```
+
+九、命令行接口
+
+```bash
+# 插件管理
+hwrun bus scan
+hwrun bus install linux-kernel
+hwrun bus install linux-kernel --version 6.2.0
+hwrun bus remove linux-kernel
+hwrun bus remove linux-kernel --force
+
+# 生命周期
+hwrun bus load linux-kernel
+hwrun bus start linux-kernel
+hwrun bus stop linux-kernel
+hwrun bus replace linux-kernel freebsd-kernel
+
+# 查询
+hwrun bus status
+hwrun bus status linux-kernel
+hwrun bus list
+hwrun bus list --state started
+hwrun bus info linux-kernel
+hwrun bus deps linux-kernel
+
+# 维护
+hwrun bus update linux-kernel
+hwrun bus rollback linux-kernel --version 6.1.0
+```
+
+十、总结
+
+10.1 组件总线职责
+
+功能 描述
+插件发现 扫描 Git 仓库和本地目录，解析 plugin.yml
+插件安装 Git clone 源码，复制文件，加载模块，启动服务
+依赖管理 通过 METAPROTO 查询协议提供者，自动安装依赖
+生命周期 安装 → 加载 → 启动 → 运行 → 停止 → 卸载
+可撤销副作用 记录所有操作，卸载时逆向执行
+热替换 运行时替换插件，协议消费者无感知
+Git 集成 所有操作自动 commit，可回滚
+协议注册 插件加载后自动注册协议到 METAPROTO
+
+10.2 关键设计原则
+
+1. METAPROTO 先启动（自举），BUS 后启动
+2. 所有插件操作通过 BUS 协议进行
+3. 副作用可撤销（安装记录 + 逆向执行）
+4. 热替换通过协议路由切换实现
+5. Git 提供版本控制和历史管理
+6. BUS 只依赖微内核极简接口（任务、IPC、内存）
+
+10.3 与微内核的接口
+
+```
+BUS 从微内核获取：
+├── task_create()      → 为每个插件创建微内核任务
+├── task_switch()      → 切换任务
+├── ipc_send()         → 发送消息到其他插件
+├── ipc_recv()         → 接收来自其他插件的消息
+├── kmalloc()          → 分配内存
+├── kfree()            → 释放内存
+└── yield()            → 让出 CPU
+
+BUS 通过微内核 IPC 与其他插件通信：
+├── METAPROTO → 协议注册/发现
+├── PARAM → 参数读写
+├── LOG → 日志写入
+└── GIT → Git 操作
+```

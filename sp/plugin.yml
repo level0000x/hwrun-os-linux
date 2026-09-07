@@ -1,0 +1,29 @@
+# HWRun OS — SP 插件描述（安全协议，依赖链第 7 环）
+plugin:
+  id: "sp"
+  name: "Security Protocol"
+  version: "1.0.0"
+  type: "security"
+
+  description: "HWRun OS 安全协议：认证、授权、对称加密（AES-256-CBC+HMAC）、哈希、签名、密钥管理与完整性校验"
+
+  provides:
+    - protocol: "SP"
+      version: "1.0"
+
+  requires:
+    - protocol: "PMP"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  files:
+    - "build/sp.so"

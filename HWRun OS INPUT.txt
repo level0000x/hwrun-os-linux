@@ -1,0 +1,872 @@
+﻿HWRun OS INPUT 实现文档
+
+模块名称： INPUT (Input Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 输入设备协议，提供对键盘、鼠标、触摸板、触摸屏等输入设备的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）
+提供协议： INPUT
+
+一、设计哲学
+
+1.1 核心定位
+
+INPUT 是 HWRun OS 的输入抽象层——所有与键盘、鼠标、触摸板、触摸屏等输入设备相关的操作都通过 INPUT 协议进行。
+
+Linux 内核的输入子系统是一个专门用于管理各类输入设备的标准化框架，其核心作用是统一处理键盘、鼠标、按键、触摸屏等各类输入设备的事件。HWRun OS 的 INPUT 插件是对这一框架的协议化封装。
+
+```
+INPUT = 输入抽象协议 = 所有输入设备操作的统一入口
+
+上层插件 (UI, CONSOLE, DESKTOP, TERMINAL, ...)
+    │
+    │  通过 INPUT 协议读取输入事件
+    ▼
+INPUT 插件 (内核模块)
+    │
+    │  基于 Linux input 子系统
+    │  ├── 输入设备驱动层 (Drivers)
+    │  ├── 输入核心层 (Input Core)        ← 承上启下[reference:1]
+    │  └── 事件处理层 (Event Handlers)    ← 如 evdev[reference:2][reference:3]
+    │
+    ▼
+硬件层 (键盘、鼠标、触摸板、触摸屏)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有输入设备操作通过 INPUT 协议进行
+2. 内核实现：INPUT 插件运行在内核态，基于 Linux input 子系统
+3. 事件统一：所有输入事件通过统一的数据结构传递
+4. 设备发现：支持热插拔和动态设备发现
+5. 多设备支持：支持键盘、鼠标、触摸板、触摸屏等多种设备类型
+
+1.3 INPUT 插件的本质
+
+INPUT 插件 = Linux 内核 input 子系统的 HWRun 协议封装
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         INPUT 插件架构                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  INPUT 协议接口 (通过 IPC 调用)                                    │   │
+│  │  Subscribe / Unsubscribe / GetDevices / GrabDevice / UngrabDevice │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层                                                         │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 事件序列化                                                     │   │
+│  │  └── 设备信息转换                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 input 子系统封装                                        │   │
+│  │  ├── input_register_device() / input_unregister_device()          │   │
+│  │  ├── input_event() / input_sync()                                 │   │
+│  │  ├── evdev 事件处理层[reference:5]                                      │   │
+│  │  └── /dev/input/event* 设备节点                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (input 子系统)                                         │   │
+│  │  ├── 输入设备驱动层[reference:6]                                         │   │
+│  │  ├── 输入核心层 (Input Core)[reference:7]                               │   │
+│  │  └── 事件处理层 (Event Handlers)[reference:8]                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 INPUT 插件的组成
+
+```
+INPUT 插件 (input.ko)
+├── 协议处理层
+│   ├── input_ipc_handler()       ← IPC 消息分发
+│   ├── input_subscribe()         ← 订阅输入事件
+│   ├── input_unsubscribe()       ← 取消订阅
+│   ├── input_get_devices()       ← 获取设备列表
+│   ├── input_grab_device()       ← 独占设备
+│   └── input_ungrab_device()     ← 释放设备
+│
+├── 事件分发层
+│   ├── input_dispatcher.c        ← 事件分发器
+│   └── input_event_queue.c       ← 事件队列
+│
+├── 设备管理层
+│   ├── input_device.c            ← 设备管理
+│   └── input_hotplug.c           ← 热插拔处理
+│
+└── 初始化/清理
+    ├── input_init()              ← 模块加载
+    └── input_exit()              ← 模块卸载
+```
+
+2.2 INPUT 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → 其他插件
+                                                                                                                         ↑
+                                                                                                              INPUT 在这里加载
+```
+
+INPUT 插件在 SANDBOX 之后、UI 和 CONSOLE 之前加载，为上层提供输入设备访问能力。
+
+2.3 INPUT 的上层消费者
+
+上层插件 需要 INPUT 提供什么
+UI (用户界面) 键盘输入、鼠标点击/移动
+CONSOLE (控制台) 键盘输入
+DESKTOP (桌面环境) 键盘/鼠标事件
+TERMINAL (终端) 键盘输入
+
+三、核心数据结构
+
+```c
+// input/include/input.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   输入设备类型 (对应 Linux input 子系统)
+   ============================================================ */
+typedef enum {
+    INPUT_TYPE_KEYBOARD = 0,        // 键盘
+    INPUT_TYPE_MOUSE,               // 鼠标
+    INPUT_TYPE_TOUCHPAD,            // 触摸板
+    INPUT_TYPE_TOUCHSCREEN,         // 触摸屏
+    INPUT_TYPE_JOYSTICK,            // 游戏手柄
+    INPUT_TYPE_TABLET,              // 数位板
+    INPUT_TYPE_UNKNOWN,
+} input_device_type_t;
+
+/* ============================================================
+   输入事件类型 (对应 Linux input_event 的 type)
+   ============================================================ */
+typedef enum {
+    INPUT_EV_SYN = 0,               // 同步事件
+    INPUT_EV_KEY,                   // 按键事件
+    INPUT_EV_REL,                   // 相对坐标 (鼠标移动)
+    INPUT_EV_ABS,                   // 绝对坐标 (触摸屏)
+    INPUT_EV_MSC,                   // 杂项事件
+    INPUT_EV_SW,                    // 开关事件
+} input_event_type_t;
+
+/* ============================================================
+   按键代码 (对应 Linux KEY_*)
+   ============================================================ */
+typedef enum {
+    INPUT_KEY_ESC = 1,
+    INPUT_KEY_ENTER = 28,
+    INPUT_KEY_SPACE = 57,
+    INPUT_KEY_BACKSPACE = 14,
+    INPUT_KEY_TAB = 15,
+    INPUT_KEY_A = 30,
+    INPUT_KEY_B = 48,
+    INPUT_KEY_C = 46,
+    // ... 完整列表在 Linux 的 <linux/input-event-codes.h>
+    INPUT_KEY_F1 = 59,
+    INPUT_KEY_F2 = 60,
+    // ...
+} input_key_code_t;
+
+/* ============================================================
+   输入事件结构 (对应 Linux input_event)
+   ============================================================ */
+typedef struct input_event {
+    uint64_t timestamp;             // 时间戳 (微秒)
+    input_event_type_t type;        // 事件类型
+    uint16_t code;                  // 事件代码 (按键码/轴)
+    int32_t value;                  // 事件值 (按下/释放/坐标)
+} input_event_t;
+
+/* ============================================================
+   输入设备信息
+   ============================================================ */
+typedef struct input_device_info {
+    char name[128];                 // 设备名称
+    char phys[64];                  // 物理路径
+    char uniq[64];                  // 唯一标识
+    input_device_type_t type;       // 设备类型
+    uint32_t vendor;                // 厂商 ID
+    uint32_t product;               // 产品 ID
+    uint32_t version;               // 版本
+    int has_keys;                   // 是否有按键
+    int has_rel;                    // 是否有相对坐标
+    int has_abs;                    // 是否有绝对坐标
+    struct input_device_info *next;
+} input_device_info_t;
+
+/* ============================================================
+   输入订阅
+   ============================================================ */
+typedef struct input_subscription {
+    char device_path[64];           // /dev/input/eventX
+    uint64_t task_id;               // 订阅者任务 ID
+    int fd;                         // 文件描述符
+    int active;
+    struct input_subscription *next;
+} input_subscription_t;
+
+/* ============================================================
+   INPUT 上下文
+   ============================================================ */
+typedef struct input_context {
+    int initialized;
+    uint64_t input_task_id;         // INPUT 自身的任务 ID
+    
+    input_subscription_t *subscriptions;
+    input_device_info_t *devices;
+    uint32_t device_count;
+    
+    void *lock;
+} input_context_t;
+```
+
+四、INPUT 协议定义
+
+```protobuf
+// protocols/input.proto
+syntax = "proto3";
+
+package hwrun.input;
+
+service Input {
+    // === 事件订阅 ===
+    rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+    
+    // === 设备管理 ===
+    rpc GetDevices(Empty) returns (GetDevicesResponse);
+    rpc GrabDevice(GrabRequest) returns (GrabResponse);
+    rpc UngrabDevice(UngrabRequest) returns (UngrabResponse);
+    rpc GetDeviceInfo(GetDeviceInfoRequest) returns (GetDeviceInfoResponse);
+    
+    // === 事件读取 ===
+    rpc ReadEvents(ReadEventsRequest) returns (ReadEventsResponse);
+}
+
+message Empty {}
+
+// ============ 事件订阅 ============
+
+message SubscribeRequest {
+    string device_path = 1;         // 可选，不指定则订阅所有设备
+    bool blocking = 2;              // 是否阻塞等待事件
+}
+
+message SubscribeResponse {
+    string subscription_id = 1;
+    int32 fd = 2;
+    int32 error = 3;
+}
+
+message UnsubscribeRequest {
+    string subscription_id = 1;
+}
+
+message UnsubscribeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 设备管理 ============
+
+message DeviceInfo {
+    string name = 1;
+    string phys = 2;
+    string uniq = 3;
+    uint32 type = 4;
+    uint32 vendor = 5;
+    uint32 product = 6;
+    uint32 version = 7;
+    bool has_keys = 8;
+    bool has_rel = 9;
+    bool has_abs = 10;
+    string path = 11;               // /dev/input/eventX
+}
+
+message GetDevicesResponse {
+    repeated DeviceInfo devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetDeviceInfoRequest {
+    string device_path = 1;
+}
+
+message GetDeviceInfoResponse {
+    DeviceInfo info = 1;
+    int32 error = 2;
+}
+
+message GrabRequest {
+    string device_path = 1;
+}
+
+message GrabResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UngrabRequest {
+    string device_path = 1;
+}
+
+message UngrabResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 事件读取 ============
+
+message InputEvent {
+    uint64 timestamp = 1;
+    uint32 type = 2;
+    uint32 code = 3;
+    int32 value = 4;
+}
+
+message ReadEventsRequest {
+    string subscription_id = 1;
+    uint32 max_events = 2;
+    int32 timeout_ms = 3;           // -1 表示阻塞
+}
+
+message ReadEventsResponse {
+    repeated InputEvent events = 1;
+    uint32 count = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// input/src/input.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/input.h>
+#include <linux/input/mt.h>
+#include <linux/slab.h>
+#include <linux/device.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
+
+#include "input.h"
+#include "input_ipc.h"
+#include "input_device.h"
+#include "input_dispatcher.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Input Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static input_context_t g_input_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init input_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun INPUT: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_input_ctx, 0, sizeof(input_context_t));
+    
+    // 2. 扫描现有输入设备
+    input_scan_devices();
+    
+    // 3. 注册 IPC 消息处理器
+    ret = input_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun INPUT: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 INPUT 协议（通过 METAPROTO - 通过 IPC）
+    input_register_protocol();
+    
+    g_input_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun INPUT: Initialized successfully\n");
+    printk(KERN_INFO "  Found %u input devices\n", g_input_ctx.device_count);
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit input_exit(void) {
+    printk(KERN_INFO "HWRun INPUT: Exiting...\n");
+    
+    input_ipc_unregister();
+    input_cleanup_devices();
+    input_cleanup_subscriptions();
+    
+    g_input_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun INPUT: Exited\n");
+}
+
+module_init(input_init);
+module_exit(input_exit);
+```
+
+5.2 设备扫描
+
+```c
+// input/src/input_device.c
+
+#include <linux/kernel.h>
+#include <linux/input.h>
+#include <linux/slab.h>
+#include <linux/device.h>
+#include <linux/string.h>
+#include <linux/module.h>
+
+#include "input.h"
+
+/* ============================================================
+   扫描所有输入设备
+   ============================================================ */
+int input_scan_devices(void) {
+    struct input_dev *dev;
+    input_device_info_t *info;
+    int count = 0;
+    
+    // 使用 input 子系统的遍历函数
+    // 注意：实际实现中需要持有 input 设备的锁
+    
+    // 遍历所有已注册的 input 设备
+    // 实际实现使用 input_dev 链表
+    
+    // 这里给出框架，实际实现需要从内核 input 子系统获取设备列表
+    
+    // 每个设备：
+    // info = kmalloc(sizeof(input_device_info_t), GFP_KERNEL);
+    // strcpy(info->name, dev->name);
+    // info->type = input_get_device_type(dev);
+    // info->vendor = dev->id.vendor;
+    // info->product = dev->id.product;
+    // info->has_keys = test_bit(EV_KEY, dev->evbit);
+    // info->has_rel = test_bit(EV_REL, dev->evbit);
+    // info->has_abs = test_bit(EV_ABS, dev->evbit);
+    // snprintf(info->path, sizeof(info->path), "/dev/input/event%d", dev->minor);
+    
+    // 添加到链表
+    
+    return count;
+}
+
+/* ============================================================
+   获取设备类型
+   ============================================================ */
+input_device_type_t input_get_device_type(struct input_dev *dev) {
+    if (test_bit(EV_KEY, dev->evbit) && dev->keybit[BIT_WORD(KEY_Q)]) {
+        return INPUT_TYPE_KEYBOARD;
+    }
+    if (test_bit(EV_REL, dev->evbit) && test_bit(REL_X, dev->relbit)) {
+        return INPUT_TYPE_MOUSE;
+    }
+    if (test_bit(EV_ABS, dev->evbit) && test_bit(ABS_X, dev->absbit) &&
+        test_bit(ABS_MT_POSITION_X, dev->absbit)) {
+        return INPUT_TYPE_TOUCHSCREEN;
+    }
+    // ... 更多类型判断
+    return INPUT_TYPE_UNKNOWN;
+}
+```
+
+5.3 事件订阅
+
+```c
+// input/src/input_dispatcher.c
+
+#include <linux/kernel.h>
+#include <linux/input.h>
+#include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
+
+#include "input.h"
+#include "input_ipc.h"
+
+/* ============================================================
+   订阅输入设备
+   ============================================================ */
+int input_subscribe(const char *device_path, int blocking, char *out_id) {
+    input_subscription_t *sub;
+    struct file *filp;
+    int fd;
+    int ret;
+    
+    // 1. 打开设备文件
+    filp = filp_open(device_path, O_RDONLY | O_NONBLOCK, 0);
+    if (IS_ERR(filp)) {
+        return PTR_ERR(filp);
+    }
+    
+    // 2. 获取文件描述符
+    fd = get_unused_fd_flags(0);
+    if (fd < 0) {
+        filp_close(filp, NULL);
+        return fd;
+    }
+    fd_install(fd, filp);
+    
+    // 3. 创建订阅记录
+    sub = kmalloc(sizeof(input_subscription_t), GFP_KERNEL);
+    if (!sub) {
+        close_fd(fd);
+        return -ENOMEM;
+    }
+    
+    memset(sub, 0, sizeof(input_subscription_t));
+    strncpy(sub->device_path, device_path, sizeof(sub->device_path) - 1);
+    sub->task_id = g_input_ctx.input_task_id;
+    sub->fd = fd;
+    sub->active = 1;
+    
+    // 4. 生成订阅 ID
+    snprintf(out_id, 64, "sub-%lu-%d", get_jiffies_64(), fd);
+    
+    // 5. 添加到订阅列表
+    sub->next = g_input_ctx.subscriptions;
+    g_input_ctx.subscriptions = sub;
+    
+    return fd;
+}
+
+/* ============================================================
+   读取输入事件
+   ============================================================ */
+int input_read_events(int fd, input_event_t *events, uint32_t max_events,
+                       int timeout_ms, uint32_t *out_count) {
+    struct file *filp;
+    struct input_event ev;
+    ssize_t ret;
+    uint32_t count = 0;
+    loff_t pos = 0;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    // 如果超时 > 0，使用 poll 等待
+    if (timeout_ms > 0) {
+        struct poll_wqueues table;
+        poll_initwait(&table);
+        // poll 等待事件
+        // ...
+    }
+    
+    // 读取事件
+    while (count < max_events) {
+        ret = kernel_read(filp, &ev, sizeof(ev), &pos);
+        if (ret < 0) {
+            break;
+        }
+        if (ret == 0) {
+            break;
+        }
+        
+        // 转换为 INPUT 事件格式
+        events[count].timestamp = ev.time.tv_sec * 1000000ULL + ev.time.tv_usec;
+        events[count].type = ev.type;
+        events[count].code = ev.code;
+        events[count].value = ev.value;
+        count++;
+    }
+    
+    fput(filp);
+    *out_count = count;
+    return 0;
+}
+```
+
+5.4 热插拔处理
+
+```c
+// input/src/input_hotplug.c
+
+#include <linux/kernel.h>
+#include <linux/input.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+
+#include "input.h"
+#include "input_ipc.h"
+
+/* ============================================================
+   热插拔事件处理
+   ============================================================ */
+// 实际实现中，通过注册 input 设备的 notifier 回调
+// 或者通过 uevent 机制处理设备插入/移除
+
+static int input_hotplug_callback(struct notifier_block *nb,
+                                   unsigned long action, void *data) {
+    struct device *dev = data;
+    struct input_dev *input_dev;
+    
+    // 检查是否为 input 设备
+    if (!dev || !dev->type || strcmp(dev->type->name, "input") != 0) {
+        return NOTIFY_DONE;
+    }
+    
+    input_dev = to_input_dev(dev);
+    
+    switch (action) {
+        case BUS_NOTIFY_ADD_DEVICE:
+            // 设备插入：通知上层
+            input_ipc_notify_device_add(input_dev);
+            break;
+        case BUS_NOTIFY_DEL_DEVICE:
+            // 设备移除：通知上层
+            input_ipc_notify_device_remove(input_dev);
+            break;
+        default:
+            break;
+    }
+    
+    return NOTIFY_OK;
+}
+```
+
+5.5 IPC 消息处理
+
+```c
+// input/src/input_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "input.h"
+#include "input_ipc.h"
+#include "input_dispatcher.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void input_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case INPUT_MSG_SUBSCRIBE: {
+            input_subscribe_req_t *req = (input_subscribe_req_t *)data;
+            input_subscribe_resp_t resp;
+            int ret = input_subscribe(req->device_path, req->blocking,
+                                       resp.subscription_id);
+            resp.fd = ret;
+            resp.error = (ret < 0) ? ret : 0;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case INPUT_MSG_UNSUBSCRIBE: {
+            char *sub_id = (char *)data;
+            int ret = input_unsubscribe(sub_id);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case INPUT_MSG_GET_DEVICES: {
+            // 返回设备列表
+            input_device_info_t *devices;
+            uint32_t count;
+            input_get_devices(&devices, &count);
+            ipc_reply(from_task, devices, count * sizeof(input_device_info_t));
+            break;
+        }
+        
+        case INPUT_MSG_READ_EVENTS: {
+            input_read_req_t *req = (input_read_req_t *)data;
+            input_read_resp_t resp;
+            input_event_t *events = kmalloc(req->max_events * sizeof(input_event_t),
+                                             GFP_KERNEL);
+            if (!events) {
+                resp.count = 0;
+                resp.error = -ENOMEM;
+                ipc_reply(from_task, &resp, sizeof(resp));
+                break;
+            }
+            int ret = input_read_events(req->fd, events, req->max_events,
+                                         req->timeout_ms, &resp.count);
+            resp.error = ret;
+            // 发送事件数据（实际需要发送 events 数组）
+            ipc_reply(from_task, events, resp.count * sizeof(input_event_t));
+            kfree(events);
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun INPUT: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、用户态工具
+
+6.1 事件查看工具
+
+```c
+// input/tools/input-events.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/input.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    const char *dev = "/dev/input/event0";
+    struct input_event ev;
+    int fd;
+    
+    if (argc > 1) {
+        dev = argv[1];
+    }
+    
+    fd = open(dev, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    
+    printf("Monitoring %s...\n", dev);
+    
+    while (1) {
+        ssize_t n = read(fd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) continue;
+        
+        printf("[%ld.%06ld] type=%d code=%d value=%d\n",
+               ev.time.tv_sec, ev.time.tv_usec,
+               ev.type, ev.code, ev.value);
+    }
+    
+    close(fd);
+    return 0;
+}
+```
+
+七、构建与安装
+
+7.1 插件描述文件
+
+```yaml
+# plugins/input/plugin.yml
+plugin:
+  id: "input"
+  name: "Input Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 输入设备协议，提供键盘、鼠标、触摸板等输入设备的统一抽象"
+  
+  provides:
+    - protocol: "INPUT"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+  
+  params:
+    - key: "input.evdev_path"
+      type: "string"
+      default: "/dev/input/"
+      description: "输入设备路径"
+    - key: "input.default_timeout"
+      type: "int"
+      default: 100
+      description: "默认事件读取超时 (ms)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/input.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+7.2 构建脚本
+
+```makefile
+# input/Makefile
+
+obj-m += input.o
+
+input-objs := input.o input_device.o input_dispatcher.o \
+              input_hotplug.o input_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 input.ko /usr/lib/hwrun/plugins/
+```
+
+八、命令行接口
+
+```bash
+# 列出所有输入设备
+hwrun input devices
+
+# 订阅键盘事件
+hwrun input subscribe --device /dev/input/event0
+
+# 读取输入事件
+hwrun input read --fd 3 --max 10
+
+# 独占设备 (防止其他应用读取)
+hwrun input grab /dev/input/event0
+hwrun input ungrab /dev/input/event0
+
+# 测试工具
+hwrun input test
+```
+
+九、总结
+
+维度 决策
+定位 输入设备协议，所有输入操作的统一入口
+实现方式 Linux 内核模块 (.ko)，基于 input 子系统
+代码量 ~1000-1500 行 C
+提供协议 INPUT (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP
+加载时机 在 UI、CONSOLE、DESKTOP 等依赖输入的插件之前
+设备类型 键盘、鼠标、触摸板、触摸屏、游戏手柄
+
+INPUT 是 HWRun OS 中输入设备访问的核心插件。它基于 Linux 内核的 input 子系统，通过 INPUT 协议向上层插件提供键盘、鼠标、触摸板、触摸屏等输入设备的统一访问接口。上层插件（UI、CONSOLE、DESKTOP、TERMINAL 等）通过 INPUT 协议订阅输入事件，不直接操作 /dev/input/event 设备节点。*

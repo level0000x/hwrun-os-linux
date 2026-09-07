@@ -1,0 +1,1077 @@
+﻿HWRun OS PARAM 实现文档
+
+模块名称： PARAM
+版本： 1.0.0
+状态： 设计冻结
+定位： 参数系统，所有配置的统一管理入口
+实现语言： C
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）
+提供协议： PARAM
+
+一、设计哲学
+
+1.1 核心定位
+
+PARAM 是 HWRun OS 的“配置中心”——所有参数统一存储、统一访问、统一管理。
+
+```
+BUS 启动后加载的第一个插件
+    │
+    ▼
+PARAM (参数系统)
+    │  提供统一的参数管理服务：
+    │  1. 参数存储（键值对，点分路径）
+    │  2. 参数层级（硬件 → 系统 → 用户 → 插件 → 运行时）
+    │  3. 参数持久化（YAML 文件）
+    │  4. 动态监听（参数变更通知插件）
+    │  5. Git 集成（参数变更自动 commit）
+    ▼
+其他插件 (LOG, GIT, HAP, FSP, ...)
+    │  通过 PARAM 读写配置
+```
+
+1.2 设计原则
+
+1. 统一入口：所有配置通过 PARAM 读写，不直接操作文件
+2. 层级覆盖：硬件参数 → 系统参数 → 用户参数 → 插件参数 → 运行时参数，后者覆盖前者
+3. 动态生效：运行时修改参数自动通知相关插件
+4. 持久化：参数变更自动保存到 YAML 文件
+5. Git 原生：参数变更自动 commit，可追溯、可回滚
+6. 点分路径：用 scheduler.policy 风格访问嵌套参数
+
+1.3 参数层级
+
+层级 来源 优先级 示例
+运行时 程序动态设置 最高 load_avg, temperature
+用户 用户配置文件 高 scheduler.policy, hostname
+插件 plugin.yml 中的 default_params 中 各插件默认配置
+系统 系统自动生成 低 system.uptime, system.version
+硬件 HAP 插件提供 最低 cpu.cores, memory.total
+
+```
+参数查找优先级：
+用户设置 > 配置文件 > 插件默认值 > 系统默认值 > 硬件探测值
+```
+
+1.4 参数类型
+
+类型 说明 C 类型
+string 字符串 char *
+int 64 位整数 int64_t
+float 双精度浮点数 double
+bool 布尔值 int (0/1)
+list 数组 struct param **
+map 嵌套对象 struct param *
+
+二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PARAM — 参数系统                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    PARAM 协议接口                                     │  │
+│  │  Get / Set / List / Load / Save / Watch / Unwatch / Export / Import │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      参数树 (Parameter Tree)                          │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  system/                                                       │ │  │
+│  │  │  ├── hostname = "hwrun-node-01"                                │ │  │
+│  │  │  └── timezone = "UTC"                                          │ │  │
+│  │  │  scheduler/                                                    │ │  │
+│  │  │  ├── policy = "performance"                                    │ │  │
+│  │  │  └── weights/                                                  │ │  │
+│  │  │      ├── performance = 0.4                                     │ │  │
+│  │  │      ├── power = 0.3                                           │ │  │
+│  │  │      └── temperature = 0.3                                     │ │  │
+│  │  │  kernel/                                                       │ │  │
+│  │  │  ├── type = "linux"                                            │ │  │
+│  │  │  └── version = "6.1.0"                                         │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    参数监听器 (Watchers)                              │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  路径                │ 插件          │ 回调函数                 │ │  │
+│  │  ├─────────────────────────────────────────────────────────────────┤ │  │
+│  │  │ scheduler.policy    │ scheduler     │ sched_on_policy_change  │ │  │
+│  │  │ kernel.type         │ bus           │ bus_on_kernel_change    │ │  │
+│  │  │ network.mtu         │ network       │ net_on_mtu_change       │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    持久化存储 (Persistent Storage)                    │  │
+│  │  └── /etc/hwrun/params/*.yml                                         │  │
+│  │      ├── system.yml                                                  │  │
+│  │      ├── scheduler.yml                                               │  │
+│  │      ├── kernel.yml                                                  │  │
+│  │      └── ...                                                         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    Git 集成 (自动 commit)                             │  │
+│  │  └── 参数变更 → git add → git commit -m "修改参数 xxx"               │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    依赖的微内核接口                                    │  │
+│  │  ├── ipc_send()         → 发送通知给订阅者                           │  │
+│  │  ├── ipc_recv()         → 接收其他插件的请求                         │  │
+│  │  ├── kmalloc()          → 内存分配                                   │  │
+│  │  ├── kfree()            → 内存释放                                   │  │
+│  │  └── task_create()      → 为监听器创建任务                           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+三、核心数据结构
+
+```c
+// param/include/param.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   参数类型
+   ============================================================ */
+typedef enum {
+    PARAM_TYPE_STRING = 0,
+    PARAM_TYPE_INT,
+    PARAM_TYPE_FLOAT,
+    PARAM_TYPE_BOOL,
+    PARAM_TYPE_LIST,
+    PARAM_TYPE_MAP,
+} param_type_t;
+
+/* ============================================================
+   参数节点
+   ============================================================ */
+#define PARAM_KEY_MAX    128
+#define PARAM_VALUE_MAX  4096
+
+typedef struct param {
+    char key[PARAM_KEY_MAX];            // 完整路径，如 "scheduler.policy"
+    char name[64];                      // 短名称，如 "policy"
+    param_type_t type;
+    int modified;                       // 是否被用户修改
+    
+    union {
+        char *str_val;
+        int64_t int_val;
+        double float_val;
+        int bool_val;
+        struct param **list;            // 列表
+        struct param *map;              // 嵌套对象（键值对）
+    } value;
+    
+    char *default_value;                // 默认值（字符串表示）
+    uint64_t updated_at;                // 最后更新时间
+    
+    struct param *parent;               // 父节点
+    struct param *next;                 // 同级下一个
+    struct param *children;             // 子节点（用于 MAP 类型）
+} param_t;
+
+/* ============================================================
+   参数监听器
+   ============================================================ */
+typedef struct param_watcher {
+    char path[PARAM_KEY_MAX];           // 监听的参数路径（支持通配符 *）
+    char plugin_id[64];                 // 监听者插件 ID
+    uint64_t task_id;                   // 微内核任务 ID（用于通知）
+    void (*callback)(const char *key, const char *old_value, const char *new_value);
+    struct param_watcher *next;
+} param_watcher_t;
+
+/* ============================================================
+   PARAM 上下文
+   ============================================================ */
+typedef struct param_context {
+    param_t *root;                      // 参数树根节点
+    param_watcher_t *watchers;          // 监听器链表
+    
+    char config_dir[256];               // /etc/hwrun/params/
+    int auto_commit;                    // 是否自动 Git commit
+    int initialized;
+    
+    uint64_t param_task_id;             // PARAM 自身的任务 ID
+    
+    /* 互斥锁 */
+    void *lock;
+} param_context_t;
+
+/* ============================================================
+   PARAM 协议消息结构（通过 IPC 调用）
+   ============================================================ */
+
+/* 获取参数请求 */
+typedef struct param_get_req {
+    char key[PARAM_KEY_MAX];
+} param_get_req_t;
+
+/* 获取参数响应 */
+typedef struct param_get_resp {
+    char value[PARAM_VALUE_MAX];
+    int success;
+    char error[128];
+} param_get_resp_t;
+
+/* 设置参数请求 */
+typedef struct param_set_req {
+    char key[PARAM_KEY_MAX];
+    char value[PARAM_VALUE_MAX];
+} param_set_req_t;
+
+/* 设置参数响应 */
+typedef struct param_set_resp {
+    int success;
+    char error[128];
+} param_set_resp_t;
+
+/* 监听参数请求 */
+typedef struct param_watch_req {
+    char path[PARAM_KEY_MAX];
+    char plugin_id[64];
+    uint64_t task_id;
+} param_watch_req_t;
+
+/* 监听参数响应 */
+typedef struct param_watch_resp {
+    int success;
+    char error[128];
+} param_watch_resp_t;
+
+/* 参数变更通知消息 */
+typedef struct param_notify_msg {
+    char key[PARAM_KEY_MAX];
+    char old_value[PARAM_VALUE_MAX];
+    char new_value[PARAM_VALUE_MAX];
+    uint64_t timestamp;
+} param_notify_msg_t;
+```
+
+四、PARAM 协议定义
+
+```protobuf
+// protocols/param.proto
+syntax = "proto3";
+
+package hwrun.param;
+
+service ParamSystem {
+    // === 参数读写 ===
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc Set(SetRequest) returns (SetResponse);
+    
+    // === 参数列表 ===
+    rpc List(ListRequest) returns (ListResponse);
+    
+    // === 参数持久化 ===
+    rpc Load(LoadRequest) returns (LoadResponse);
+    rpc Save(SaveRequest) returns (SaveResponse);
+    
+    // === 参数监听 ===
+    rpc Watch(WatchRequest) returns (WatchResponse);
+    rpc Unwatch(UnwatchRequest) returns (UnwatchResponse);
+    
+    // === 导入导出 ===
+    rpc Export(ExportRequest) returns (ExportResponse);
+    rpc Import(ImportRequest) returns (ImportResponse);
+}
+
+message GetRequest {
+    string key = 1;                   // 点分路径，如 "scheduler.policy"
+}
+
+message GetResponse {
+    string value = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message SetRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message SetResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListRequest {
+    string prefix = 1;                // 可选，列出指定前缀下的所有参数
+}
+
+message ListResponse {
+    map<string, string> params = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message LoadRequest {
+    string file = 1;                  // 可选，不指定则加载所有
+}
+
+message LoadResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message SaveRequest {
+    string file = 1;                  // 可选，不指定则保存所有
+}
+
+message SaveResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message WatchRequest {
+    string path = 1;                  // 支持通配符 *，如 "scheduler.*"
+    string plugin_id = 2;
+    uint64 task_id = 3;
+}
+
+message WatchResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message UnwatchRequest {
+    string path = 1;
+    string plugin_id = 2;
+}
+
+message UnwatchResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ExportRequest {
+    string file = 1;
+}
+
+message ExportResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ImportRequest {
+    string file = 1;
+}
+
+message ImportResponse {
+    bool success = 1;
+    string error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 初始化与自举
+
+```c
+// param/src/param.c
+
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "param.h"
+#include "kernel_ipc.h"
+#include "kernel_task.h"
+#include "kernel_mm.h"
+#include "metaproto_client.h"
+#include "git_storage_client.h"
+#include "yaml_parser.h"
+
+/* 全局 PARAM 上下文 */
+static param_context_t g_ctx = {0};
+
+/* ============================================================
+   PARAM 初始化（被 BUS 调用）
+   ============================================================ */
+int param_init(uint64_t task_id) {
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    
+    // 1. 记录任务 ID
+    g_ctx.param_task_id = task_id;
+    
+    // 2. 设置配置目录
+    strcpy(g_ctx.config_dir, "/etc/hwrun/params/");
+    g_ctx.auto_commit = 1;  // 默认启用自动 commit
+    
+    // 3. 初始化参数树
+    g_ctx.root = param_create_node("", PARAM_TYPE_MAP);
+    
+    // 4. 加载默认参数（从 plugin.yml 中收集）
+    //    由 BUS 在加载插件时调用 param_register_defaults()
+    
+    // 5. 从持久化存储加载参数
+    param_load_all();
+    
+    // 6. 注册 PARAM 协议（通过 METAPROTO）
+    ProtocolInfo proto_info = {
+        .name = "PARAM",
+        .version = "1.0.0",
+        .description = "Parameter System Protocol",
+        .provider_plugin = "param-system",
+        .status = "active",
+    };
+    metaproto_register(metaproto_client, &proto_info);
+    
+    g_ctx.initialized = 1;
+    param_log("PARAM initialized");
+    return 0;
+}
+```
+
+5.2 参数树操作
+
+```c
+// param/src/tree.c
+
+/* ============================================================
+   创建参数节点
+   ============================================================ */
+param_t *param_create_node(const char *name, param_type_t type) {
+    param_t *p = kmalloc(sizeof(param_t));
+    if (!p) return NULL;
+    
+    memset(p, 0, sizeof(param_t));
+    strncpy(p->name, name, sizeof(p->name) - 1);
+    p->type = type;
+    p->updated_at = get_timestamp();
+    
+    return p;
+}
+
+/* ============================================================
+   根据路径查找参数（支持创建中间节点）
+   ============================================================ */
+param_t *param_find_or_create(const char *path, int create) {
+    if (!path || path[0] == '\0') return g_ctx.root;
+    
+    param_t *current = g_ctx.root;
+    char path_copy[PARAM_KEY_MAX];
+    strncpy(path_copy, path, sizeof(path_copy) - 1);
+    
+    char *token = strtok(path_copy, ".");
+    char *prev_token = NULL;
+    
+    while (token) {
+        // 在当前节点的 children 中查找
+        param_t *child = current->children;
+        param_t *found = NULL;
+        
+        while (child) {
+            if (strcmp(child->name, token) == 0) {
+                found = child;
+                break;
+            }
+            child = child->next;
+        }
+        
+        if (!found) {
+            if (!create) return NULL;
+            // 创建中间节点
+            found = param_create_node(token, PARAM_TYPE_MAP);
+            found->parent = current;
+            found->next = current->children;
+            current->children = found;
+        }
+        
+        current = found;
+        prev_token = token;
+        token = strtok(NULL, ".");
+    }
+    
+    return current;
+}
+
+/* ============================================================
+   设置参数值
+   ============================================================ */
+int param_set(const char *key, const char *value) {
+    if (!g_ctx.initialized) return -1;
+    
+    // 1. 解析 key，找到或创建节点
+    param_t *node = param_find_or_create(key, 1);
+    if (!node) return -2;
+    
+    // 2. 保存旧值（用于通知）
+    char old_value[PARAM_VALUE_MAX];
+    param_get_value_str(node, old_value, sizeof(old_value));
+    
+    // 3. 设置新值（自动推断类型）
+    if (param_parse_value(node, value) != 0) {
+        return -3;
+    }
+    node->updated_at = get_timestamp();
+    node->modified = 1;
+    
+    // 4. 持久化
+    param_save_key(key);
+    
+    // 5. Git commit
+    if (g_ctx.auto_commit) {
+        char commit_msg[256];
+        snprintf(commit_msg, sizeof(commit_msg), "修改参数 %s = %s", key, value);
+        git_storage_commit(git_client, commit_msg);
+    }
+    
+    // 6. 通知监听器
+    param_notify_watchers(key, old_value, value);
+    
+    return 0;
+}
+
+/* ============================================================
+   获取参数值（字符串形式）
+   ============================================================ */
+int param_get(const char *key, char *out, size_t size) {
+    if (!g_ctx.initialized) return -1;
+    
+    param_t *node = param_find_or_create(key, 0);
+    if (!node) {
+        snprintf(out, size, "");
+        return -2;
+    }
+    
+    return param_get_value_str(node, out, size);
+}
+```
+
+5.3 参数值解析与类型转换
+
+```c
+// param/src/value.c
+
+/* ============================================================
+   解析字符串值并设置到参数节点（自动类型推断）
+   ============================================================ */
+int param_parse_value(param_t *node, const char *value) {
+    // 如果节点已有类型，直接转换
+    if (node->type != PARAM_TYPE_MAP) {
+        return param_convert_value(node, value);
+    }
+    
+    // 推断类型
+    // 1. 布尔值
+    if (strcmp(value, "true") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "yes") == 0 || strcmp(value, "no") == 0 ||
+        strcmp(value, "on") == 0 || strcmp(value, "off") == 0) {
+        node->type = PARAM_TYPE_BOOL;
+        node->value.bool_val = (strcmp(value, "true") == 0 ||
+                                strcmp(value, "yes") == 0 ||
+                                strcmp(value, "on") == 0);
+        return 0;
+    }
+    
+    // 2. 整数
+    char *endptr;
+    long long int_val = strtoll(value, &endptr, 10);
+    if (*endptr == '\0') {
+        node->type = PARAM_TYPE_INT;
+        node->value.int_val = int_val;
+        return 0;
+    }
+    
+    // 3. 浮点数
+    double float_val = strtod(value, &endptr);
+    if (*endptr == '\0') {
+        node->type = PARAM_TYPE_FLOAT;
+        node->value.float_val = float_val;
+        return 0;
+    }
+    
+    // 4. 默认字符串
+    node->type = PARAM_TYPE_STRING;
+    node->value.str_val = strdup(value);
+    return 0;
+}
+
+/* ============================================================
+   将参数值转为字符串
+   ============================================================ */
+int param_get_value_str(param_t *node, char *out, size_t size) {
+    if (!node) return -1;
+    
+    switch (node->type) {
+        case PARAM_TYPE_STRING:
+            snprintf(out, size, "%s", node->value.str_val ? node->value.str_val : "");
+            break;
+        case PARAM_TYPE_INT:
+            snprintf(out, size, "%ld", node->value.int_val);
+            break;
+        case PARAM_TYPE_FLOAT:
+            snprintf(out, size, "%g", node->value.float_val);
+            break;
+        case PARAM_TYPE_BOOL:
+            snprintf(out, size, "%s", node->value.bool_val ? "true" : "false");
+            break;
+        case PARAM_TYPE_LIST: {
+            // 输出 JSON 数组格式
+            out[0] = '[';
+            size_t pos = 1;
+            for (int i = 0; node->value.list[i]; i++) {
+                if (i > 0) out[pos++] = ',';
+                // 递归转换
+                char item[256];
+                param_get_value_str(node->value.list[i], item, sizeof(item));
+                strncpy(out + pos, item, size - pos - 1);
+                pos += strlen(item);
+            }
+            out[pos] = ']';
+            out[pos + 1] = '\0';
+            break;
+        }
+        case PARAM_TYPE_MAP:
+            snprintf(out, size, "{...}");
+            break;
+        default:
+            snprintf(out, size, "");
+            return -1;
+    }
+    return 0;
+}
+```
+
+5.4 参数持久化（YAML）
+
+```c
+// param/src/storage.c
+
+/* ============================================================
+   加载所有参数文件
+   ============================================================ */
+int param_load_all(void) {
+    DIR *dir = opendir(g_ctx.config_dir);
+    if (!dir) {
+        // 目录不存在，创建
+        mkdir(g_ctx.config_dir, 0755);
+        return 0;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG) continue;
+        
+        // 只处理 .yml 文件
+        char *ext = strrchr(entry->d_name, '.');
+        if (!ext || strcmp(ext, ".yml") != 0) continue;
+        
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", g_ctx.config_dir, entry->d_name);
+        param_load_file(path);
+    }
+    
+    closedir(dir);
+    return 0;
+}
+
+/* ============================================================
+   加载单个 YAML 文件
+   ============================================================ */
+int param_load_file(const char *path) {
+    // 解析 YAML 文件，递归导入参数树
+    // 使用 libyaml 或自研解析器
+    
+    // 伪代码：
+    // yaml_document_t doc;
+    // yaml_parser_load_file(&parser, path);
+    // yaml_document_get_root_node(&doc);
+    // param_import_yaml_node(root_node, "");
+    
+    param_log("Loaded params from %s", path);
+    return 0;
+}
+
+/* ============================================================
+   保存单个参数到 YAML 文件
+   ============================================================ */
+int param_save_key(const char *key) {
+    // 根据 key 确定文件名
+    // 如 scheduler.policy → scheduler.yml
+    char *first_dot = strchr(key, '.');
+    char filename[256];
+    if (first_dot) {
+        size_t len = first_dot - key;
+        strncpy(filename, key, len);
+        filename[len] = '\0';
+    } else {
+        strcpy(filename, "system");
+    }
+    strcat(filename, ".yml");
+    
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_ctx.config_dir, filename);
+    
+    // 导出该文件对应的所有参数
+    char prefix[256];
+    snprintf(prefix, sizeof(prefix), "%s.", filename);
+    prefix[strlen(filename)] = '\0';  // 去掉 .yml
+    
+    // 收集所有以 prefix 开头的参数
+    // 生成 YAML 并写入文件
+    // ...
+    
+    return 0;
+}
+```
+
+5.5 参数监听与通知
+
+```c
+// param/src/watch.c
+
+/* ============================================================
+   添加参数监听器
+   ============================================================ */
+int param_watch(const char *path, const char *plugin_id, uint64_t task_id,
+                void (*callback)(const char *key, const char *old_val, const char *new_val)) {
+    param_watcher_t *w = kmalloc(sizeof(param_watcher_t));
+    if (!w) return -1;
+    
+    strncpy(w->path, path, sizeof(w->path) - 1);
+    strncpy(w->plugin_id, plugin_id, sizeof(w->plugin_id) - 1);
+    w->task_id = task_id;
+    w->callback = callback;
+    w->next = g_ctx.watchers;
+    g_ctx.watchers = w;
+    
+    param_log("Plugin %s watching %s", plugin_id, path);
+    return 0;
+}
+
+/* ============================================================
+   通知所有匹配的监听器（参数变更时同步调用）
+   ============================================================ */
+int param_notify_watchers(const char *key, const char *old_value, const char *new_value) {
+    param_watcher_t *w = g_ctx.watchers;
+    int count = 0;
+    
+    while (w) {
+        // 检查路径匹配（支持通配符 *）
+        if (param_path_match(key, w->path)) {
+            // 同步回调
+            if (w->callback) {
+                w->callback(key, old_value, new_value);
+                count++;
+            }
+            
+            // 通过 IPC 发送通知
+            param_notify_msg_t msg;
+            strncpy(msg.key, key, sizeof(msg.key) - 1);
+            strncpy(msg.old_value, old_value, sizeof(msg.old_value) - 1);
+            strncpy(msg.new_value, new_value, sizeof(msg.new_value) - 1);
+            msg.timestamp = get_timestamp();
+            ipc_send(w->task_id, &msg, sizeof(msg));
+        }
+        w = w->next;
+    }
+    
+    return count;
+}
+
+/* ============================================================
+   路径匹配（支持通配符 *）
+   ============================================================ */
+int param_path_match(const char *key, const char *pattern) {
+    // 简单通配符匹配
+    // "scheduler.*" 匹配 "scheduler.policy", "scheduler.weights.performance"
+    // 但不匹配 "scheduler"（没有点）
+    
+    size_t pattern_len = strlen(pattern);
+    if (pattern[pattern_len - 1] == '*') {
+        // 前缀匹配
+        char prefix[PARAM_KEY_MAX];
+        strncpy(prefix, pattern, pattern_len - 1);
+        prefix[pattern_len - 1] = '\0';
+        return strncmp(key, prefix, strlen(prefix)) == 0;
+    }
+    
+    return strcmp(key, pattern) == 0;
+}
+```
+
+5.6 IPC 通信接口
+
+```c
+// param/src/ipc_handler.c
+
+/* ============================================================
+   PARAM IPC 消息处理器
+   ============================================================ */
+void param_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case PARAM_MSG_GET: {
+            param_get_req_t *req = (param_get_req_t *)data;
+            param_get_resp_t resp;
+            resp.success = (param_get(req->key, resp.value, sizeof(resp.value)) == 0);
+            if (!resp.success) strcpy(resp.error, "Key not found");
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case PARAM_MSG_SET: {
+            param_set_req_t *req = (param_set_req_t *)data;
+            param_set_resp_t resp;
+            resp.success = (param_set(req->key, req->value) == 0);
+            if (!resp.success) strcpy(resp.error, "Set failed");
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case PARAM_MSG_WATCH: {
+            param_watch_req_t *req = (param_watch_req_t *)data;
+            param_watch_resp_t resp;
+            resp.success = (param_watch(req->path, req->plugin_id, req->task_id, NULL) == 0);
+            if (!resp.success) strcpy(resp.error, "Watch failed");
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case PARAM_MSG_LIST: {
+            // 返回所有参数
+            char *buf = param_list_all();
+            ipc_reply(from_task, buf, strlen(buf) + 1);
+            break;
+        }
+        
+        default:
+            param_log("Unknown IPC message type: %d", msg_type);
+            break;
+    }
+}
+```
+
+六、启动流程
+
+```
+微内核 _start()
+    │
+    ├── 1. 硬件初始化
+    ├── 2. 内存分配器初始化
+    ├── 3. 中断/时钟初始化
+    ├── 4. 加载 METAPROTO 插件
+    │        └── METAPROTO 注册自己
+    ├── 5. 加载 BUS 插件
+    │        └── BUS 注册自己
+    │        └── BUS 加载 PARAM 插件
+    ▼
+param_init()
+    │
+    ├── 1. 初始化参数树
+    ├── 2. 加载 /etc/hwrun/params/*.yml
+    ├── 3. 注册 PARAM 协议（通过 METAPROTO）
+    ├── 4. 注册 IPC 消息处理器
+    ├── 5. 就绪
+    │
+    ▼
+BUS 加载 LOG 插件
+    │  └── LOG 通过 PARAM 读取日志配置
+    │
+BUS 加载 GIT 插件
+    │  └── GIT 通过 PARAM 读取 Git 配置
+    │
+BUS 加载其他插件
+    │  └── 每个插件通过 PARAM 读取自己的配置
+```
+
+七、插件集成
+
+7.1 插件在 plugin.yml 中声明默认参数
+
+```yaml
+# plugins/scheduler/plugin.yml
+plugin:
+  id: "scheduler"
+  name: "HWRun Scheduler"
+  # ...
+  
+  params:
+    - key: "scheduler.policy"
+      type: "string"
+      default: "auto"
+      description: "调度策略 (auto/performance/power_save/balanced)"
+    - key: "scheduler.weights.performance"
+      type: "float"
+      default: 0.4
+      description: "性能权重"
+    - key: "scheduler.weights.power"
+      type: "float"
+      default: 0.3
+      description: "功耗权重"
+    - key: "scheduler.weights.temperature"
+      type: "float"
+      default: 0.3
+      description: "温度权重"
+```
+
+7.2 插件通过 PARAM 读写参数
+
+```c
+// plugins/scheduler/scheduler.c
+
+int scheduler_init(void) {
+    // 读取参数
+    char policy[64];
+    param_get("scheduler.policy", policy, sizeof(policy));
+    
+    float w_perf, w_power, w_temp;
+    char buf[64];
+    param_get("scheduler.weights.performance", buf, sizeof(buf));
+    w_perf = atof(buf);
+    // ...
+    
+    // 监听参数变更
+    param_watch("scheduler.*", "scheduler", task_id, on_scheduler_param_change);
+    
+    return 0;
+}
+
+void on_scheduler_param_change(const char *key, const char *old_val, const char *new_val) {
+    scheduler_log("Parameter %s changed: %s → %s", key, old_val, new_val);
+    // 重新加载配置
+    scheduler_reload_config();
+}
+```
+
+八、配置文件
+
+8.1 参数文件示例
+
+```yaml
+# /etc/hwrun/params/system.yml
+system:
+  hostname: "hwrun-node-01"
+  timezone: "UTC"
+  locale: "en_US.UTF-8"
+
+# /etc/hwrun/params/scheduler.yml
+scheduler:
+  policy: "performance"
+  weights:
+    performance: 0.5
+    power: 0.2
+    temperature: 0.3
+
+# /etc/hwrun/params/kernel.yml
+kernel:
+  type: "linux"
+  version: "6.1.0"
+  config: "default"
+  debug: false
+
+# /etc/hwrun/params/network.yml
+network:
+  mtu: 1500
+  interface: "eth0"
+```
+
+8.2 PARAM 自身配置
+
+```yaml
+# /etc/hwrun/param.yml
+param:
+  # 配置目录
+  config_dir: "/etc/hwrun/params/"
+  
+  # 是否自动 Git commit
+  auto_commit: true
+  
+  # 日志
+  log:
+    level: "info"
+    file: "/var/log/hwrun/param.log"
+```
+
+九、命令行接口
+
+```bash
+# 查看参数
+hwrun param get scheduler.policy
+# 输出: performance
+
+# 设置参数
+hwrun param set scheduler.policy power_save
+# 输出: 参数已修改，commit: a1b2c3d
+
+# 列出所有参数
+hwrun param list
+# 输出:
+# system.hostname = hwrun-node-01
+# scheduler.policy = power_save
+# kernel.type = linux
+# ...
+
+# 列出指定前缀下的参数
+hwrun param list --prefix scheduler
+# 输出:
+# scheduler.policy = power_save
+# scheduler.weights.performance = 0.5
+# scheduler.weights.power = 0.3
+
+# 导出参数
+hwrun param export /path/to/export.yml
+
+# 导入参数
+hwrun param import /path/to/import.yml
+
+# 监听参数变化（调试）
+hwrun param watch scheduler.policy
+# 阻塞等待，参数变化时打印
+```
+
+十、代码组织
+
+```
+param/
+├── Makefile
+├── plugin.yml                     # 插件描述文件
+│
+├── include/
+│   ├── param.h                    # 核心数据结构
+│   ├── tree.h                     # 参数树操作
+│   ├── value.h                    # 值解析与转换
+│   ├── storage.h                  # 持久化存储
+│   ├── watch.h                    # 监听与通知
+│   └── ipc_handler.h              # IPC 消息处理
+│
+└── src/
+    ├── param.c                    # 初始化
+    ├── tree.c                     # 参数树实现
+    ├── value.c                    # 值解析实现
+    ├── storage.c                  # 持久化实现
+    ├── watch.c                    # 监听实现
+    ├── ipc_handler.c              # IPC 处理
+    └── test.c                     # 单元测试
+```
+
+十一、总结
+
+维度 决策
+定位 配置中心，所有参数的统一入口
+存储格式 YAML
+访问方式 点分路径（如 scheduler.policy）
+参数层级 硬件 → 系统 → 用户 → 插件 → 运行时
+类型系统 string, int, float, bool, list, map
+变更通知 同步回调 + IPC 通知
+持久化 自动保存到 YAML 文件
+Git 集成 参数变更自动 commit
+依赖 微内核（IPC、任务、内存）+ METAPROTO
+
+PARAM 是 HWRun OS 中 BUS 加载的第一个功能性插件。它提供统一的参数管理服务，所有插件通过 PARAM 读写配置。参数以 YAML 格式持久化存储，支持点分路径访问和层级覆盖。参数变更时同步通知所有监听者，并自动 Git commit，实现配置的可追溯、可回滚。

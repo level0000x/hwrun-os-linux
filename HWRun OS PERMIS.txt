@@ -1,0 +1,1151 @@
+﻿HWRun OS PERMISSION 实现文档
+
+模块名称： PERMISSION (Permission Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 权限管理协议，提供用户、角色、权限的细粒度管理，基于 Linux 内核的 LSM 框架和 Capabilities 机制
+实现语言： C（内核模块 + 用户态辅助服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、SP（安全协议）
+提供协议： PERMISSION
+
+一、设计哲学
+
+1.1 核心定位
+
+PERMISSION 是 HWRun OS 的权限管理核心——所有与用户、角色、权限分配、权限检查相关的操作都通过 PERMISSION 协议进行。
+
+```
+PERMISSION = 权限管理协议 = 所有权限操作的统一入口
+
+上层插件 (UI, SHELL, DESKTOP, PKGMGR, CLUSTER, ...)
+    │
+    │  通过 PERMISSION 协议检查和管理权限
+    ▼
+PERMISSION 插件 (内核模块 + 用户态服务)
+    │
+    │  基于 Linux LSM 框架 + Capabilities
+    │  ├── 用户管理 (UID/GID, 认证)
+    │  ├── 角色管理 (RBAC 模型)
+    │  ├── 权限检查 (LSM 钩子)
+    │  ├── 能力管理 (Capabilities)
+    │  └── 审计日志 (Audit)
+    │
+    ▼
+Linux 内核 (LSM / Capabilities / Audit)
+```
+
+1.2 权限模型
+
+HWRun OS 采用混合权限模型，结合 DAC、MAC、Capabilities 和 RBAC：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HWRun OS 权限模型层次                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  RBAC (基于角色的访问控制) — 用户态策略层                           │   │
+│  │  用户 → 角色 → 权限 → 资源                                          │   │
+│  │  由 PERMISSION 用户态服务管理                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  MAC (强制访问控制) — LSM 框架层                                    │   │
+│  │  安全上下文 → 策略 → 允许/拒绝                                      │   │
+│  │  由 SELinux/AppArmor 实现（可选）                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Capabilities (能力) — 特权分解层                                   │   │
+│  │  细粒度特权 (CAP_NET_ADMIN, CAP_SYS_TIME, ...)                    │   │
+│  │  由 Linux Capabilities 实现                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  DAC (自主访问控制) — 基础层                                       │   │
+│  │  UID/GID + rwx 权限                                               │   │
+│  │  由 Linux 内核原生实现                                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.3 PERMISSION 插件的本质
+
+PERMISSION 插件 = Linux LSM 框架的 HWRun 协议封装 + RBAC 用户态管理
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PERMISSION 插件架构                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PERMISSION 协议接口 (通过 IPC 调用)                                │   │
+│  │  Check / Grant / Revoke / AddUser / RemoveUser / ListUsers        │   │
+│  │  ListRoles / AddRole / RemoveRole / AssignRole                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  用户态权限管理器 (hwrun-permissiond)                                │   │
+│  │  ├── 用户数据库 (/etc/hwrun/users/)                               │   │
+│  │  ├── 角色定义 (/etc/hwrun/roles.yml)                              │   │
+│  │  ├── 权限策略 (/etc/hwrun/policies/)                              │   │
+│  │  └── RBAC 引擎                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核模块 (permission.ko)                                           │   │
+│  │  ├── LSM 钩子注册                                                   │   │
+│  │  ├── Capabilities 封装                                              │   │
+│  │  ├── 权限检查入口                                                   │   │
+│  │  └── IPC 通信层                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (LSM / Capabilities)                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 PERMISSION 插件的组成
+
+```
+PERMISSION 插件
+├── 内核模块 (permission.ko)
+│   ├── 协议处理层
+│   │   ├── permission_ipc_handler()  ← IPC 消息分发
+│   │   ├── permission_check()        ← 权限检查
+│   │   ├── permission_grant()        ← 授权
+│   │   └── permission_revoke()       ← 撤销权限
+│   ├── LSM 集成层
+│   │   ├── permission_lsm.c          ← LSM 钩子实现
+│   │   └── permission_hooks.h        ← 钩子定义
+│   ├── Capabilities 封装
+│   │   └── permission_cap.c          ← 能力管理
+│   └── 初始化/清理
+│       ├── permission_init()         ← 模块加载
+│       └── permission_exit()         ← 模块卸载
+│
+└── 用户态服务 (hwrun-permissiond)
+    ├── 用户管理
+    │   ├── user_add.c                ← 添加用户
+    │   ├── user_remove.c             ← 删除用户
+    │   ├── user_auth.c               ← 用户认证
+    │   └── user_list.c               ← 用户列表
+    ├── 角色管理
+    │   ├── role_add.c                ← 添加角色
+    │   ├── role_remove.c             ← 删除角色
+    │   ├── role_assign.c             ← 分配角色
+    │   └── role_list.c               ← 角色列表
+    ├── 策略引擎
+    │   ├── policy_check.c            ← 权限检查
+    │   ├── policy_rule.c             ← 规则管理
+    │   └── policy_cache.c            ← 策略缓存
+    └── 存储层
+        ├── storage_file.c            ← 文件存储
+        └── storage_git.c             ← Git 存储
+```
+
+2.2 PERMISSION 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → 其他插件
+                                                                                                                              ↑
+                                                                                                                    PERMISSION 在这里加载
+```
+
+PERMISSION 插件在 DISPLAY 之后、上层应用插件之前加载，为系统提供权限管理能力。
+
+2.3 PERMISSION 的上层消费者
+
+上层插件 需要 PERMISSION 提供什么
+UI (用户界面) 用户登录、权限检查
+SHELL 命令执行权限
+DESKTOP 桌面操作权限
+PKGMGR (包管理) 安装/卸载权限
+CLUSTER (集群) 节点加入/离开权限
+INSTANCE (实例) 实例管理权限
+
+三、核心数据结构
+
+```c
+// permission/include/permission.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   用户信息
+   ============================================================ */
+typedef struct permission_user {
+    char username[64];              // 用户名
+    char password_hash[128];        // 密码哈希 (SHA-256)
+    uint32_t uid;                   // 用户 ID
+    uint32_t gid;                   // 主组 ID
+    char home[256];                 // 家目录
+    char shell[64];                 // Shell 路径
+    uint64_t created_at;            // 创建时间
+    uint64_t last_login;            // 最后登录时间
+    int locked;                     // 是否锁定
+    struct permission_user *next;
+} permission_user_t;
+
+/* ============================================================
+   角色信息
+   ============================================================ */
+typedef struct permission_role {
+    char name[64];                  // 角色名称
+    char description[256];          // 角色描述
+    uint32_t role_id;               // 角色 ID
+    char **permissions;             // 权限列表
+    int permission_count;
+    struct permission_role *next;
+} permission_role_t;
+
+/* ============================================================
+   权限定义
+   ============================================================ */
+typedef struct permission_def {
+    char name[64];                  // 权限名称 (如 "fs.read", "task.submit")
+    char resource[64];              // 资源类型 (如 "file", "task", "instance")
+    char action[64];                // 操作 (如 "read", "write", "execute")
+    char description[256];          // 描述
+} permission_def_t;
+
+/* ============================================================
+   权限检查请求
+   ============================================================ */
+typedef struct permission_check_req {
+    char user[64];                  // 用户名
+    char action[64];                // 操作 (如 "fs.read")
+    char target[256];               // 目标 (如文件路径)
+} permission_check_req_t;
+
+/* ============================================================
+   权限检查响应
+   ============================================================ */
+typedef struct permission_check_resp {
+    int allowed;                    // 1=允许, 0=拒绝
+    char reason[256];               // 拒绝原因
+    int error;
+} permission_check_resp_t;
+
+/* ============================================================
+   权限上下文 (内核态)
+   ============================================================ */
+typedef struct permission_context {
+    int initialized;
+    uint64_t permission_task_id;    // PERMISSION 自身的任务 ID
+    int lsm_registered;             // LSM 是否已注册
+    
+    // 缓存
+    permission_user_t *users;       // 用户缓存
+    permission_role_t *roles;       // 角色缓存
+    int cache_valid;                // 缓存是否有效
+    
+    void *lock;
+} permission_context_t;
+```
+
+四、PERMISSION 协议定义
+
+```protobuf
+// protocols/permission.proto
+syntax = "proto3";
+
+package hwrun.permission;
+
+service Permission {
+    // === 权限检查 ===
+    rpc Check(CheckRequest) returns (CheckResponse);
+    
+    // === 授权管理 ===
+    rpc Grant(GrantRequest) returns (GrantResponse);
+    rpc Revoke(RevokeRequest) returns (RevokeResponse);
+    
+    // === 用户管理 ===
+    rpc AddUser(AddUserRequest) returns (AddUserResponse);
+    rpc RemoveUser(RemoveUserRequest) returns (RemoveUserResponse);
+    rpc ListUsers(Empty) returns (ListUsersResponse);
+    rpc GetUser(GetUserRequest) returns (GetUserResponse);
+    rpc Authenticate(AuthRequest) returns (AuthResponse);
+    
+    // === 角色管理 ===
+    rpc AddRole(AddRoleRequest) returns (AddRoleResponse);
+    rpc RemoveRole(RemoveRoleRequest) returns (RemoveRoleResponse);
+    rpc ListRoles(Empty) returns (ListRolesResponse);
+    rpc GetRole(GetRoleRequest) returns (GetRoleResponse);
+    rpc AssignRole(AssignRoleRequest) returns (AssignRoleResponse);
+    rpc UnassignRole(UnassignRoleRequest) returns (UnassignRoleResponse);
+    
+    // === 权限定义 ===
+    rpc ListPermissions(Empty) returns (ListPermissionsResponse);
+}
+
+message Empty {}
+
+// ============ 权限检查 ============
+
+message CheckRequest {
+    string user = 1;
+    string action = 2;
+    string target = 3;
+}
+
+message CheckResponse {
+    bool allowed = 1;
+    string reason = 2;
+    int32 error = 3;
+}
+
+// ============ 授权管理 ============
+
+message GrantRequest {
+    string user = 1;
+    string action = 2;
+    string target = 3;
+}
+
+message GrantResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message RevokeRequest {
+    string user = 1;
+    string action = 2;
+    string target = 3;
+}
+
+message RevokeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 用户管理 ============
+
+message AddUserRequest {
+    string username = 1;
+    string password = 2;
+    uint32 uid = 3;                 // 可选
+    uint32 gid = 4;                 // 可选
+    string home = 5;
+    string shell = 6;
+}
+
+message AddUserResponse {
+    bool success = 1;
+    uint32 uid = 2;
+    int32 error = 3;
+}
+
+message RemoveUserRequest {
+    string username = 1;
+}
+
+message RemoveUserResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UserInfo {
+    string username = 1;
+    uint32 uid = 2;
+    uint32 gid = 3;
+    string home = 4;
+    string shell = 5;
+    uint64 created_at = 6;
+    uint64 last_login = 7;
+    bool locked = 8;
+    repeated string roles = 9;
+}
+
+message ListUsersResponse {
+    repeated UserInfo users = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetUserRequest {
+    string username = 1;
+}
+
+message GetUserResponse {
+    UserInfo user = 1;
+    int32 error = 2;
+}
+
+message AuthRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message AuthResponse {
+    bool success = 1;
+    string token = 2;
+    int32 error = 3;
+}
+
+// ============ 角色管理 ============
+
+message AddRoleRequest {
+    string name = 1;
+    string description = 2;
+    repeated string permissions = 3;
+}
+
+message AddRoleResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message RemoveRoleRequest {
+    string name = 1;
+}
+
+message RemoveRoleResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message RoleInfo {
+    string name = 1;
+    string description = 2;
+    repeated string permissions = 3;
+}
+
+message ListRolesResponse {
+    repeated RoleInfo roles = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetRoleRequest {
+    string name = 1;
+}
+
+message GetRoleResponse {
+    RoleInfo role = 1;
+    int32 error = 2;
+}
+
+message AssignRoleRequest {
+    string username = 1;
+    string role_name = 2;
+}
+
+message AssignRoleResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UnassignRoleRequest {
+    string username = 1;
+    string role_name = 2;
+}
+
+message UnassignRoleResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 权限定义 ============
+
+message PermissionDef {
+    string name = 1;
+    string resource = 2;
+    string action = 3;
+    string description = 4;
+}
+
+message ListPermissionsResponse {
+    repeated PermissionDef permissions = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 内核模块初始化和加载
+
+```c
+// permission/src/permission.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/security.h>
+#include <linux/capability.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
+
+#include "permission.h"
+#include "permission_ipc.h"
+#include "permission_lsm.h"
+#include "permission_cap.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Permission Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static permission_context_t g_perm_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init permission_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun PERMISSION: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_perm_ctx, 0, sizeof(permission_context_t));
+    
+    // 2. 注册 LSM 钩子
+    ret = permission_lsm_register();
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun PERMISSION: Failed to register LSM hooks\n");
+        // LSM 注册失败不致命，可以继续运行
+    } else {
+        g_perm_ctx.lsm_registered = 1;
+        printk(KERN_INFO "HWRun PERMISSION: LSM hooks registered\n");
+    }
+    
+    // 3. 注册 IPC 消息处理器
+    ret = permission_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun PERMISSION: Failed to register IPC handler\n");
+        if (g_perm_ctx.lsm_registered) {
+            permission_lsm_unregister();
+        }
+        return ret;
+    }
+    
+    // 4. 注册 PERMISSION 协议（通过 METAPROTO - 通过 IPC）
+    permission_register_protocol();
+    
+    g_perm_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun PERMISSION: Initialized successfully\n");
+    printk(KERN_INFO "  LSM registered: %s\n",
+           g_perm_ctx.lsm_registered ? "yes" : "no");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit permission_exit(void) {
+    printk(KERN_INFO "HWRun PERMISSION: Exiting...\n");
+    
+    permission_ipc_unregister();
+    
+    if (g_perm_ctx.lsm_registered) {
+        permission_lsm_unregister();
+    }
+    
+    g_perm_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun PERMISSION: Exited\n");
+}
+
+module_init(permission_init);
+module_exit(permission_exit);
+```
+
+5.2 LSM 钩子实现
+
+LSM（Linux Security Module）框架是 Linux 内核实现强制访问控制（MAC）的核心机制。它通过在系统调用的关键路径上放置钩子（hook）函数来实现安全检查。
+
+PERMISSION 插件作为 LSM 模块，在 DAC 检查通过后被调用。
+
+```c
+// permission/src/permission_lsm.c
+
+#include <linux/security.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/inode.h>
+
+#include "permission.h"
+#include "permission_ipc.h"
+
+/* ============================================================
+   LSM 钩子函数 - 文件权限检查
+   ============================================================ */
+static int permission_inode_permission(struct inode *inode, int mask) {
+    struct cred *cred;
+    const char *pathname;
+    char path_buf[256];
+    char *path_ptr;
+    int ret = 0;
+    
+    // 获取当前进程的凭证
+    cred = current_cred();
+    if (!cred) {
+        return 0;  // 默认允许
+    }
+    
+    // 获取文件路径
+    path_ptr = d_path(&inode->i_sb->s_root, path_buf, sizeof(path_buf));
+    if (IS_ERR(path_ptr)) {
+        return 0;
+    }
+    
+    // 通过 IPC 调用用户态权限管理器
+    // 实际实现中需要异步或缓存的检查方式
+    // 这里给出框架
+    
+    return ret;
+}
+
+/* ============================================================
+   LSM 钩子函数 - 任务权限检查
+   ============================================================ */
+static int permission_task_kill(struct task_struct *p, struct kernel_siginfo *info,
+                                  int sig, const struct cred *cred) {
+    // 检查进程是否可以发送信号给目标进程
+    // 实际实现中需要查询权限策略
+    return 0;  // 默认允许
+}
+
+/* ============================================================
+   LSM 钩子函数 - 能力检查 (Capability)
+   ============================================================ */
+static int permission_capable(const struct cred *cred,
+                               struct user_namespace *ns,
+                               int cap, unsigned int opts) {
+    // 检查进程是否具有指定的 Capability
+    // Capability 是 Linux 的细粒度特权机制[reference:4]
+    // 每个任务有四个能力掩码: effective, permitted, inheritable, bounding[reference:5]
+    
+    // 如果 PERMISSION 模块启用了细粒度控制，在这里进行额外的检查
+    // 否则返回 0 (允许) 让内核的 Capability 机制处理
+    
+    // 默认返回 0，由内核 Capability 机制决定
+    return 0;
+}
+
+/* ============================================================
+   LSM 钩子函数表
+   ============================================================ */
+static struct security_hook_list permission_hooks[] = {
+    LSM_HOOK_INIT(inode_permission, permission_inode_permission),
+    LSM_HOOK_INIT(task_kill, permission_task_kill),
+    LSM_HOOK_INIT(capable, permission_capable),
+};
+
+/* ============================================================
+   注册 LSM 钩子
+   ============================================================ */
+int permission_lsm_register(void) {
+    // security_add_hooks 是 LSM 框架提供的注册接口[reference:6]
+    // 将钩子函数添加到 LSM 的钩子链表中[reference:7]
+    security_add_hooks(permission_hooks,
+                       ARRAY_SIZE(permission_hooks),
+                       "permission");
+    return 0;
+}
+
+/* ============================================================
+   注销 LSM 钩子
+   ============================================================ */
+void permission_lsm_unregister(void) {
+    // LSM 框架没有提供移除已注册钩子的机制[reference:8]
+    // 这里只是标记为已注销，实际钩子仍然存在于内核中
+    // 但 PERMISSION 模块卸载后，钩子函数不会被调用
+    printk(KERN_INFO "HWRun PERMISSION: LSM hooks unregistered\n");
+}
+```
+
+5.3 Capabilities 封装
+
+Linux Capabilities 将 root 用户的特权分解为多个独立的能力。每个任务维护四个能力掩码：
+
+· Effective (pE)：当前生效的能力
+· Permitted (pP)：允许持有的能力
+· Inheritable (pI)：可继承的能力
+· Bounding (X)：能力边界集
+
+```c
+// permission/src/permission_cap.c
+
+#include <linux/capability.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
+#include <linux/uidgid.h>
+
+#include "permission.h"
+
+/* ============================================================
+   检查进程是否具有指定的 Capability
+   ============================================================ */
+int permission_has_capability(pid_t pid, int cap) {
+    struct task_struct *task;
+    const struct cred *cred;
+    int ret = 0;
+    
+    rcu_read_lock();
+    
+    task = find_task_by_vpid(pid);
+    if (!task) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    
+    cred = __task_cred(task);
+    if (!cred) {
+        rcu_read_unlock();
+        return -EINVAL;
+    }
+    
+    // 检查 Effective 能力掩码
+    if (cap_raised(cred->cap_effective, cap)) {
+        ret = 1;
+    }
+    
+    rcu_read_unlock();
+    return ret;
+}
+
+/* ============================================================
+   给进程授予 Capability
+   ============================================================ */
+int permission_grant_capability(pid_t pid, int cap) {
+    struct task_struct *task;
+    struct cred *new_cred;
+    int ret = 0;
+    
+    task = find_task_by_vpid(pid);
+    if (!task) {
+        return -ESRCH;
+    }
+    
+    // 创建新的凭证
+    new_cred = prepare_creds();
+    if (!new_cred) {
+        return -ENOMEM;
+    }
+    
+    // 设置 Capability
+    cap_raise(new_cred->cap_effective, cap);
+    cap_raise(new_cred->cap_permitted, cap);
+    
+    // 提交凭证
+    ret = commit_creds(new_cred);
+    
+    return ret;
+}
+```
+
+5.4 用户态权限管理器
+
+```c
+// permission/userspace/permissiond.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <time.h>
+#include <yaml.h>
+
+#include "permission.h"
+#include "permission_ipc.h"
+
+/* ============================================================
+   用户数据库路径
+   ============================================================ */
+#define USER_DB_PATH "/etc/hwrun/users/"
+#define ROLE_DB_PATH "/etc/hwrun/roles.yml"
+#define POLICY_PATH "/etc/hwrun/policies/"
+
+/* ============================================================
+   用户认证
+   ============================================================ */
+int permission_authenticate(const char *username, const char *password,
+                             char *token, size_t token_size) {
+    permission_user_t *user;
+    char hash[65];
+    
+    // 1. 查找用户
+    user = permission_find_user(username);
+    if (!user) {
+        return -ENOENT;
+    }
+    
+    // 2. 检查是否锁定
+    if (user->locked) {
+        return -EACCES;
+    }
+    
+    // 3. 验证密码 (使用 SHA-256)
+    sha256(password, strlen(password), hash);
+    if (strcmp(hash, user->password_hash) != 0) {
+        return -EPERM;
+    }
+    
+    // 4. 生成会话令牌
+    snprintf(token, token_size, "session-%s-%ld", username, time(NULL));
+    
+    // 5. 更新最后登录时间
+    user->last_login = time(NULL);
+    permission_save_user(user);
+    
+    return 0;
+}
+
+/* ============================================================
+   RBAC 权限检查
+   ============================================================ */
+int permission_rbac_check(const char *username, const char *action,
+                           const char *target) {
+    permission_user_t *user;
+    permission_role_t *role;
+    
+    // 1. 查找用户
+    user = permission_find_user(username);
+    if (!user) {
+        return -ENOENT;
+    }
+    
+    // 2. 遍历用户的角色
+    for (int i = 0; i < user->role_count; i++) {
+        role = permission_find_role(user->roles[i]);
+        if (!role) continue;
+        
+        // 3. 检查角色是否包含该权限
+        for (int j = 0; j < role->permission_count; j++) {
+            if (strcmp(role->permissions[j], action) == 0) {
+                return 1;  // 允许
+            }
+            // 检查通配符权限 (如 "fs.*")
+            if (permission_match_pattern(role->permissions[j], action)) {
+                return 1;
+            }
+        }
+    }
+    
+    return 0;  // 拒绝
+}
+```
+
+5.5 IPC 消息处理
+
+```c
+// permission/src/permission_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "permission.h"
+#include "permission_ipc.h"
+#include "permission_lsm.h"
+#include "permission_cap.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void permission_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case PERMISSION_MSG_CHECK: {
+            permission_check_req_t *req = (permission_check_req_t *)data;
+            permission_check_resp_t resp;
+            
+            // 通过 IPC 转发到用户态权限管理器
+            // 实际实现中需要调用用户态服务
+            // 这里给出框架
+            
+            // 1. 先检查本地缓存
+            // 2. 如果缓存没有，请求用户态服务
+            // 3. 返回结果
+            
+            resp.allowed = 1;
+            resp.reason[0] = '\0';
+            resp.error = 0;
+            
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case PERMISSION_MSG_GRANT: {
+            permission_grant_req_t *req = (permission_grant_req_t *)data;
+            // 授权操作
+            // 实际实现需要更新策略数据库
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        case PERMISSION_MSG_REVOKE: {
+            permission_revoke_req_t *req = (permission_revoke_req_t *)data;
+            // 撤销权限操作
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        case PERMISSION_MSG_ADD_USER: {
+            permission_add_user_req_t *req = (permission_add_user_req_t *)data;
+            // 添加用户
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        case PERMISSION_MSG_LIST_USERS: {
+            // 列出所有用户
+            // 通过 IPC 从用户态获取
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun PERMISSION: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+6.1 角色定义
+
+```yaml
+# /etc/hwrun/roles.yml
+roles:
+  - name: "admin"
+    description: "系统管理员"
+    permissions:
+      - "*.*"                       # 所有权限
+    
+  - name: "user"
+    description: "普通用户"
+    permissions:
+      - "fs.read"
+      - "fs.write"
+      - "task.submit"
+      - "task.view"
+    
+  - name: "readonly"
+    description: "只读用户"
+    permissions:
+      - "fs.read"
+      - "task.view"
+    
+  - name: "compute"
+    description: "计算节点用户"
+    permissions:
+      - "task.submit"
+      - "task.cancel"
+      - "resource.cpu"
+      - "resource.gpu"
+      - "instance.create"
+      - "instance.destroy"
+    
+  - name: "cluster_admin"
+    description: "集群管理员"
+    permissions:
+      - "cluster.*"
+      - "node.*"
+      - "instance.*"
+```
+
+6.2 用户数据库
+
+```yaml
+# /etc/hwrun/users/admin.yml
+user:
+  username: "admin"
+  password_hash: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+  uid: 0
+  gid: 0
+  home: "/root"
+  shell: "/bin/bash"
+  created_at: 1694160735
+  last_login: 1694160735
+  locked: false
+  roles:
+    - "admin"
+```
+
+6.3 策略规则
+
+```yaml
+# /etc/hwrun/policies/default.yml
+policies:
+  # 文件系统策略
+  - resource: "file"
+    action: "read"
+    allow:
+      - "user:*"
+      - "admin:*"
+    deny:
+      - "guest:*"
+  
+  - resource: "file"
+    action: "write"
+    allow:
+      - "user:/home/*"
+      - "admin:*"
+    deny:
+      - "*:/etc/shadow"
+      - "*:/root/*"
+  
+  # 任务策略
+  - resource: "task"
+    action: "submit"
+    allow:
+      - "user:*"
+      - "compute:*"
+  
+  # 实例策略
+  - resource: "instance"
+    action: "create"
+    allow:
+      - "admin:*"
+      - "compute:node-*"
+  
+  - resource: "instance"
+    action: "destroy"
+    allow:
+      - "admin:*"
+```
+
+七、命令行接口
+
+```bash
+# 用户管理
+hwrun permission user add admin --password hwrun
+hwrun permission user remove admin
+hwrun permission user list
+hwrun permission user info admin
+hwrun permission user lock admin
+hwrun permission user unlock admin
+hwrun permission auth admin --password hwrun
+
+# 角色管理
+hwrun permission role add admin --description "系统管理员"
+hwrun permission role remove admin
+hwrun permission role list
+hwrun permission role info admin
+hwrun permission role add-perm admin "*.*"
+hwrun permission role remove-perm admin "fs.write"
+
+# 权限分配
+hwrun permission assign admin --user admin
+hwrun permission unassign admin --user admin
+
+# 权限检查
+hwrun permission check --user admin --action fs.read --target /etc/hwrun
+hwrun permission check --user guest --action fs.write --target /etc/hwrun
+
+# 权限列表
+hwrun permission list
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/permission/plugin.yml
+plugin:
+  id: "permission"
+  name: "Permission Management Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 权限管理协议，提供用户、角色、权限的细粒度管理"
+  
+  provides:
+    - protocol: "PERMISSION"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "SP"
+      version: "1.0"
+  
+  params:
+    - key: "permission.lsm_enabled"
+      type: "bool"
+      default: true
+      description: "是否启用 LSM 钩子"
+    - key: "permission.default_role"
+      type: "string"
+      default: "user"
+      description: "默认角色"
+    - key: "permission.cache_ttl"
+      type: "int"
+      default: 60
+      description: "权限缓存时间 (秒)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/permission.ko"
+    - "/usr/bin/hwrun-permissiond"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# permission/Makefile
+
+obj-m += permission.o
+
+permission-objs := permission.o permission_ipc.o \
+                   permission_lsm.o permission_cap.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 permission.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-permissiond /usr/bin/
+```
+
+九、总结
+
+维度 决策
+定位 权限管理协议，所有权限操作的统一入口
+实现方式 Linux 内核模块 (.ko) + 用户态服务
+代码量 ~1500-2000 行 C
+提供协议 PERMISSION (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + SP
+权限模型 DAC + MAC (LSM) + Capabilities + RBAC
+LSM 集成 通过 security_add_hooks() 注册钩子
+Capabilities 通过 cap_raised() / cap_raise() 管理
+
+PERMISSION 是 HWRun OS 中权限管理的核心插件。它基于 Linux 内核的 LSM 框架和 Capabilities 机制，通过 PERMISSION 协议向上层插件提供用户管理、角色管理、权限检查、授权管理等完整的权限管理功能。PERMISSION 插件同时运行在内核态（LSM 钩子）和用户态（RBAC 引擎），实现从内核到用户态的完整权限控制链路。上层插件（UI、SHELL、DESKTOP、PKGMGR、CLUSTER、INSTANCE 等）通过 PERMISSION 协议进行权限操作，不直接操作内核的 LSM 或 Capabilities 接口。

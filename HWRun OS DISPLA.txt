@@ -1,0 +1,1240 @@
+﻿HWRun OS DISPLAY 实现文档
+
+模块名称： DISPLAY (Display Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 显示协议，提供对显示输出、帧缓冲、分辨率管理、屏幕模式切换等显示功能的统一抽象
+实现语言： C（内核模块 + libdrm 封装）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）
+提供协议： DISPLAY
+
+一、设计哲学
+
+1.1 核心定位
+
+DISPLAY 是 HWRun OS 的显示抽象层——所有与显示输出、帧缓冲、分辨率管理、屏幕模式切换相关的操作都通过 DISPLAY 协议进行。
+
+```
+DISPLAY = 显示抽象协议 = 所有显示设备操作的统一入口
+
+上层插件 (UI, CONSOLE, DESKTOP, TERMINAL, ...)
+    │
+    │  通过 DISPLAY 协议进行显示操作
+    ▼
+DISPLAY 插件 (内核模块)
+    │
+    │  基于 DRM/KMS 框架
+    │  ├── DRM 设备管理 (drmModeGetResources)
+    │  ├── 连接器管理 (drmModeGetConnector)
+    │  ├── CRTC 管理 (drmModeSetCrtc)
+    │  ├── 帧缓冲管理 (drmModeAddFB / drmModeRmFB)
+    │  └── 页面翻转 (drmModePageFlip)
+    │
+    ▼
+Linux 内核 (DRM / KMS 子系统)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有显示操作通过 DISPLAY 协议进行
+2. 内核实现：DISPLAY 插件基于 Linux 的 DRM/KMS 框架
+3. 双后端支持：支持 DRM/KMS（现代）和 FBDEV（传统）两种后端
+4. 多显示器支持：支持多个显示器的连接、断开和配置
+5. 模式切换：支持分辨率、刷新率、颜色深度的切换
+6. 原子操作：支持原子模式设置（Atomic Modesetting）
+
+1.3 显示框架概述
+
+Linux 的显示子系统由 DRM（Direct Rendering Manager）和 KMS（Kernel Mode Setting）构成。KMS 向用户空间呈现的基本对象结构包括五个核心对象：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DRM/KMS 对象模型                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  帧缓冲 (Framebuffer)                                              │   │
+│  │  └── 内存中存储像素数据的缓冲区，包含格式、宽度、高度等信息[reference:2]    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  平面 (Plane)[reference:3]                                                │   │
+│  │  └── 硬件扫描单元，将帧缓冲数据扫描到 CRTC                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  CRTC (显示控制器)[reference:4]                                      │   │
+│  │  └── 控制扫描输出时序，将平面数据转换为视频信号                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  编码器 (Encoder)[reference:5]                                         │   │
+│  │  └── 将 CRTC 输出转换为特定接口格式 (HDMI, DP, DVI, VGA)           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  连接器 (Connector)[reference:6]                                     │   │
+│  │  └── 物理显示端口，连接到显示器                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.4 DISPLAY 插件的本质
+
+DISPLAY 插件 = Linux DRM/KMS 的 HWRun 协议封装 + FBDEV 传统支持
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DISPLAY 插件架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  DISPLAY 协议接口 (通过 IPC 调用)                                   │   │
+│  │  GetInfo / SetMode / GetFrameBuffer / Flip / GetModes / SetGamma   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层                                                         │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 设备枚举                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  显示后端                                                          │   │
+│  │  ├── DRM/KMS 后端 (libdrm)                                        │   │
+│  │  │   ├── drmModeGetResources()[reference:7]                          │   │
+│  │  │   ├── drmModeGetConnector()[reference:8]                          │   │
+│  │  │   ├── drmModeSetCrtc()[reference:9]                               │   │
+│  │  │   └── drmModePageFlip()[reference:10]                                 │   │
+│  │  └── FBDEV 后端 (传统帧缓冲)[reference:11]                             │   │
+│  │      ├── open("/dev/fb0")[reference:12]                                   │   │
+│  │      ├── ioctl FBIOGET_VSCREENINFO                                │   │
+│  │      └── mmap() 帧缓冲内存[reference:13]                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (DRM / KMS / FBDEV)                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 DISPLAY 插件的组成
+
+```
+DISPLAY 插件 (display.ko)
+├── 协议处理层
+│   ├── display_ipc_handler()    ← IPC 消息分发
+│   ├── display_get_info()       ← 获取显示信息
+│   ├── display_set_mode()       ← 设置显示模式
+│   ├── display_get_modes()      ← 获取支持的模式列表
+│   ├── display_get_framebuffer()← 获取帧缓冲
+│   ├── display_flip()           ← 页面翻转 (双缓冲)
+│   ├── display_set_gamma()      ← 设置 Gamma 校正
+│   └── display_get_edid()       ← 获取 EDID 信息
+│
+├── DRM/KMS 后端
+│   ├── display_drm.c            ← DRM 设备管理
+│   ├── display_drm_connector.c  ← 连接器管理
+│   ├── display_drm_crtc.c       ← CRTC 管理
+│   ├── display_drm_fb.c         ← 帧缓冲管理
+│   └── display_drm_flip.c       ← 页面翻转
+│
+├── FBDEV 后端 (传统)
+│   └── display_fbdev.c          ← 传统帧缓冲支持
+│
+└── 初始化/清理
+    ├── display_init()           ← 模块加载
+    └── display_exit()           ← 模块卸载
+```
+
+2.2 DISPLAY 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → 其他插件
+                                                                                                                           ↑
+                                                                                                                DISPLAY 在这里加载
+```
+
+DISPLAY 插件在 INPUT 之后、UI 和 DESKTOP 之前加载，为上层提供显示输出能力。
+
+2.3 DISPLAY 的上层消费者
+
+上层插件 需要 DISPLAY 提供什么
+UI (用户界面) 窗口渲染、帧缓冲
+CONSOLE (控制台) 文字显示
+DESKTOP (桌面环境) 桌面渲染、多显示器支持
+TERMINAL (终端) 字符显示
+
+三、核心数据结构
+
+```c
+// display/include/display.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   显示后端类型
+   ============================================================ */
+typedef enum {
+    DISPLAY_BACKEND_DRM = 0,        // DRM/KMS (现代)
+    DISPLAY_BACKEND_FBDEV,          // FBDEV (传统)
+    DISPLAY_BACKEND_NONE,
+} display_backend_t;
+
+/* ============================================================
+   像素格式
+   ============================================================ */
+typedef enum {
+    DISPLAY_PIXEL_RGB565 = 0,
+    DISPLAY_PIXEL_RGB888,
+    DISPLAY_PIXEL_ARGB8888,
+    DISPLAY_PIXEL_XRGB8888,
+    DISPLAY_PIXEL_RGBA8888,
+    DISPLAY_PIXEL_RGBX8888,
+    DISPLAY_PIXEL_BGR888,
+    DISPLAY_PIXEL_ABGR8888,
+    DISPLAY_PIXEL_XBGR8888,
+} display_pixel_format_t;
+
+/* ============================================================
+   显示模式
+   ============================================================ */
+typedef struct display_mode {
+    uint32_t width;                 // 宽度 (像素)
+    uint32_t height;                // 高度 (像素)
+    uint32_t refresh_rate;          // 刷新率 (Hz)
+    uint32_t clock_khz;             // 像素时钟 (kHz)
+    uint8_t hdisplay;
+    uint8_t hsync_start;
+    uint8_t hsync_end;
+    uint8_t htotal;
+    uint8_t vdisplay;
+    uint8_t vsync_start;
+    uint8_t vsync_end;
+    uint8_t vtotal;
+    uint32_t flags;                 // 模式标志
+    char name[32];                  // 模式名称 (如 "1920x1080@60")
+} display_mode_t;
+
+/* ============================================================
+   显示设备信息
+   ============================================================ */
+typedef struct display_device_info {
+    char name[64];                  // 设备名称 (如 "eDP-1", "HDMI-A-1")
+    char model[64];                 // 显示器型号
+    char serial[32];                // 序列号
+    uint32_t width_mm;              // 物理宽度 (mm)
+    uint32_t height_mm;             // 物理高度 (mm)
+    int connected;                  // 是否已连接
+    int enabled;                    // 是否已启用
+    uint32_t current_mode_index;    // 当前模式索引
+    uint32_t mode_count;            // 支持的模式数量
+    display_mode_t *modes;          // 支持的模式列表
+    uint64_t edid;                  // EDID 数据地址
+} display_device_info_t;
+
+/* ============================================================
+   帧缓冲信息
+   ============================================================ */
+typedef struct display_framebuffer {
+    uint64_t base;                  // 帧缓冲物理地址
+    uint64_t size;                  // 帧缓冲大小 (字节)
+    void *virt_addr;                // 虚拟地址 (mmap)
+    uint32_t width;                 // 宽度 (像素)
+    uint32_t height;                // 高度 (像素)
+    uint32_t pitch;                 // 行间距 (字节)
+    display_pixel_format_t format;  // 像素格式
+    uint32_t bpp;                   // 每像素位数
+} display_framebuffer_t;
+
+/* ============================================================
+   显示信息
+   ============================================================ */
+typedef struct display_info {
+    display_backend_t backend;      // 显示后端
+    uint32_t device_count;          // 显示设备数量
+    display_device_info_t *devices; // 设备列表
+    display_framebuffer_t fb;       // 当前帧缓冲
+    uint32_t gamma_size;            // Gamma 表大小
+} display_info_t;
+
+/* ============================================================
+   DISPLAY 上下文
+   ============================================================ */
+typedef struct display_context {
+    int initialized;
+    uint64_t display_task_id;       // DISPLAY 自身的任务 ID
+    
+    display_backend_t backend;
+    int drm_fd;                     // DRM 设备文件描述符
+    display_info_t info;
+    
+    void *lock;
+} display_context_t;
+```
+
+四、DISPLAY 协议定义
+
+```protobuf
+// protocols/display.proto
+syntax = "proto3";
+
+package hwrun.display;
+
+service Display {
+    // === 信息查询 ===
+    rpc GetInfo(Empty) returns (GetInfoResponse);
+    rpc GetModes(GetModesRequest) returns (GetModesResponse);
+    rpc GetMode(GetModeRequest) returns (GetModeResponse);
+    rpc GetCurrentMode(GetCurrentModeRequest) returns (GetModeResponse);
+    
+    // === 模式设置 ===
+    rpc SetMode(SetModeRequest) returns (SetModeResponse);
+    rpc SetModeByName(SetModeByNameRequest) returns (SetModeResponse);
+    
+    // === 帧缓冲 ===
+    rpc GetFrameBuffer(Empty) returns (GetFrameBufferResponse);
+    rpc Flip(FrameFlipRequest) returns (FrameFlipResponse);
+    rpc FlipAsync(FrameFlipRequest) returns (FrameFlipResponse);
+    
+    // === 显示控制 ===
+    rpc Enable(EnableRequest) returns (EnableResponse);
+    rpc Disable(DisableRequest) returns (DisableResponse);
+    
+    // === Gamma ===
+    rpc SetGamma(SetGammaRequest) returns (SetGammaResponse);
+    rpc GetGamma(Empty) returns (GetGammaResponse);
+    
+    // === EDID ===
+    rpc GetEdid(GetEdidRequest) returns (GetEdidResponse);
+}
+
+message Empty {}
+
+// ============ 信息查询 ============
+
+message DisplayMode {
+    uint32 width = 1;
+    uint32 height = 2;
+    uint32 refresh_rate = 3;
+    uint32 clock_khz = 4;
+    string name = 5;
+}
+
+message DisplayDevice {
+    string name = 1;
+    string model = 2;
+    string serial = 3;
+    uint32 width_mm = 4;
+    uint32 height_mm = 5;
+    bool connected = 6;
+    bool enabled = 7;
+    uint32 current_mode_index = 8;
+    repeated DisplayMode modes = 9;
+}
+
+message GetInfoResponse {
+    string backend = 1;             // "drm" / "fbdev"
+    uint32 device_count = 2;
+    repeated DisplayDevice devices = 3;
+    uint32 gamma_size = 4;
+    int32 error = 5;
+}
+
+message GetModesRequest {
+    string device_name = 1;
+}
+
+message GetModesResponse {
+    repeated DisplayMode modes = 1;
+    uint32 count = 2;
+    int32 error = 3;
+}
+
+message GetModeRequest {
+    string device_name = 1;
+    uint32 mode_index = 2;
+}
+
+message GetModeResponse {
+    DisplayMode mode = 1;
+    int32 error = 2;
+}
+
+message GetCurrentModeRequest {
+    string device_name = 1;
+}
+
+// ============ 模式设置 ============
+
+message SetModeRequest {
+    string device_name = 1;
+    uint32 width = 2;
+    uint32 height = 3;
+    uint32 refresh_rate = 4;
+}
+
+message SetModeByNameRequest {
+    string device_name = 1;
+    string mode_name = 2;           // "1920x1080@60"
+}
+
+message SetModeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 帧缓冲 ============
+
+message FrameBufferInfo {
+    uint64 base = 1;
+    uint64 size = 2;
+    uint32 width = 3;
+    uint32 height = 4;
+    uint32 pitch = 5;
+    uint32 format = 6;              // display_pixel_format_t
+    uint32 bpp = 7;
+}
+
+message GetFrameBufferResponse {
+    FrameBufferInfo fb = 1;
+    int32 error = 2;
+}
+
+message FrameFlipRequest {
+    uint64 fb_id = 1;               // 帧缓冲 ID
+    bool async = 2;                 // 是否异步翻转
+}
+
+message FrameFlipResponse {
+    bool success = 1;
+    uint64 flip_timestamp = 2;      // 翻转完成时间戳
+    int32 error = 3;
+}
+
+// ============ 显示控制 ============
+
+message EnableRequest {
+    string device_name = 1;
+}
+
+message EnableResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message DisableRequest {
+    string device_name = 1;
+}
+
+message DisableResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ Gamma ============
+
+message SetGammaRequest {
+    repeated uint32 red = 1;
+    repeated uint32 green = 2;
+    repeated uint32 blue = 3;
+}
+
+message SetGammaResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message GetGammaResponse {
+    repeated uint32 red = 1;
+    repeated uint32 green = 2;
+    repeated uint32 blue = 3;
+    int32 error = 4;
+}
+
+// ============ EDID ============
+
+message GetEdidRequest {
+    string device_name = 1;
+}
+
+message GetEdidResponse {
+    bytes edid = 1;
+    uint32 size = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// display/src/display.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fb.h>
+#include <linux/drm.h>
+#include <drm/drm_mode.h>
+#include <drm/drm_file.h>
+
+#include "display.h"
+#include "display_ipc.h"
+#include "display_drm.h"
+#include "display_fbdev.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Display Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static display_context_t g_display_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init display_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun DISPLAY: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_display_ctx, 0, sizeof(display_context_t));
+    
+    // 2. 尝试打开 DRM 设备
+    g_display_ctx.drm_fd = display_drm_open();
+    if (g_display_ctx.drm_fd >= 0) {
+        g_display_ctx.backend = DISPLAY_BACKEND_DRM;
+        printk(KERN_INFO "HWRun DISPLAY: Using DRM/KMS backend\n");
+        
+        // 初始化 DRM 设备信息
+        ret = display_drm_init(&g_display_ctx.info);
+        if (ret < 0) {
+            printk(KERN_WARNING "HWRun DISPLAY: DRM init failed, falling back\n");
+            close(g_display_ctx.drm_fd);
+            g_display_ctx.drm_fd = -1;
+            g_display_ctx.backend = DISPLAY_BACKEND_NONE;
+        }
+    }
+    
+    // 3. 如果 DRM 不可用，尝试 FBDEV
+    if (g_display_ctx.backend == DISPLAY_BACKEND_NONE) {
+        ret = display_fbdev_init(&g_display_ctx.info);
+        if (ret == 0) {
+            g_display_ctx.backend = DISPLAY_BACKEND_FBDEV;
+            printk(KERN_INFO "HWRun DISPLAY: Using FBDEV backend\n");
+        }
+    }
+    
+    if (g_display_ctx.backend == DISPLAY_BACKEND_NONE) {
+        printk(KERN_ERR "HWRun DISPLAY: No display backend available\n");
+        return -ENODEV;
+    }
+    
+    // 4. 注册 IPC 消息处理器
+    ret = display_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun DISPLAY: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 5. 注册 DISPLAY 协议
+    display_register_protocol();
+    
+    g_display_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun DISPLAY: Initialized successfully\n");
+    printk(KERN_INFO "  Backend: %s, Devices: %u\n",
+           g_display_ctx.backend == DISPLAY_BACKEND_DRM ? "DRM/KMS" : "FBDEV",
+           g_display_ctx.info.device_count);
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit display_exit(void) {
+    printk(KERN_INFO "HWRun DISPLAY: Exiting...\n");
+    
+    display_ipc_unregister();
+    display_cleanup_info(&g_display_ctx.info);
+    
+    if (g_display_ctx.drm_fd >= 0) {
+        close(g_display_ctx.drm_fd);
+    }
+    
+    g_display_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun DISPLAY: Exited\n");
+}
+
+module_init(display_init);
+module_exit(display_exit);
+```
+
+5.2 DRM 后端实现
+
+```c
+// display/src/display_drm.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fb.h>
+#include <drm/drm_mode.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <string.h>
+
+#include "display.h"
+#include "display_drm.h"
+
+#define DRM_DEVICE_PATH "/dev/dri/card0"
+
+/* ============================================================
+   打开 DRM 设备
+   ============================================================ */
+int display_drm_open(void) {
+    int fd = open(DRM_DEVICE_PATH, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    return fd;
+}
+
+/* ============================================================
+   DRM 初始化 - 枚举设备和连接器
+   ============================================================ */
+int display_drm_init(display_info_t *info) {
+    struct drmModeRes *resources;
+    struct drmModeConnector *connector;
+    display_device_info_t *devices;
+    uint32_t device_count = 0;
+    int ret = 0;
+    
+    // 1. 获取 DRM 资源[reference:14]
+    resources = drmModeGetResources(g_display_ctx.drm_fd);
+    if (!resources) {
+        return -1;
+    }
+    
+    // 2. 分配设备数组
+    devices = kmalloc(resources->count_connectors * sizeof(display_device_info_t),
+                      GFP_KERNEL);
+    if (!devices) {
+        drmModeFreeResources(resources);
+        return -ENOMEM;
+    }
+    
+    memset(devices, 0, resources->count_connectors * sizeof(display_device_info_t));
+    
+    // 3. 遍历连接器[reference:15]
+    for (int i = 0; i < resources->count_connectors; i++) {
+        connector = drmModeGetConnector(g_display_ctx.drm_fd,
+                                         resources->connectors[i]);
+        if (!connector) {
+            continue;
+        }
+        
+        // 只处理已连接的连接器
+        if (connector->connection == DRM_MODE_CONNECTED) {
+            display_device_info_t *dev = &devices[device_count];
+            
+            // 获取连接器名称
+            snprintf(dev->name, sizeof(dev->name), "connector-%d",
+                     resources->connectors[i]);
+            
+            // 获取 EDID 信息 (简化)
+            dev->connected = 1;
+            dev->enabled = 1;
+            
+            // 获取支持的模式
+            dev->mode_count = connector->count_modes;
+            dev->modes = kmalloc(dev->mode_count * sizeof(display_mode_t),
+                                  GFP_KERNEL);
+            
+            if (dev->modes) {
+                for (int j = 0; j < dev->mode_count && j < 64; j++) {
+                    struct drmModeModeInfo *mode = &connector->modes[j];
+                    dev->modes[j].width = mode->hdisplay;
+                    dev->modes[j].height = mode->vdisplay;
+                    dev->modes[j].refresh_rate = mode->vrefresh;
+                    dev->modes[j].clock_khz = mode->clock;
+                    snprintf(dev->modes[j].name, sizeof(dev->modes[j].name),
+                             "%dx%d@%d", mode->hdisplay, mode->vdisplay,
+                             mode->vrefresh);
+                }
+            }
+            
+            device_count++;
+        }
+        
+        drmModeFreeConnector(connector);
+    }
+    
+    // 4. 填充信息
+    info->backend = DISPLAY_BACKEND_DRM;
+    info->device_count = device_count;
+    info->devices = devices;
+    info->gamma_size = 256;  // 默认 Gamma 表大小
+    
+    drmModeFreeResources(resources);
+    return 0;
+}
+
+/* ============================================================
+   设置显示模式 (DRM)
+   ============================================================ */
+int display_drm_set_mode(const char *device_name, uint32_t width,
+                          uint32_t height, uint32_t refresh_rate) {
+    struct drmModeRes *resources;
+    struct drmModeConnector *connector;
+    struct drmModeCrtc *crtc;
+    uint32_t fb_id;
+    int ret = -1;
+    
+    resources = drmModeGetResources(g_display_ctx.drm_fd);
+    if (!resources) {
+        return -1;
+    }
+    
+    // 查找匹配的连接器和模式
+    for (int i = 0; i < resources->count_connectors; i++) {
+        connector = drmModeGetConnector(g_display_ctx.drm_fd,
+                                         resources->connectors[i]);
+        if (!connector || connector->connection != DRM_MODE_CONNECTED) {
+            if (connector) drmModeFreeConnector(connector);
+            continue;
+        }
+        
+        // 查找匹配的模式
+        for (int j = 0; j < connector->count_modes; j++) {
+            struct drmModeModeInfo *mode = &connector->modes[j];
+            if (mode->hdisplay == width && mode->vdisplay == height &&
+                (refresh_rate == 0 || mode->vrefresh == refresh_rate)) {
+                
+                // 获取 CRTC
+                if (connector->encoder_id) {
+                    crtc = drmModeGetCrtc(g_display_ctx.drm_fd,
+                                           connector->encoder_id);
+                    if (crtc) {
+                        // 创建帧缓冲并设置模式
+                        // 实际使用 drmModeAddFB 和 drmModeSetCrtc[reference:16]
+                        ret = 0;
+                        drmModeFreeCrtc(crtc);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        drmModeFreeConnector(connector);
+        if (ret == 0) break;
+    }
+    
+    drmModeFreeResources(resources);
+    return ret;
+}
+```
+
+5.3 页面翻转实现
+
+```c
+// display/src/display_drm_flip.c
+
+#include <drm/drm_mode.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <poll.h>
+
+#include "display.h"
+#include "display_drm.h"
+
+/* ============================================================
+   页面翻转 (双缓冲)[reference:17]
+   ============================================================ */
+int display_drm_flip(uint32_t fb_id, int async) {
+    struct drmModeRes *resources;
+    struct drmModeCrtc *crtc;
+    int ret = -1;
+    
+    resources = drmModeGetResources(g_display_ctx.drm_fd);
+    if (!resources) {
+        return -1;
+    }
+    
+    // 使用第一个 CRTC
+    if (resources->count_crtcs > 0) {
+        uint32_t crtc_id = resources->crtcs[0];
+        uint32_t flags = 0;
+        
+        if (async) {
+            flags |= DRM_MODE_PAGE_FLIP_EVENT;
+        }
+        
+        // 执行页面翻转[reference:18]
+        ret = drmModePageFlip(g_display_ctx.drm_fd, crtc_id, fb_id, flags, NULL);
+        
+        // 如果是异步翻转，需要处理事件[reference:19]
+        if (async && ret == 0) {
+            // 等待翻转完成事件
+            struct pollfd pfd = {
+                .fd = g_display_ctx.drm_fd,
+                .events = POLLIN
+            };
+            poll(&pfd, 1, 100);
+            // 处理事件 (drmHandleEvent)
+        }
+    }
+    
+    drmModeFreeResources(resources);
+    return ret;
+}
+```
+
+5.4 FBDEV 后端实现 (传统)
+
+```c
+// display/src/display_fbdev.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fb.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#include "display.h"
+#include "display_fbdev.h"
+
+#define FB_DEVICE_PATH "/dev/fb0"
+
+/* ============================================================
+   FBDEV 初始化[reference:20]
+   ============================================================ */
+int display_fbdev_init(display_info_t *info) {
+    struct fb_var_screeninfo var;
+    struct fb_fix_screeninfo fix;
+    int fd;
+    display_device_info_t *dev;
+    
+    fd = open(FB_DEVICE_PATH, O_RDWR);
+    if (fd < 0) {
+        return -1;
+    }
+    
+    // 获取可变信息[reference:21]
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0) {
+        close(fd);
+        return -1;
+    }
+    
+    // 获取固定信息
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) < 0) {
+        close(fd);
+        return -1;
+    }
+    
+    // 创建设备信息
+    dev = kmalloc(sizeof(display_device_info_t), GFP_KERNEL);
+    if (!dev) {
+        close(fd);
+        return -ENOMEM;
+    }
+    
+    memset(dev, 0, sizeof(display_device_info_t));
+    strcpy(dev->name, "fb0");
+    dev->connected = 1;
+    dev->enabled = 1;
+    dev->mode_count = 1;
+    
+    dev->modes = kmalloc(sizeof(display_mode_t), GFP_KERNEL);
+    if (dev->modes) {
+        dev->modes[0].width = var.xres;
+        dev->modes[0].height = var.yres;
+        dev->modes[0].refresh_rate = 60;  // 默认
+        snprintf(dev->modes[0].name, sizeof(dev->modes[0].name),
+                 "%dx%d", var.xres, var.yres);
+    }
+    
+    // 填充帧缓冲信息
+    info->fb.base = fix.smem_start;
+    info->fb.size = fix.smem_len;
+    info->fb.width = var.xres;
+    info->fb.height = var.yres;
+    info->fb.pitch = fix.line_length;
+    info->fb.bpp = var.bits_per_pixel;
+    
+    // mmap 映射帧缓冲[reference:22]
+    info->fb.virt_addr = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd, 0);
+    
+    info->backend = DISPLAY_BACKEND_FBDEV;
+    info->device_count = 1;
+    info->devices = dev;
+    info->gamma_size = 256;
+    
+    close(fd);
+    return 0;
+}
+```
+
+5.5 IPC 消息处理
+
+```c
+// display/src/display_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "display.h"
+#include "display_ipc.h"
+#include "display_drm.h"
+#include "display_fbdev.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void display_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case DISPLAY_MSG_GET_INFO: {
+            display_info_t info;
+            memcpy(&info, &g_display_ctx.info, sizeof(info));
+            ipc_reply(from_task, &info, sizeof(info));
+            break;
+        }
+        
+        case DISPLAY_MSG_SET_MODE: {
+            display_set_mode_req_t *req = (display_set_mode_req_t *)data;
+            int ret;
+            
+            if (g_display_ctx.backend == DISPLAY_BACKEND_DRM) {
+                ret = display_drm_set_mode(req->device_name, req->width,
+                                            req->height, req->refresh_rate);
+            } else {
+                ret = display_fbdev_set_mode(req->width, req->height);
+            }
+            
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case DISPLAY_MSG_GET_FRAMEBUFFER: {
+            display_framebuffer_t fb;
+            memcpy(&fb, &g_display_ctx.info.fb, sizeof(fb));
+            ipc_reply(from_task, &fb, sizeof(fb));
+            break;
+        }
+        
+        case DISPLAY_MSG_FLIP: {
+            display_flip_req_t *req = (display_flip_req_t *)data;
+            int ret;
+            
+            if (g_display_ctx.backend == DISPLAY_BACKEND_DRM) {
+                ret = display_drm_flip(req->fb_id, req->async);
+            } else {
+                ret = -1;  // FBDEV 不支持页面翻转
+            }
+            
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case DISPLAY_MSG_GET_MODES: {
+            display_get_modes_req_t *req = (display_get_modes_req_t *)data;
+            display_device_info_t *dev = display_find_device(req->device_name);
+            if (dev && dev->modes) {
+                ipc_reply(from_task, dev->modes,
+                          dev->mode_count * sizeof(display_mode_t));
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun DISPLAY: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、用户态工具
+
+6.1 显示信息查看工具
+
+```c
+// display/tools/display-info.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <string.h>
+
+int main(void) {
+    int fd = open("/dev/dri/card0", O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    
+    struct drmModeRes *res = drmModeGetResources(fd);
+    if (!res) {
+        perror("drmModeGetResources");
+        close(fd);
+        return 1;
+    }
+    
+    printf("DRM Resources:\n");
+    printf("  CRTCs: %d\n", res->count_crtcs);
+    printf("  Connectors: %d\n", res->count_connectors);
+    printf("  Encoders: %d\n", res->count_encoders);
+    
+    for (int i = 0; i < res->count_connectors; i++) {
+        struct drmModeConnector *conn = drmModeGetConnector(fd, res->connectors[i]);
+        if (conn) {
+            printf("  Connector %d: %s\n", i,
+                   conn->connection == DRM_MODE_CONNECTED ? "connected" : "disconnected");
+            printf("    Modes: %d\n", conn->count_modes);
+            for (int j = 0; j < conn->count_modes && j < 5; j++) {
+                printf("      %dx%d@%dHz\n",
+                       conn->modes[j].hdisplay,
+                       conn->modes[j].vdisplay,
+                       conn->modes[j].vrefresh);
+            }
+            drmModeFreeConnector(conn);
+        }
+    }
+    
+    drmModeFreeResources(res);
+    close(fd);
+    return 0;
+}
+```
+
+6.2 帧缓冲测试工具
+
+```bash
+# 显示当前帧缓冲信息
+hwrun display info
+
+# 设置分辨率
+hwrun display set-mode 1920x1080
+
+# 设置分辨率和刷新率
+hwrun display set-mode 1920x1080@60
+
+# 列出所有支持的模式
+hwrun display modes
+
+# 获取帧缓冲
+hwrun display fb
+
+# 页面翻转 (双缓冲)
+hwrun display flip --fb 1
+
+# 保存当前屏幕截图
+hwrun display screenshot /tmp/screen.raw
+
+# 显示 EDID 信息
+hwrun display edid
+```
+
+七、构建与安装
+
+7.1 插件描述文件
+
+```yaml
+# plugins/display/plugin.yml
+plugin:
+  id: "display"
+  name: "Display Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 显示协议，提供显示输出、帧缓冲、分辨率管理等显示功能"
+  
+  provides:
+    - protocol: "DISPLAY"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "INPUT"
+      version: "1.0"
+  
+  params:
+    - key: "display.backend"
+      type: "string"
+      default: "auto"
+      description: "显示后端 (auto/drm/fbdev)"
+    - key: "display.default_width"
+      type: "int"
+      default: 1024
+      description: "默认显示宽度"
+    - key: "display.default_height"
+      type: "int"
+      default: 768
+      description: "默认显示高度"
+    - key: "display.default_refresh"
+      type: "int"
+      default: 60
+      description: "默认刷新率 (Hz)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/display.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+7.2 构建脚本
+
+```makefile
+# display/Makefile
+
+obj-m += display.o
+
+display-objs := display.o display_drm.o display_drm_connector.o \
+                display_drm_crtc.o display_drm_fb.o display_drm_flip.o \
+                display_fbdev.o display_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 display.ko /usr/lib/hwrun/plugins/
+```
+
+7.3 安装后脚本
+
+```bash
+#!/bin/bash
+# display/scripts/post_install.sh
+
+# 加载 DISPLAY 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/display.ko
+
+if [ $? -eq 0 ]; then
+    echo "DISPLAY kernel module loaded successfully"
+    
+    # 检查 DRM 设备是否存在
+    if [ -e /dev/dri/card0 ]; then
+        echo "DRM device found: /dev/dri/card0"
+    else
+        echo "Warning: DRM device not found, using FBDEV fallback"
+    fi
+else
+    echo "Failed to load DISPLAY kernel module"
+    exit 1
+fi
+```
+
+八、配置与使用
+
+8.1 配置示例
+
+```yaml
+# /etc/hwrun/params/display.yml
+display:
+  # 显示后端: auto / drm / fbdev
+  backend: "auto"
+  
+  # 默认分辨率
+  default_width: 1920
+  default_height: 1080
+  default_refresh: 60
+  
+  # 多显示器
+  multi_display: true
+  primary: "eDP-1"
+  
+  # Gamma 校正
+  gamma:
+    enabled: true
+    red: 1.0
+    green: 1.0
+    blue: 1.0
+```
+
+8.2 命令行接口
+
+```bash
+# 显示信息
+hwrun display info
+
+# 设置分辨率
+hwrun display set-mode 1920x1080
+hwrun display set-mode 1920x1080@60
+
+# 列出所有模式
+hwrun display modes
+hwrun display modes --device HDMI-A-1
+
+# 帧缓冲操作
+hwrun display fb
+hwrun display flip --fb 1
+hwrun display flip --async
+
+# 显示控制
+hwrun display enable HDMI-A-1
+hwrun display disable HDMI-A-1
+
+# Gamma 设置
+hwrun display gamma set --red 1.0 --green 0.8 --blue 0.9
+hwrun display gamma get
+
+# EDID
+hwrun display edid HDMI-A-1
+hwrun display edid --save /tmp/edid.bin
+```
+
+九、总结
+
+维度 决策
+定位 显示协议，所有显示操作的统一入口
+实现方式 Linux 内核模块，基于 DRM/KMS 框架
+代码量 ~1500-2000 行 C
+提供协议 DISPLAY (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + INPUT
+加载时机 在 UI、CONSOLE、DESKTOP 等依赖显示的插件之前
+后端支持 DRM/KMS (现代) + FBDEV (传统)
+核心功能 显示信息查询、模式设置、帧缓冲管理、页面翻转、Gamma 校正、EDID 读取
+
+DISPLAY 是 HWRun OS 中显示输出的核心插件。它基于 Linux 内核的 DRM/KMS 框架，通过 DISPLAY 协议向上层插件提供显示信息查询、分辨率设置、帧缓冲管理、页面翻转、Gamma 校正、EDID 读取等完整的显示管理功能。上层插件（UI、CONSOLE、DESKTOP、TERMINAL 等）通过 DISPLAY 协议进行显示操作，不直接操作 /dev/dri/card 或 /dev/fb 设备节点。**

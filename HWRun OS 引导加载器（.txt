@@ -1,0 +1,950 @@
+﻿HWRun OS 引导加载器（Bootloader）完整设计文档
+
+模块名称： HWRun Bootloader
+版本： 1.0.0
+状态： 设计冻结
+目标平台： x86_64（UEFI + Legacy BIOS 双支持）
+实现语言： C + 汇编（NASM）
+代码量目标： UEFI 版本 ~1500-2000 行 C；Legacy BIOS 版本 ~800-1200 行汇编
+输出： 加载微内核到内存，移交控制权
+
+一、项目概述
+
+1.1 设计定位
+
+HWRun 引导加载器是系统启动的第一个软件组件，负责从存储介质加载微内核和初始插件到内存，然后移交控制权。引导加载器在完成工作后不再参与系统运行。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      HWRun OS 双引导加载器策略                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     HWRun OS 引导加载器                             │   │
+│  ├──────────────────────────────┬──────────────────────────────────────┤   │
+│  │   UEFI 版本 (BOOTX64.EFI)    │   Legacy BIOS 版本 (boot.bin)       │   │
+│  │   ──────────────────────     │   ──────────────────────────         │   │
+│  │   • 现代硬件 (2012+)        │   • 旧硬件 (2012 年前)               │   │
+│  │   • 支持 Secure Boot        │   • 工控机、嵌入式                   │   │
+│  │   • GPT 分区                │   • MBR 分区                         │   │
+│  │   • 文件格式: PE32+         │   • 文件格式: 原始二进制             │   │
+│  └──────────────────────────────┴──────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    ▼                                        │
+│                     ┌─────────────────────────────────────────────────────┐ │
+│                     │  统一传递给微内核：Boot_Info 结构体                │ │
+│                     │  (内存映射、帧缓冲、模块地址、启动方式)           │ │
+│                     └─────────────────────────────────────────────────────┘ │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+两套引导加载器功能完全等价，都执行相同的任务：加载微内核、METAPROTO 和 BUS 插件到内存，然后跳转到微内核入口。区别仅在于底层实现方式不同。微内核通过 Boot_Info 结构体中的 boot_method 字段识别启动方式，但核心启动逻辑完全一致。
+
+1.2 设计目标
+
+目标 说明
+双平台支持 同时支持 UEFI 和 Legacy BIOS
+最小化 引导加载器只做一件事：加载微内核，然后消失
+自包含 不依赖任何外部库
+可调试 支持串口输出调试信息
+可移植 架构相关代码隔离，便于移植到 ARM64
+统一移交 两种启动方式传递给微内核的信息格式完全一致
+
+1.3 统一引导信息结构
+
+无论是 UEFI 还是 Legacy BIOS 版本，最终都填充同一个 Boot_Info 结构体传递给微内核：
+
+```c
+// bootloader/include/bootloader.h
+
+typedef struct {
+    uint64_t magic;                /* 魔数 0x484752554e424f4f ("HWRUNBOO") */
+    uint64_t version;              /* 引导信息版本 */
+    uint32_t boot_method;          /* 0 = UEFI, 1 = Legacy BIOS */
+    
+    /* 内存信息 */
+    Boot_Memory_Map memory_map;
+    
+    /* 帧缓冲 */
+    Boot_Framebuffer framebuffer;
+    
+    /* 模块信息 */
+    Boot_Module kernel;            /* 微内核本身 */
+    Boot_Module metaproto;         /* METAPROTO 插件 */
+    Boot_Module bus;               /* BUS 插件 */
+    
+    /* 命令行参数（如果有） */
+    char *cmdline;
+    
+    uint64_t reserved[8];
+} Boot_Info;
+```
+
+二、UEFI 引导加载器设计
+
+2.1 UEFI 启动流程
+
+UEFI 固件启动后，会扫描 EFI 系统分区（ESP），查找并执行 PE32+ 格式的 UEFI 应用程序。HWRun 的 UEFI 引导加载器位于 /EFI/BOOT/BOOTX64.EFI。
+
+```
+BIOS/UEFI
+    │
+    ▼
+UEFI 固件
+    │  1. 硬件初始化（CPU、内存、芯片组）
+    │  2. 扫描 ESP 分区
+    │  3. 加载 EFI/BOOT/BOOTX64.EFI
+    ▼
+HWRun UEFI 引导加载器 (BOOTX64.EFI)
+    │  1. 初始化 UEFI 服务
+    │  2. 获取 GOP 帧缓冲（显示输出）
+    │  3. 从 ESP 加载 kernel.bin
+    │  4. 从 ESP 加载 metaproto.so
+    │  5. 从 ESP 加载 bus.so
+    │  6. 获取 UEFI 内存映射
+    │  7. 退出 UEFI Boot Services
+    │  8. 跳转到微内核入口
+    ▼
+微内核 (Microkernel)
+```
+
+2.2 UEFI 文件布局
+
+```
+/boot/efi/
+├── EFI/
+│   └── BOOT/
+│       └── BOOTX64.EFI          ← UEFI 引导加载器 (PE32+)
+├── hwrun/
+│   ├── kernel.bin               ← 微内核 (ELF64)
+│   ├── plugins/
+│   │   ├── metaproto.so         ← METAPROTO 插件
+│   │   └── bus.so               ← BUS 插件
+│   └── config/
+│       └── boot.cfg             ← 引导配置（可选）
+```
+
+2.3 核心数据结构（UEFI）
+
+```c
+// bootloader_uefi/include/bootloader.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* UEFI 基本类型 */
+typedef uint64_t EFI_STATUS;
+typedef void *EFI_HANDLE;
+typedef struct EFI_SYSTEM_TABLE EFI_SYSTEM_TABLE;
+typedef struct EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
+typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+/* EFI 状态码 */
+#define EFI_SUCCESS               0
+#define EFI_LOAD_ERROR            1
+#define EFI_INVALID_PARAMETER     2
+#define EFI_UNSUPPORTED           3
+#define EFI_BUFFER_TOO_SMALL      5
+#define EFI_NOT_FOUND             14
+#define EFI_OUT_OF_RESOURCES      9
+#define EFI_SECURITY_VIOLATION    26
+#define EFI_END_OF_FILE           31
+
+/* ELF64 头 */
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} Elf64_Phdr;
+
+#define PT_LOAD 1
+#define ELF_MAGIC0 0x7f
+#define ELF_MAGIC1 'E'
+#define ELF_MAGIC2 'L'
+#define ELF_MAGIC3 'F'
+```
+
+2.4 UEFI 核心函数实现
+
+```c
+// bootloader_uefi/src/efi_main.c
+
+#include <stdint.h>
+#include <stddef.h>
+#include "bootloader.h"
+#include "elf.h"
+#include "file.h"
+#include "memory.h"
+#include "gop.h"
+#include "serial.h"
+
+static EFI_HANDLE g_image_handle;
+static EFI_SYSTEM_TABLE *g_system_table;
+static EFI_BOOT_SERVICES *g_boot_services;
+static EFI_GRAPHICS_OUTPUT_PROTOCOL *g_gop;
+
+EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
+    EFI_STATUS status;
+    Boot_Info boot_info;
+    
+    g_image_handle = image_handle;
+    g_system_table = system_table;
+    g_boot_services = system_table->BootServices;
+    
+    // 初始化控制台
+    system_table->ConOut->ClearScreen(system_table->ConOut);
+    system_table->ConOut->OutputString(system_table->ConOut, 
+                                       L"HWRun Bootloader (UEFI) v1.0\r\n");
+    
+    // 初始化串口调试
+    serial_init();
+    serial_write_str("HWRun UEFI Bootloader started\r\n");
+    
+    // 获取 GOP（图形输出协议）
+    status = gop_init(&g_gop);
+    if (status != EFI_SUCCESS) {
+        serial_write_str("GOP not available, using text mode\r\n");
+    }
+    
+    // 获取文件系统
+    EFI_FILE_IO_PROTOCOL *file_io;
+    status = g_boot_services->HandleProtocol(
+        image_handle,
+        &gEfiSimpleFileSystemProtocolGuid,
+        (void **)&file_io
+    );
+    if (status != EFI_SUCCESS) {
+        serial_write_str("Failed to get file system\r\n");
+        return status;
+    }
+    
+    // 加载微内核
+    void *kernel_addr;
+    uint64_t kernel_size;
+    status = file_load(file_io, L"\\hwrun\\kernel.bin", &kernel_addr, &kernel_size);
+    if (status != EFI_SUCCESS) {
+        serial_write_str("Failed to load kernel.bin\r\n");
+        return status;
+    }
+    serial_write_str("Loaded kernel.bin\r\n");
+    
+    Elf64_Ehdr *kernel_ehdr = (Elf64_Ehdr *)kernel_addr;
+    if (!elf_validate(kernel_ehdr)) {
+        serial_write_str("Invalid ELF header\r\n");
+        return EFI_LOAD_ERROR;
+    }
+    uint64_t kernel_entry = elf_get_entry(kernel_ehdr);
+    
+    // 加载 METAPROTO 插件
+    void *metaproto_addr;
+    uint64_t metaproto_size;
+    status = file_load(file_io, L"\\hwrun\\plugins\\metaproto.so", 
+                       &metaproto_addr, &metaproto_size);
+    if (status != EFI_SUCCESS) {
+        serial_write_str("Failed to load metaproto.so\r\n");
+        return status;
+    }
+    serial_write_str("Loaded metaproto.so\r\n");
+    
+    // 加载 BUS 插件
+    void *bus_addr;
+    uint64_t bus_size;
+    status = file_load(file_io, L"\\hwrun\\plugins\\bus.so", 
+                       &bus_addr, &bus_size);
+    if (status != EFI_SUCCESS) {
+        serial_write_str("Failed to load bus.so\r\n");
+        return status;
+    }
+    serial_write_str("Loaded bus.so\r\n");
+    
+    // 获取内存映射
+    Boot_Memory_Map memory_map;
+    status = memory_map_get(&memory_map);
+    if (status != EFI_SUCCESS) {
+        serial_write_str("Failed to get memory map\r\n");
+        return status;
+    }
+    
+    // 构建引导信息
+    boot_info.magic = BOOT_INFO_MAGIC;
+    boot_info.version = 1;
+    boot_info.boot_method = 0;  // UEFI
+    boot_info.memory_map = memory_map;
+    boot_info.kernel.base = (uint64_t)kernel_addr;
+    boot_info.kernel.size = kernel_size;
+    boot_info.metaproto.base = (uint64_t)metaproto_addr;
+    boot_info.metaproto.size = metaproto_size;
+    boot_info.bus.base = (uint64_t)bus_addr;
+    boot_info.bus.size = bus_size;
+    
+    if (g_gop) {
+        gop_get_framebuffer_info(g_gop, &boot_info.framebuffer);
+    }
+    
+    // 退出 UEFI Boot Services
+    serial_write_str("Exiting boot services...\r\n");
+    status = g_boot_services->ExitBootServices(g_image_handle, memory_map.map_key);
+    if (status != EFI_SUCCESS) {
+        // 某些固件需要重试
+        status = memory_map_get(&memory_map);
+        if (status == EFI_SUCCESS) {
+            status = g_boot_services->ExitBootServices(g_image_handle, 
+                                                        memory_map.map_key);
+        }
+        if (status != EFI_SUCCESS) {
+            serial_write_str("ExitBootServices failed\r\n");
+            return status;
+        }
+    }
+    
+    serial_write_str("Jumping to kernel...\r\n");
+    jump_to_kernel(kernel_entry, &boot_info);
+    
+    return EFI_SUCCESS;  // 不会到达
+}
+```
+
+2.5 ELF 解析器（UEFI）
+
+```c
+// bootloader_uefi/src/elf.c
+
+#include "bootloader.h"
+
+int elf_validate(const Elf64_Ehdr *ehdr) {
+    if (ehdr->e_ident[0] != ELF_MAGIC0 ||
+        ehdr->e_ident[1] != ELF_MAGIC1 ||
+        ehdr->e_ident[2] != ELF_MAGIC2 ||
+        ehdr->e_ident[3] != ELF_MAGIC3) {
+        return 0;
+    }
+    if (ehdr->e_ident[4] != 2) return 0;  // 64-bit
+    if (ehdr->e_ident[5] != 1) return 0;  // Little-endian
+    if (ehdr->e_type != 2) return 0;      // ET_EXEC
+    return 1;
+}
+
+uint64_t elf_get_entry(const Elf64_Ehdr *ehdr) {
+    return ehdr->e_entry;
+}
+
+const Elf64_Phdr *elf_get_phdr(const Elf64_Ehdr *ehdr) {
+    return (const Elf64_Phdr *)((uintptr_t)ehdr + ehdr->e_phoff);
+}
+
+uint16_t elf_get_phnum(const Elf64_Ehdr *ehdr) {
+    return ehdr->e_phnum;
+}
+```
+
+2.6 GOP 初始化（UEFI）
+
+```c
+// bootloader_uefi/src/gop.c
+
+#include "bootloader.h"
+
+EFI_STATUS gop_init(EFI_GRAPHICS_OUTPUT_PROTOCOL **out_gop) {
+    EFI_STATUS status;
+    EFI_BOOT_SERVICES *bs = g_system_table->BootServices;
+    
+    status = bs->HandleProtocol(g_image_handle,
+                                &gEfiGraphicsOutputProtocolGuid,
+                                (void **)out_gop);
+    if (status != EFI_SUCCESS) {
+        return status;
+    }
+    
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = *out_gop;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->Mode;
+    serial_write_dec("GOP: ", mode->Mode);
+    serial_write_dec("x", mode->Info->HorizontalResolution);
+    serial_write_dec("x", mode->Info->VerticalResolution);
+    
+    return EFI_SUCCESS;
+}
+
+void gop_get_framebuffer_info(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop,
+                               Boot_Framebuffer *fb) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->Mode;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_INFO *info = mode->Info;
+    
+    fb->framebuffer_base = (uint64_t)mode->FrameBufferBase;
+    fb->framebuffer_size = mode->FrameBufferSize;
+    fb->width = info->HorizontalResolution;
+    fb->height = info->VerticalResolution;
+    fb->pixels_per_scanline = info->PixelsPerScanLine;
+    fb->pixel_format = info->PixelFormat;
+}
+```
+
+三、Legacy BIOS 引导加载器设计
+
+3.1 Legacy BIOS 启动流程
+
+Legacy BIOS 启动时，会检查启动设备的第一个扇区（MBR）是否包含有效的启动签名（0xAA55）。如果有效，BIOS 将 MBR 加载到内存地址 0x7C00 并跳转执行。
+
+由于 MBR 只有 512 字节，HWRun 的 Legacy BIOS 引导加载器采用两阶段设计：
+
+```
+BIOS
+    │
+    ▼
+第一阶段 (MBR, 512 字节)
+    │  1. 被 BIOS 加载到 0x7C00
+    │  2. 初始化段寄存器和栈
+    │  3. 显示 "HWRun" 启动信息
+    │  4. 使用 INT 13h 从磁盘读取第二阶段
+    │  5. 跳转到第二阶段 (0x7E00)
+    ▼
+第二阶段 (Loader, ~4-8KB)
+    │  1. 启用 A20 地址线
+    │  2. 使用 E820 获取内存映射
+    │  3. 检测 VBE 帧缓冲
+    │  4. 从 FAT32 分区加载文件:
+    │      - kernel.bin (微内核)
+    │      - metaproto.so (METAPROTO 插件)
+    │      - bus.so (BUS 插件)
+    │  5. 切换到保护模式 (32 位)
+    │  6. 切换到长模式 (64 位)
+    │  7. 构建 Boot_Info
+    │  8. 跳转到微内核入口
+    ▼
+微内核 (Microkernel)
+```
+
+3.2 Legacy BIOS 文件布局
+
+```
+hwrun.img (磁盘镜像)
+├── 第 0 扇区 (MBR)          ← 第一阶段 (boot.bin, 512 字节)
+├── 第 1-16 扇区             ← 第二阶段 (loader, 8KB)
+├── FAT32 分区
+│   ├── /hwrun/
+│   │   ├── kernel.bin       ← 微内核
+│   │   └── plugins/
+│   │       ├── metaproto.so ← METAPROTO 插件
+│   │       └── bus.so       ← BUS 插件
+│   └── (其他文件)
+└── 剩余空间
+```
+
+3.3 核心数据结构（Legacy BIOS）
+
+```c
+// bootloader_legacy/include/boot.h
+
+#include <stdint.h>
+
+/* 磁盘地址包 (用于 LBA 磁盘读取) */
+typedef struct {
+    uint8_t  size;          // 0x10
+    uint8_t  reserved;
+    uint16_t sector_count;
+    uint32_t buffer_addr;   // segment:offset
+    uint64_t lba;
+} __attribute__((packed)) DiskAddressPacket;
+
+/* 引导信息（与 UEFI 版本兼容） */
+typedef struct {
+    uint64_t magic;
+    uint64_t version;
+    uint32_t boot_method;   // 1 = Legacy BIOS
+    
+    /* 内存信息 */
+    uint64_t entry_count;
+    uint64_t entry_size;
+    uint64_t map_key;
+    void *entries;
+    
+    /* 帧缓冲 (VBE) */
+    uint32_t framebuffer_base;
+    uint32_t framebuffer_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+    
+    /* 模块信息 */
+    uint64_t kernel_base;
+    uint64_t kernel_size;
+    uint64_t metaproto_base;
+    uint64_t metaproto_size;
+    uint64_t bus_base;
+    uint64_t bus_size;
+    
+    char *cmdline;
+    uint64_t reserved[8];
+} BootInfoLegacy;
+
+#define BOOT_LEGACY_MAGIC 0x484752554e424f4fULL
+```
+
+3.4 第一阶段汇编代码（MBR）
+
+```nasm
+; bootloader_legacy/src/boot.asm
+; 第一阶段：MBR 引导扇区 (512 字节)
+
+BITS 16
+ORG 0x7C00
+
+start:
+    ; 1. 初始化段寄存器
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    
+    ; 2. 保存启动驱动器号
+    mov [boot_drive], dl
+    
+    ; 3. 显示启动信息
+    mov si, msg_loading
+    call print
+    
+    ; 4. 重置磁盘系统
+    mov ah, 0x00
+    int 0x13
+    jc error
+    
+    ; 5. 读取第二阶段 (从 LBA 1 开始，16 个扇区)
+    mov si, dap
+    mov ah, 0x42           ; Extended Read
+    int 0x13
+    jc error
+    
+    ; 6. 跳转到第二阶段 (0x7E00)
+    jmp 0x0000:0x7E00
+
+error:
+    mov si, msg_error
+    call print
+    jmp $
+
+print:
+    lodsb
+    or al, al
+    jz .done
+    mov ah, 0x0E
+    int 0x10
+    jmp print
+.done:
+    ret
+
+boot_drive:    db 0
+msg_loading:   db 0x0D, 0x0A, "HWRun BIOS Bootloader", 0x0D, 0x0A, 0
+msg_error:     db "Error loading stage2", 0
+
+dap:
+    db 0x10
+    db 0x00
+    dw 0x10                ; 16 sectors
+    dw 0x7E00              ; buffer offset
+    dw 0x0000              ; buffer segment
+    dq 0x01                ; LBA
+
+TIMES 510 - ($ - $$) db 0
+DW 0xAA55                  ; MBR 签名
+```
+
+3.5 第二阶段汇编代码（加载器）
+
+```nasm
+; bootloader_legacy/src/loader.asm
+; 第二阶段：加载器 (从 LBA 1 加载)
+
+BITS 16
+ORG 0x7E00
+
+start_stage2:
+    mov si, msg_stage2
+    call print
+    
+    ; 启用 A20 地址线
+    call enable_a20
+    
+    ; 获取 E820 内存映射
+    call get_memory_map
+    
+    ; 检测 VBE 帧缓冲
+    call init_vbe
+    
+    ; 加载内核和插件
+    call load_kernel
+    call load_metaproto
+    call load_bus
+    
+    ; 切换到保护模式
+    call switch_to_protected
+    
+    ; 切换到长模式
+    call switch_to_long_mode
+    
+    ; 跳转到微内核
+    jmp enter_kernel
+
+enable_a20:
+    mov ax, 0x2401
+    int 0x15
+    ret
+
+; ============================================================
+; E820 内存映射获取
+; ============================================================
+get_memory_map:
+    mov di, e820_buffer
+    xor ebx, ebx
+    mov edx, 0x534D4150      ; 'SMAP'
+    mov eax, 0xE820
+    mov ecx, 24
+    int 0x15
+    jc .error
+    mov [e820_count], bp
+    ret
+.error:
+    ret
+
+; ============================================================
+; 切换到 32 位保护模式
+; ============================================================
+switch_to_protected:
+    cli
+    lgdt [gdt_desc]
+    mov eax, cr0
+    or eax, 0x01
+    mov cr0, eax
+    jmp 0x08:pm_entry
+
+BITS 32
+pm_entry:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    ret
+
+; ============================================================
+; GDT
+; ============================================================
+gdt:
+    dq 0                     ; 空
+    dw 0xFFFF                ; 代码段 (0x08)
+    dw 0x0000
+    db 0x00
+    db 0x9A
+    db 0xCF
+    db 0x00
+    dw 0xFFFF                ; 数据段 (0x10)
+    dw 0x0000
+    db 0x00
+    db 0x92
+    db 0xCF
+    db 0x00
+gdt_end:
+
+gdt_desc:
+    dw gdt_end - gdt - 1
+    dd gdt
+
+msg_stage2: db "Stage2 loaded", 0x0D, 0x0A, 0
+e820_buffer: times 256 db 0
+e820_count: dw 0
+```
+
+四、跳转到微内核
+
+4.1 x86_64 汇编实现
+
+```nasm
+; bootloader/jump.S
+
+.section .text
+.global jump_to_kernel
+
+jump_to_kernel:
+    movq %rdi, %rax          ; entry_addr
+    movq %rsi, %rbx          ; boot_info
+    
+    ; 设置临时栈 (入口地址下方 16KB)
+    leaq -16384(%rax), %rsp
+    
+    ; 设置参数: boot_info 指针
+    movq %rbx, %rsi
+    
+    ; 设置参数: 魔数验证
+    movq $0x484752554e424f4f, %rdi
+    
+    ; 跳转到内核入口
+    jmp *%rax
+    
+    cli
+1:  hlt
+    jmp 1b
+```
+
+五、串口调试支持
+
+```c
+// bootloader/src/serial.c
+
+#include <stdint.h>
+
+#define COM1 0x3F8
+
+void serial_init(void) {
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x80);
+    outb(COM1 + 0, 0x03);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xC7);
+    outb(COM1 + 4, 0x0B);
+}
+
+void serial_write_char(char c) {
+    while ((inb(COM1 + 5) & 0x20) == 0);
+    outb(COM1, c);
+}
+
+void serial_write_str(const char *str) {
+    while (*str) {
+        if (*str == '\n') serial_write_char('\r');
+        serial_write_char(*str);
+        str++;
+    }
+}
+
+void serial_write_hex(const char *prefix, uint64_t value) {
+    serial_write_str(prefix);
+    char hex[] = "0123456789abcdef";
+    for (int i = 60; i >= 0; i -= 4) {
+        serial_write_char(hex[(value >> i) & 0xF]);
+    }
+    serial_write_char('\n');
+}
+
+void serial_write_dec(const char *prefix, uint64_t value) {
+    serial_write_str(prefix);
+    char buf[32];
+    int i = 0;
+    if (value == 0) {
+        serial_write_char('0');
+        serial_write_char('\n');
+        return;
+    }
+    while (value > 0) {
+        buf[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    while (i > 0) serial_write_char(buf[--i]);
+    serial_write_char('\n');
+}
+```
+
+六、构建与测试
+
+6.1 构建依赖
+
+依赖 UEFI 版本 Legacy BIOS 版本
+编译器 x86_64-elf-gcc NASM
+链接器 x86_64-elf-ld -
+库 GNU EFI (gnu-efi) -
+模拟器 QEMU + OVMF QEMU
+工具 mtools dd, mtools
+
+6.2 UEFI 版本构建
+
+```makefile
+# bootloader_uefi/Makefile
+
+CC = x86_64-elf-gcc
+LD = x86_64-elf-ld
+OBJCOPY = x86_64-elf-objcopy
+
+CFLAGS = -ffreestanding -fno-stack-protector -fno-strict-aliasing \
+         -fno-builtin -Wall -Wextra -O2 -m64 -mno-red-zone \
+         -Iinclude -I/usr/include/efi -I/usr/include/efi/x86_64
+
+LDFLAGS = -nostdlib -T linker.ld
+
+OBJS = efi_main.o elf.o file.o memory.o gop.o serial.o jump.o
+TARGET = BOOTX64.EFI
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(LD) $(LDFLAGS) -o $@.so $^
+	$(OBJCOPY) -O binary $@.so $@
+
+clean:
+	rm -f *.o *.so $(TARGET)
+```
+
+6.3 Legacy BIOS 版本构建
+
+```makefile
+# bootloader_legacy/Makefile
+
+NASM = nasm
+QEMU = qemu-system-x86_64
+
+all: boot.bin
+
+boot.bin: src/boot.asm src/loader.asm
+	$(NASM) -f bin src/boot.asm -o boot.bin
+
+image: boot.bin
+	dd if=/dev/zero of=hwrun.img bs=1M count=64
+	dd if=boot.bin of=hwrun.img conv=notrunc bs=512 count=1
+
+run: image
+	$(QEMU) -drive file=hwrun.img,format=raw -m 256M -serial stdio
+
+clean:
+	rm -f boot.bin hwrun.img
+```
+
+6.4 测试脚本
+
+```bash
+#!/bin/bash
+# test.sh - 完整测试
+
+# 1. 构建 UEFI 版本
+cd bootloader_uefi && make && cd ..
+
+# 2. 构建 Legacy BIOS 版本
+cd bootloader_legacy && make && cd ..
+
+# 3. 创建 UEFI 测试镜像
+dd if=/dev/zero of=uefi.img bs=1M count=64
+mkfs.vfat -F 32 uefi.img
+mmd -i uefi.img ::/EFI
+mmd -i uefi.img ::/EFI/BOOT
+mmd -i uefi.img ::/hwrun
+mmd -i uefi.img ::/hwrun/plugins
+mcopy -i uefi.img bootloader_uefi/BOOTX64.EFI ::/EFI/BOOT/
+mcopy -i uefi.img kernel.bin ::/hwrun/
+mcopy -i uefi.img metaproto.so ::/hwrun/plugins/
+mcopy -i uefi.img bus.so ::/hwrun/plugins/
+
+# 4. 测试 UEFI
+qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \
+    -drive file=uefi.img,format=raw -serial stdio -m 256M
+
+# 5. 测试 Legacy BIOS
+qemu-system-x86_64 -drive file=bootloader_legacy/hwrun.img,format=raw \
+    -serial stdio -m 256M
+```
+
+七、错误处理
+
+7.1 错误码
+
+错误码 含义
+0 成功
+1 加载失败（文件不存在或损坏）
+2 内存不足
+3 ELF 解析失败
+4 退出 Boot Services 失败（UEFI）
+5 GOP 初始化失败（UEFI）
+6 文件系统访问失败
+
+7.2 错误处理流程
+
+两种引导加载器在遇到错误时都遵循相同流程：
+
+```
+加载失败 → 输出错误信息 → 进入死循环（等待用户重启）
+
+不会：回退到其他引导方式
+不会：尝试恢复（引导加载器没有恢复机制）
+```
+
+八、配置文件（可选）
+
+```yaml
+# /hwrun/config/boot.cfg
+boot:
+  kernel: "/hwrun/kernel.bin"
+  
+  plugins:
+    - "/hwrun/plugins/metaproto.so"
+    - "/hwrun/plugins/bus.so"
+  
+  debug:
+    serial: true
+    serial_port: "COM1"
+    serial_baud: 38400
+  
+  display:
+    framebuffer: true
+    resolution: "1024x768"
+  
+  memory:
+    min_kernel_mb: 16
+    reserve_low_mb: 1
+```
+
+九、发布文件结构
+
+最终发布时，两个版本合并在同一发布包中：
+
+```
+hwrun-os-release/
+├── uefi/
+│   └── BOOTX64.EFI          ← UEFI 版本
+├── legacy/
+│   └── boot.bin             ← Legacy BIOS 版本
+├── hwrun/
+│   ├── kernel.bin           ← 微内核 (ELF64)
+│   └── plugins/
+│       ├── metaproto.so     ← METAPROTO 插件
+│       └── bus.so           ← BUS 插件
+├── tools/
+│   ├── install_uefi.sh      ← UEFI 安装脚本
+│   └── install_legacy.sh    ← Legacy BIOS 安装脚本
+└── README.md
+```
+
+十、总结
+
+维度 UEFI 版本 Legacy BIOS 版本
+目标平台 现代 PC (2012+) 旧硬件、工控机
+文件格式 PE32+ (UEFI 应用) 原始二进制 (MBR)
+入口 efi_main() 0x7C00
+实现语言 C + 汇编 NASM 汇编
+代码量 ~1500-2000 行 ~800-1200 行
+启动模式 UEFI 直接启动 实模式 → 保护模式 → 长模式
+磁盘访问 UEFI 文件协议 BIOS INT 13h
+内存信息 UEFI GetMemoryMap BIOS E820
+显示 GOP (图形输出协议) VBE (VESA BIOS Extensions)
+传递给内核 Boot_Info (统一) Boot_Info (统一)
+
+HWRun 引导加载器提供 UEFI 和 Legacy BIOS 两种版本，功能完全等价，都执行相同的任务：加载微内核和初始插件到内存，构建统一的 Boot_Info 结构体，然后跳转到微内核入口。引导完成后，引导加载器不再参与系统运行。微内核通过 Boot_Info.boot_method 字段识别启动方式，但核心启动逻辑完全一致。

@@ -1,0 +1,52 @@
+# ============================================================
+# HWRun OS — GIT 插件描述文件
+#
+# Git 版本控制系统封装层，系统的"时间机器"。
+# 所有实际操作由系统 /usr/bin/git 完成，本插件提供统一入口、
+# 审计日志与历史压缩管理。
+# ============================================================
+plugin:
+  id: "git"
+  name: "Git 版本控制"
+  version: "1.0.0"
+  type: "git"
+
+  description: "系统 Git 命令的封装层 + 审计日志 + 自动历史管理"
+
+  provides:
+    - protocol: "GIT"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  params:
+    - key: "git.repo_path"
+      type: "string"
+      default: "/var/lib/hwrun/git"
+    - key: "git.audit_path"
+      type: "string"
+      default: "/var/lib/hwrun/git-audit"
+    - key: "git.auto_commit"
+      type: "bool"
+      default: true
+    - key: "git.auto_push"
+      type: "bool"
+      default: false
+    - key: "git.max_size"
+      type: "string"
+      default: "1GB"
+    - key: "git.auto_compact"
+      type: "bool"
+      default: true
+    - key: "git.branch"
+      type: "string"
+      default: "main"
+
+  files:
+    - "/usr/lib/hwrun/plugins/git.so"

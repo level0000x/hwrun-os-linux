@@ -1,0 +1,1431 @@
+﻿HWRun OS HAP 实现文档
+
+模块名称： HAP (Hardware Abstraction Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 硬件抽象协议，提供对 CPU、内存、PCIe、GPU、中断等硬件资源的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）
+提供协议： HAP
+
+一、设计哲学
+
+1.1 核心定位
+
+HAP 是 HWRun OS 的硬件抽象层——所有上层插件通过 HAP 协议访问硬件，不直接操作硬件。
+
+```
+HAP = 硬件抽象协议 = 所有硬件访问的统一入口
+
+上层插件 (FSP, PMP, NP, SP, SCHED, LOADER, ...)
+    │
+    │  通过 HAP 协议访问硬件
+    ▼
+HAP 插件 (内核模块)
+    │
+    │  直接操作硬件
+    ▼
+硬件层 (CPU, 内存, PCIe, GPU, 中断控制器, ...)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有硬件访问通过 HAP 协议进行，上层不直接操作硬件
+2. 内核实现：HAP 插件运行在内核态，直接操作硬件
+3. 统一抽象：不同架构（x86/ARM/RISC-V）通过同一协议暴露
+4. 按需加载：HAP 插件作为独立内核模块，由 BUS 加载
+5. 最小化：HAP 只提供硬件访问的"机制"，不提供"策略"
+
+1.3 HAP 插件的本质
+
+HAP 插件 = Linux 内核模块 + HWRun 协议适配层
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HAP 插件架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  HAP 协议接口 (用户态通过 IPC 调用)                                  │   │
+│  │  GetCpuInfo / GetMemoryInfo / GetPcieDevices / AllocMemory / ...   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层 (将 HAP 协议调用转换为内核操作)                          │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 权限检查                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核功能封装 (直接操作 Linux 内核)                                   │   │
+│  │  ├── CPU: 读取 /proc/cpuinfo, CPUID 指令                           │   │
+│  │  ├── 内存: 读取 /proc/meminfo, NUMA 信息                           │   │
+│  │  ├── PCIe: 遍历 pci_dev 链表                                       │   │
+│  │  ├── GPU: 读取 /sys/class/drm/ 或厂商驱动                          │   │
+│  │  ├── 中断: request_irq() / free_irq()                              │   │
+│  │  └── DMA: dma_alloc_coherent() / dma_free_coherent()               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (硬件驱动)                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 HAP 插件的组成
+
+```
+HAP 插件 (hap.ko)
+├── 协议处理层
+│   ├── hap_ipc_handler()      ← IPC 消息分发
+│   ├── hap_get_cpu_info()     ← CPU 信息
+│   ├── hap_get_memory_info()  ← 内存信息
+│   ├── hap_get_pcie_devices() ← PCIe 设备列表
+│   ├── hap_get_gpu_info()     ← GPU 信息
+│   ├── hap_alloc_memory()     ← 物理内存分配
+│   ├── hap_free_memory()      ← 物理内存释放
+│   ├── hap_migrate_memory()   ← 内存迁移
+│   ├── hap_register_irq()     ← 中断注册
+│   ├── hap_handle_irq()       ← 中断处理
+│   ├── hap_get_sensor_data()  ← 传感器数据
+│   └── hap_request_dma()      ← DMA 请求
+│
+├── 硬件访问层
+│   ├── hap_cpu.c              ← CPU 信息获取
+│   ├── hap_memory.c           ← 内存信息获取
+│   ├── hap_pcie.c             ← PCIe 枚举
+│   ├── hap_gpu.c              ← GPU 信息获取
+│   ├── hap_irq.c              ← 中断管理
+│   └── hap_dma.c              ← DMA 管理
+│
+└── 初始化/清理
+    ├── hap_init()             ← 模块加载
+    └── hap_exit()             ← 模块卸载
+```
+
+2.2 HAP 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → 其他插件
+                                                                      ↑
+                                                              HAP 在这里加载
+```
+
+HAP 是第一个加载的硬件相关插件。在它之后，其他硬件相关的插件（PMP、FSP、NP 等）才能正常工作。
+
+2.3 HAP 的上层消费者
+
+上层插件 需要 HAP 提供什么
+PMP (进程管理) CPU 核心数、NUMA 拓扑（决定进程绑定到哪个核心）
+SCHED (调度器) CPU 核心数、频率、缓存层级
+FSP (文件系统) 存储设备信息、DMA 通道
+NP (网络) 网络设备信息、中断注册
+DRIVER (设备驱动) PCIe 枚举、BAR 空间映射、中断注册
+MONITOR (监控) 传感器数据（温度、功耗、频率）
+POWER (电源管理) 功耗数据、频率控制
+
+三、核心数据结构
+
+```c
+// hap/include/hap.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   设备类型
+   ============================================================ */
+typedef enum {
+    HAP_DEVICE_CPU,
+    HAP_DEVICE_MEMORY,
+    HAP_DEVICE_PCIE,
+    HAP_DEVICE_GPU,
+    HAP_DEVICE_STORAGE,
+    HAP_DEVICE_NETWORK,
+} hap_device_type_t;
+
+/* ============================================================
+   CPU 信息
+   ============================================================ */
+typedef struct hap_cpu_info {
+    char vendor[64];                // "GenuineIntel", "AuthenticAMD"
+    char model[128];                // "Intel Core i7-12700K"
+    char microarch[64];             // "Golden Cove", "Zen 4"
+    uint32_t cores;                 // 物理核心数
+    uint32_t threads;               // 逻辑线程数
+    uint32_t sockets;               // 插槽数
+    uint32_t numa_nodes;            // NUMA 节点数
+    
+    struct {
+        uint32_t L1d;               // KB
+        uint32_t L1i;               // KB
+        uint32_t L2;                // KB
+        uint32_t L3;                // KB
+    } cache;
+    
+    uint64_t freq_min_mhz;          // 最低频率
+    uint64_t freq_max_mhz;          // 最高频率
+    uint64_t freq_current_mhz;      // 当前频率
+    
+    char simd[128];                 // "AVX-512, AVX2, SSE4.2"
+    uint64_t features;              // CPU 特性位掩码
+} hap_cpu_info_t;
+
+/* ============================================================
+   NUMA 节点信息
+   ============================================================ */
+typedef struct hap_numa_node {
+    uint32_t node_id;
+    uint64_t memory_total_kb;
+    uint64_t memory_free_kb;
+    uint32_t cpu_count;
+    uint32_t *cpu_list;             // 该节点上的 CPU 核心列表
+    uint64_t bandwidth_gbps;        // 内存带宽
+    uint64_t latency_ns;            // 内存延迟
+} hap_numa_node_t;
+
+/* ============================================================
+   内存信息
+   ============================================================ */
+typedef struct hap_memory_info {
+    uint64_t total_kb;
+    uint64_t free_kb;
+    uint64_t available_kb;
+    uint64_t swap_total_kb;
+    uint64_t swap_free_kb;
+    char memory_type[32];           // "DDR4", "DDR5", "HBM"
+    uint32_t numa_node_count;
+    hap_numa_node_t *numa_nodes;
+} hap_memory_info_t;
+
+/* ============================================================
+   PCIe 设备
+   ============================================================ */
+typedef struct hap_pcie_device {
+    char address[16];               // "0000:01:00.0"
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t subsystem_vendor_id;
+    uint16_t subsystem_device_id;
+    uint32_t class_code;            // PCIe 类别
+    char class_name[64];            // "VGA compatible controller"
+    char driver[64];                // 驱动名称
+    char name[256];                 // 设备名称
+    
+    struct {
+        uint32_t link_speed_gt;     // 链路速度 (GT/s)
+        uint32_t link_width;        // 链路宽度
+    } pcie;
+    
+    struct {
+        uint32_t bar_count;
+        struct {
+            uint32_t bar;
+            uint64_t start;
+            uint64_t size;
+            int prefetchable;
+        } bars[6];
+    } resource;
+    
+    uint32_t iommu_group;
+    uint32_t irq;
+} hap_pcie_device_t;
+
+/* ============================================================
+   GPU 信息
+   ============================================================ */
+typedef struct hap_gpu_info {
+    char vendor[64];                // "NVIDIA", "AMD", "Intel"
+    char model[128];                // "NVIDIA GeForce RTX 4090"
+    char driver[64];                // 驱动版本
+    
+    uint64_t vram_total_mb;
+    uint64_t vram_used_mb;
+    uint64_t vram_free_mb;
+    
+    uint32_t compute_units;         // CU 数量
+    uint32_t shader_cores;          // 着色器核心数
+    
+    uint32_t freq_mhz;
+    uint32_t temp_c;
+    uint32_t power_w;
+    uint32_t util_pct;
+    
+    char pcie_address[16];          // 对应的 PCIe 地址
+} hap_gpu_info_t;
+
+/* ============================================================
+   传感器数据
+   ============================================================ */
+typedef struct hap_sensor_data {
+    uint32_t sensor_count;
+    struct {
+        char name[64];
+        char type[32];              // "temperature", "power", "fan", "voltage"
+        double value;
+        char unit[16];              // "°C", "W", "RPM", "V"
+    } *sensors;
+} hap_sensor_data_t;
+
+/* ============================================================
+   内存分配请求
+   ============================================================ */
+typedef struct hap_mem_alloc_req {
+    uint64_t size;
+    uint32_t numa_node;             // 指定 NUMA 节点，-1 表示自动
+    uint32_t flags;                 // HAP_MEM_CPU, HAP_MEM_GPU, HAP_MEM_NPU
+} hap_mem_alloc_req_t;
+
+/* ============================================================
+   内存分配响应
+   ============================================================ */
+typedef struct hap_mem_alloc_resp {
+    uint64_t phys_addr;             // 物理地址
+    void *virt_addr;                // 内核虚拟地址
+    uint64_t size;
+    uint32_t numa_node;
+    int error;
+} hap_mem_alloc_resp_t;
+
+/* ============================================================
+   中断注册请求
+   ============================================================ */
+typedef struct hap_irq_register_req {
+    uint32_t irq;
+    uint64_t handler_task_id;       // 处理中断的用户态任务 ID
+    uint32_t flags;                 // IRQF_SHARED, etc.
+} hap_irq_register_req_t;
+
+/* ============================================================
+   HAP 上下文
+   ============================================================ */
+typedef struct hap_context {
+    int initialized;
+    uint64_t hap_task_id;           // HAP 自身的任务 ID
+    
+    /* 缓存的数据（避免重复读取） */
+    hap_cpu_info_t cpu_info;
+    hap_memory_info_t memory_info;
+    hap_pcie_device_t *pcie_devices;
+    uint32_t pcie_device_count;
+    hap_gpu_info_t *gpu_infos;
+    uint32_t gpu_count;
+    
+    /* 中断注册表 */
+    struct {
+        uint32_t irq;
+        uint64_t handler_task_id;
+    } irq_handlers[256];
+    uint32_t irq_handler_count;
+    
+    void *lock;
+} hap_context_t;
+```
+
+四、HAP 协议定义
+
+```protobuf
+// protocols/hap.proto
+syntax = "proto3";
+
+package hwrun.hap;
+
+service HardwareAbstraction {
+    // === CPU ===
+    rpc GetCpuInfo(Empty) returns (CpuInfo);
+    rpc GetCpuTopology(Empty) returns (CpuTopology);
+    
+    // === 内存 ===
+    rpc GetMemoryInfo(Empty) returns (MemoryInfo);
+    rpc GetNumaTopology(Empty) returns (NumaTopology);
+    
+    // === PCIe ===
+    rpc GetPcieDevices(Empty) returns (PcieDeviceList);
+    rpc GetPcieDevice(PcieDeviceRequest) returns (PcieDevice);
+    
+    // === GPU ===
+    rpc GetGpuInfo(Empty) returns (GpuInfo);
+    rpc GetGpuInfoById(GpuInfoRequest) returns (GpuInfo);
+    
+    // === 内存分配 ===
+    rpc AllocMemory(MemAllocRequest) returns (MemAllocResponse);
+    rpc FreeMemory(MemFreeRequest) returns (MemFreeResponse);
+    rpc MigrateMemory(MemMigrateRequest) returns (MemMigrateResponse);
+    
+    // === 中断 ===
+    rpc RegisterIrq(IrqRegisterRequest) returns (IrqRegisterResponse);
+    rpc UnregisterIrq(IrqUnregisterRequest) returns (IrqUnregisterResponse);
+    
+    // === 传感器 ===
+    rpc GetSensorData(SensorRequest) returns (SensorResponse);
+    
+    // === DMA ===
+    rpc RequestDma(DmaRequest) returns (DmaResponse);
+    rpc ReleaseDma(DmaReleaseRequest) returns (DmaReleaseResponse);
+}
+
+message Empty {}
+
+// ============ CPU ============
+
+message CpuInfo {
+    string vendor = 1;
+    string model = 2;
+    string microarch = 3;
+    uint32 cores = 4;
+    uint32 threads = 5;
+    uint32 sockets = 6;
+    uint32 numa_nodes = 7;
+    map<string, uint32> cache = 8;      // "L1d": 32, "L2": 256, "L3": 2048
+    uint64 freq_min_mhz = 9;
+    uint64 freq_max_mhz = 10;
+    uint64 freq_current_mhz = 11;
+    string simd = 12;
+    uint64 features = 13;
+}
+
+message CpuTopology {
+    repeated Core cores = 1;
+}
+
+message Core {
+    uint32 core_id = 1;
+    uint32 socket_id = 2;
+    uint32 numa_node = 3;
+    uint32 thread_id = 4;
+    bool is_p_core = 5;                 // 性能核 (P-core)
+    bool is_e_core = 6;                 // 能效核 (E-core)
+}
+
+// ============ 内存 ============
+
+message MemoryInfo {
+    uint64 total_kb = 1;
+    uint64 free_kb = 2;
+    uint64 available_kb = 3;
+    uint64 swap_total_kb = 4;
+    uint64 swap_free_kb = 5;
+    string memory_type = 6;
+    repeated NumaNode numa_nodes = 7;
+}
+
+message NumaNode {
+    uint32 node_id = 1;
+    uint64 memory_total_kb = 2;
+    uint64 memory_free_kb = 3;
+    repeated uint32 cpus = 4;
+    uint64 bandwidth_gbps = 5;
+    uint64 latency_ns = 6;
+}
+
+message NumaTopology {
+    repeated NumaNode nodes = 1;
+    map<uint32, map<uint32, uint64>> distances = 2;  // node -> node -> distance
+}
+
+// ============ PCIe ============
+
+message PcieDeviceRequest {
+    string address = 1;                 // "0000:01:00.0"
+}
+
+message PcieDevice {
+    string address = 1;
+    uint32 vendor_id = 2;
+    uint32 device_id = 3;
+    uint32 subsystem_vendor_id = 4;
+    uint32 subsystem_device_id = 5;
+    uint32 class_code = 6;
+    string class_name = 7;
+    string driver = 8;
+    string name = 9;
+    uint32 link_speed_gt = 10;
+    uint32 link_width = 11;
+    repeated Bar bars = 12;
+    uint32 iommu_group = 13;
+    uint32 irq = 14;
+}
+
+message Bar {
+    uint32 bar = 1;
+    uint64 start = 2;
+    uint64 size = 3;
+    bool prefetchable = 4;
+}
+
+message PcieDeviceList {
+    repeated PcieDevice devices = 1;
+}
+
+// ============ GPU ============
+
+message GpuInfo {
+    string vendor = 1;
+    string model = 2;
+    string driver = 3;
+    uint64 vram_total_mb = 4;
+    uint64 vram_used_mb = 5;
+    uint64 vram_free_mb = 6;
+    uint32 compute_units = 7;
+    uint32 shader_cores = 8;
+    uint32 freq_mhz = 9;
+    uint32 temp_c = 10;
+    uint32 power_w = 11;
+    uint32 util_pct = 12;
+    string pcie_address = 13;
+}
+
+message GpuInfoRequest {
+    uint32 index = 1;                   // GPU 索引
+}
+
+// ============ 内存分配 ============
+
+message MemAllocRequest {
+    uint64 size = 1;
+    int32 numa_node = 2;                // -1 表示自动
+    uint32 flags = 3;                   // 1=CPU, 2=GPU, 4=NPU
+}
+
+message MemAllocResponse {
+    uint64 phys_addr = 1;
+    bytes virt_addr = 2;
+    uint64 size = 3;
+    uint32 numa_node = 4;
+    int32 error = 5;
+}
+
+message MemFreeRequest {
+    uint64 phys_addr = 1;
+}
+
+message MemFreeResponse {
+    int32 error = 1;
+}
+
+message MemMigrateRequest {
+    uint64 phys_addr = 1;
+    uint64 size = 2;
+    uint32 target_numa_node = 3;
+}
+
+message MemMigrateResponse {
+    int32 error = 1;
+}
+
+// ============ 中断 ============
+
+message IrqRegisterRequest {
+    uint32 irq = 1;
+    uint64 handler_task_id = 2;
+    uint32 flags = 3;
+}
+
+message IrqRegisterResponse {
+    int32 error = 1;
+}
+
+message IrqUnregisterRequest {
+    uint32 irq = 1;
+}
+
+message IrqUnregisterResponse {
+    int32 error = 1;
+}
+
+// ============ 传感器 ============
+
+message SensorRequest {
+    string type = 1;                    // "temperature", "power", "all"
+}
+
+message SensorResponse {
+    repeated Sensor sensors = 1;
+}
+
+message Sensor {
+    string name = 1;
+    string type = 2;
+    double value = 3;
+    string unit = 4;
+}
+
+// ============ DMA ============
+
+message DmaRequest {
+    uint64 size = 1;
+    uint32 direction = 2;               // 0=DEV_TO_MEM, 1=MEM_TO_DEV
+}
+
+message DmaResponse {
+    uint64 dma_handle = 1;
+    uint64 phys_addr = 2;
+    bytes virt_addr = 3;
+    int32 error = 4;
+}
+
+message DmaReleaseRequest {
+    uint64 dma_handle = 1;
+}
+
+message DmaReleaseResponse {
+    int32 error = 1;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// hap/src/hap.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/proc_fs.h>
+#include <linux/slab.h>
+#include <linux/pci.h>
+#include <linux/cpufreq.h>
+#include <linux/numa.h>
+#include <linux/interrupt.h>
+
+#include "hap.h"
+#include "hap_ipc.h"
+#include "hap_cpu.h"
+#include "hap_memory.h"
+#include "hap_pcie.h"
+#include "hap_gpu.h"
+#include "hap_irq.h"
+#include "hap_dma.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Hardware Abstraction Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static hap_context_t g_hap_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init hap_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun HAP: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_hap_ctx, 0, sizeof(hap_context_t));
+    
+    // 2. 探测并缓存 CPU 信息
+    ret = hap_cpu_probe(&g_hap_ctx.cpu_info);
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun HAP: Failed to probe CPU\n");
+        return ret;
+    }
+    
+    // 3. 探测并缓存内存信息
+    ret = hap_memory_probe(&g_hap_ctx.memory_info);
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun HAP: Failed to probe memory\n");
+        return ret;
+    }
+    
+    // 4. 探测并缓存 PCIe 设备
+    ret = hap_pcie_probe(&g_hap_ctx.pcie_devices, &g_hap_ctx.pcie_device_count);
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun HAP: Failed to probe PCIe devices\n");
+        return ret;
+    }
+    
+    // 5. 探测 GPU 信息
+    ret = hap_gpu_probe(&g_hap_ctx.gpu_infos, &g_hap_ctx.gpu_count);
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun HAP: Failed to probe GPU (may not exist)\n");
+        g_hap_ctx.gpu_count = 0;
+    }
+    
+    // 6. 初始化中断处理器
+    hap_irq_init();
+    
+    // 7. 初始化 DMA 管理器
+    hap_dma_init();
+    
+    // 8. 注册 IPC 消息处理器
+    ret = hap_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun HAP: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 9. 注册 HAP 协议（通过 METAPROTO - 通过 IPC）
+    // 实际通过 IPC 发送注册请求到 METAPROTO
+    hap_register_protocol();
+    
+    g_hap_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun HAP: Initialized successfully\n");
+    printk(KERN_INFO "  CPU: %s %s (%u cores, %u threads)\n",
+           g_hap_ctx.cpu_info.vendor,
+           g_hap_ctx.cpu_info.model,
+           g_hap_ctx.cpu_info.cores,
+           g_hap_ctx.cpu_info.threads);
+    printk(KERN_INFO "  Memory: %lu MB total\n",
+           g_hap_ctx.memory_info.total_kb / 1024);
+    printk(KERN_INFO "  PCIe devices: %u\n", g_hap_ctx.pcie_device_count);
+    printk(KERN_INFO "  GPUs: %u\n", g_hap_ctx.gpu_count);
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit hap_exit(void) {
+    printk(KERN_INFO "HWRun HAP: Exiting...\n");
+    
+    // 1. 注销 IPC 处理器
+    hap_ipc_unregister();
+    
+    // 2. 释放 PCIe 设备列表
+    if (g_hap_ctx.pcie_devices) {
+        kfree(g_hap_ctx.pcie_devices);
+        g_hap_ctx.pcie_devices = NULL;
+    }
+    
+    // 3. 释放 GPU 信息
+    if (g_hap_ctx.gpu_infos) {
+        kfree(g_hap_ctx.gpu_infos);
+        g_hap_ctx.gpu_infos = NULL;
+    }
+    
+    // 4. 清理中断处理器
+    hap_irq_cleanup();
+    
+    // 5. 清理 DMA 管理器
+    hap_dma_cleanup();
+    
+    g_hap_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun HAP: Exited\n");
+}
+
+module_init(hap_init);
+module_exit(hap_exit);
+```
+
+5.2 CPU 信息获取
+
+```c
+// hap/src/hap_cpu.c
+
+#include <linux/kernel.h>
+#include <linux/smp.h>
+#include <linux/cpufreq.h>
+#include <linux/cpumask.h>
+#include <asm/cpu.h>
+#include <asm/processor.h>
+#include <asm/cpufeature.h>
+#include <asm/cpuid.h>
+
+#include "hap.h"
+
+/* ============================================================
+   获取 CPU 厂商信息（通过 CPUID）
+   ============================================================ */
+static void hap_cpu_get_vendor(hap_cpu_info_t *info) {
+    uint32_t eax, ebx, ecx, edx;
+    char vendor[13] = {0};
+    
+    cpuid(0, &eax, &ebx, &ecx, &edx);
+    memcpy(vendor, &ebx, 4);
+    memcpy(vendor + 4, &edx, 4);
+    memcpy(vendor + 8, &ecx, 4);
+    
+    strncpy(info->vendor, vendor, sizeof(info->vendor) - 1);
+    
+    // 获取 CPU 型号（通过 /proc/cpuinfo 的 model name）
+    // 实际通过读取 /proc/cpuinfo 或使用 x86 的 cpuinfo_x86 结构
+    struct cpuinfo_x86 *c = &boot_cpu_data;
+    snprintf(info->model, sizeof(info->model), "%s", c->x86_model_id);
+    
+    // 微架构名称
+    switch (c->x86_vendor) {
+        case X86_VENDOR_INTEL:
+            switch (c->x86) {
+                case 6:
+                    switch (c->x86_model) {
+                        case 0x97: strcpy(info->microarch, "Alder Lake"); break;
+                        case 0x9A: strcpy(info->microarch, "Raptor Lake"); break;
+                        case 0xAE: strcpy(info->microarch, "Golden Cove"); break;
+                        default: strcpy(info->microarch, "Intel Core");
+                    }
+                    break;
+                default: strcpy(info->microarch, "Intel");
+            }
+            break;
+        case X86_VENDOR_AMD:
+            switch (c->x86) {
+                case 0x19: strcpy(info->microarch, "Zen 4"); break;
+                case 0x17: strcpy(info->microarch, "Zen 3"); break;
+                default: strcpy(info->microarch, "AMD");
+            }
+            break;
+        default:
+            strcpy(info->microarch, "Unknown");
+    }
+}
+
+/* ============================================================
+   获取核心/线程数
+   ============================================================ */
+static void hap_cpu_get_cores(hap_cpu_info_t *info) {
+    info->cores = num_present_cpus();
+    info->threads = num_online_cpus();
+    info->sockets = 1;  // 简化实现，实际需要读取 ACPI
+    
+    // 获取 NUMA 节点数
+    info->numa_nodes = num_possible_nodes();
+}
+
+/* ============================================================
+   获取缓存信息
+   ============================================================ */
+static void hap_cpu_get_cache(hap_cpu_info_t *info) {
+    // 通过 CPUID 获取缓存信息（简化版）
+    // 实际应遍历所有缓存级别
+    info->cache.L1d = 32;   // KB
+    info->cache.L1i = 32;
+    info->cache.L2 = 256;
+    info->cache.L3 = 2048;
+}
+
+/* ============================================================
+   获取频率信息
+   ============================================================ */
+static void hap_cpu_get_freq(hap_cpu_info_t *info) {
+    unsigned int freq;
+    
+    // 获取当前频率
+    freq = cpufreq_quick_get(0);
+    if (freq) {
+        info->freq_current_mhz = freq;
+    } else {
+        info->freq_current_mhz = 0;
+    }
+    
+    // 获取最大/最小频率（简化版）
+    info->freq_min_mhz = 800;
+    info->freq_max_mhz = 5000;
+}
+
+/* ============================================================
+   获取 SIMD 指令集信息
+   ============================================================ */
+static void hap_cpu_get_simd(hap_cpu_info_t *info) {
+    char *simd = info->simd;
+    size_t remaining = sizeof(info->simd);
+    
+    if (cpu_has_feature(X86_FEATURE_AVX512F)) {
+        strncat(simd, "AVX-512, ", remaining);
+    }
+    if (cpu_has_feature(X86_FEATURE_AVX2)) {
+        strncat(simd, "AVX2, ", remaining);
+    }
+    if (cpu_has_feature(X86_FEATURE_AVX)) {
+        strncat(simd, "AVX, ", remaining);
+    }
+    if (cpu_has_feature(X86_FEATURE_SSE4_2)) {
+        strncat(simd, "SSE4.2, ", remaining);
+    }
+    if (cpu_has_feature(X86_FEATURE_SSE4_1)) {
+        strncat(simd, "SSE4.1, ", remaining);
+    }
+    if (cpu_has_feature(X86_FEATURE_SSE3)) {
+        strncat(simd, "SSE3, ", remaining);
+    }
+    
+    // 移除末尾的 ", "
+    size_t len = strlen(simd);
+    if (len >= 2 && simd[len - 2] == ',') {
+        simd[len - 2] = '\0';
+    }
+}
+
+/* ============================================================
+   CPU 探测主函数
+   ============================================================ */
+int hap_cpu_probe(hap_cpu_info_t *info) {
+    memset(info, 0, sizeof(hap_cpu_info_t));
+    
+    hap_cpu_get_vendor(info);
+    hap_cpu_get_cores(info);
+    hap_cpu_get_cache(info);
+    hap_cpu_get_freq(info);
+    hap_cpu_get_simd(info);
+    
+    // 获取 CPU 特性位掩码（简化版）
+    info->features = 0;
+    
+    return 0;
+}
+```
+
+5.3 内存信息获取
+
+```c
+// hap/src/hap_memory.c
+
+#include <linux/mm.h>
+#include <linux/numa.h>
+#include <linux/memblock.h>
+#include <linux/slab.h>
+#include <asm/page.h>
+
+#include "hap.h"
+
+/* ============================================================
+   获取内存总量
+   ============================================================ */
+static void hap_memory_get_total(hap_memory_info_t *info) {
+    // 通过 memblock 或 /proc/meminfo 获取
+    // 简化版：使用全局内存统计
+    struct sysinfo si;
+    si_meminfo(&si);
+    
+    info->total_kb = si.totalram * (PAGE_SIZE / 1024);
+    info->free_kb = si.freeram * (PAGE_SIZE / 1024);
+    info->available_kb = info->free_kb;  // 简化版
+    
+    // Swap 信息
+    info->swap_total_kb = si.totalswap * (PAGE_SIZE / 1024);
+    info->swap_free_kb = si.freeswap * (PAGE_SIZE / 1024);
+}
+
+/* ============================================================
+   获取 NUMA 信息
+   ============================================================ */
+static void hap_memory_get_numa(hap_memory_info_t *info) {
+    int nid;
+    int node_count = 0;
+    hap_numa_node_t *nodes = NULL;
+    
+    for_each_online_node(nid) {
+        node_count++;
+    }
+    
+    info->numa_node_count = node_count;
+    if (node_count == 0) {
+        info->numa_nodes = NULL;
+        return;
+    }
+    
+    nodes = kmalloc(node_count * sizeof(hap_numa_node_t), GFP_KERNEL);
+    if (!nodes) {
+        info->numa_nodes = NULL;
+        return;
+    }
+    
+    int idx = 0;
+    for_each_online_node(nid) {
+        nodes[idx].node_id = nid;
+        nodes[idx].memory_total_kb = node_get_totalram(nid) * (PAGE_SIZE / 1024);
+        nodes[idx].memory_free_kb = node_get_freeram(nid) * (PAGE_SIZE / 1024);
+        nodes[idx].cpu_count = 0;
+        nodes[idx].cpu_list = NULL;
+        nodes[idx].bandwidth_gbps = 0;
+        nodes[idx].latency_ns = 0;
+        idx++;
+    }
+    
+    info->numa_nodes = nodes;
+}
+
+/* ============================================================
+   内存探测主函数
+   ============================================================ */
+int hap_memory_probe(hap_memory_info_t *info) {
+    memset(info, 0, sizeof(hap_memory_info_t));
+    
+    hap_memory_get_total(info);
+    hap_memory_get_numa(info);
+    
+    // 内存类型（简化版）
+    strcpy(info->memory_type, "DDR5");
+    
+    return 0;
+}
+```
+
+5.4 PCIe 设备枚举
+
+```c
+// hap/src/hap_pcie.c
+
+#include <linux/pci.h>
+#include <linux/slab.h>
+
+#include "hap.h"
+
+/* ============================================================
+   PCIe 设备枚举回调
+   ============================================================ */
+static int hap_pcie_callback(struct pci_dev *dev, void *data) {
+    hap_pcie_device_t **list = (hap_pcie_device_t **)data;
+    hap_pcie_device_t *entry;
+    uint32_t count = 0;
+    
+    // 先计数
+    // 实际实现中应动态扩展数组
+    
+    entry = kmalloc(sizeof(hap_pcie_device_t), GFP_KERNEL);
+    if (!entry) {
+        return -ENOMEM;
+    }
+    
+    memset(entry, 0, sizeof(hap_pcie_device_t));
+    
+    // 填充信息
+    snprintf(entry->address, sizeof(entry->address), "%04x:%02x:%02x.%x",
+             dev->domain, dev->bus->number, PCI_SLOT(dev->devfn),
+             PCI_FUNC(dev->devfn));
+    
+    entry->vendor_id = dev->vendor;
+    entry->device_id = dev->device;
+    entry->subsystem_vendor_id = dev->subsystem_vendor;
+    entry->subsystem_device_id = dev->subsystem_device;
+    entry->class_code = dev->class;
+    
+    // 获取类别名称
+    switch (dev->class >> 16) {
+        case PCI_CLASS_DISPLAY_VGA:
+            strcpy(entry->class_name, "VGA compatible controller");
+            break;
+        case PCI_CLASS_NETWORK_ETHERNET:
+            strcpy(entry->class_name, "Ethernet controller");
+            break;
+        case PCI_CLASS_STORAGE_NVME:
+            strcpy(entry->class_name, "NVMe controller");
+            break;
+        default:
+            snprintf(entry->class_name, sizeof(entry->class_name),
+                     "Class 0x%06x", dev->class);
+    }
+    
+    // 获取驱动名称
+    if (dev->driver) {
+        strncpy(entry->driver, dev->driver->name, sizeof(entry->driver) - 1);
+    } else {
+        strcpy(entry->driver, "unknown");
+    }
+    
+    // 获取设备名称
+    if (dev->dev.driver && dev->dev.driver->name) {
+        strncpy(entry->name, dev->dev.driver->name, sizeof(entry->name) - 1);
+    } else {
+        snprintf(entry->name, sizeof(entry->name), "%04x:%04x",
+                 dev->vendor, dev->device);
+    }
+    
+    // PCIe 链路信息
+    entry->pcie.link_speed_gt = pcie_get_speed_cap(dev);
+    entry->pcie.link_width = pcie_get_width_cap(dev);
+    
+    // BAR 信息
+    entry->resource.bar_count = 0;
+    for (int i = 0; i < 6; i++) {
+        if (dev->resource[i].flags & IORESOURCE_MEM) {
+            entry->resource.bars[entry->resource.bar_count].bar = i;
+            entry->resource.bars[entry->resource.bar_count].start =
+                dev->resource[i].start;
+            entry->resource.bars[entry->resource.bar_count].size =
+                dev->resource[i].end - dev->resource[i].start + 1;
+            entry->resource.bars[entry->resource.bar_count].prefetchable =
+                (dev->resource[i].flags & IORESOURCE_PREFETCH) ? 1 : 0;
+            entry->resource.bar_count++;
+        }
+    }
+    
+    // IOMMU 组
+    entry->iommu_group = 0;  // 简化版
+    
+    // 中断号
+    entry->irq = dev->irq;
+    
+    // 添加到列表（简化版：直接分配）
+    // 实际应动态扩展数组
+    *list = entry;
+    
+    return 0;
+}
+
+/* ============================================================
+   PCIe 探测主函数
+   ============================================================ */
+int hap_pcie_probe(hap_pcie_device_t **devices, uint32_t *count) {
+    // 先计数
+    struct pci_dev *dev;
+    uint32_t total = 0;
+    
+    for_each_pci_dev(dev) {
+        total++;
+    }
+    
+    if (total == 0) {
+        *devices = NULL;
+        *count = 0;
+        return 0;
+    }
+    
+    // 分配数组
+    hap_pcie_device_t *list = kmalloc(total * sizeof(hap_pcie_device_t),
+                                       GFP_KERNEL);
+    if (!list) {
+        return -ENOMEM;
+    }
+    
+    // 枚举设备
+    uint32_t idx = 0;
+    for_each_pci_dev(dev) {
+        hap_pcie_device_t *entry = &list[idx];
+        memset(entry, 0, sizeof(hap_pcie_device_t));
+        
+        // 填充信息（同上）
+        snprintf(entry->address, sizeof(entry->address), "%04x:%02x:%02x.%x",
+                 dev->domain, dev->bus->number, PCI_SLOT(dev->devfn),
+                 PCI_FUNC(dev->devfn));
+        entry->vendor_id = dev->vendor;
+        entry->device_id = dev->device;
+        entry->subsystem_vendor_id = dev->subsystem_vendor;
+        entry->subsystem_device_id = dev->subsystem_device;
+        entry->class_code = dev->class;
+        entry->irq = dev->irq;
+        
+        // ... 其他字段填充
+        
+        idx++;
+    }
+    
+    *devices = list;
+    *count = total;
+    
+    return 0;
+}
+```
+
+5.5 中断管理
+
+```c
+// hap/src/hap_irq.c
+
+#include <linux/interrupt.h>
+#include <linux/slab.h>
+
+#include "hap.h"
+#include "hap_ipc.h"
+
+#define MAX_IRQ_HANDLERS 256
+
+static struct {
+    uint32_t irq;
+    uint64_t handler_task_id;
+    int registered;
+} irq_handlers[MAX_IRQ_HANDLERS];
+
+static int irq_handler_count = 0;
+
+/* ============================================================
+   中断处理函数（内核态）
+   ============================================================ */
+static irqreturn_t hap_irq_handler(int irq, void *dev_id) {
+    // 查找对应的任务 ID
+    uint64_t task_id = 0;
+    for (int i = 0; i < irq_handler_count; i++) {
+        if (irq_handlers[i].irq == irq) {
+            task_id = irq_handlers[i].handler_task_id;
+            break;
+        }
+    }
+    
+    if (task_id == 0) {
+        return IRQ_NONE;
+    }
+    
+    // 通过 IPC 通知用户态任务
+    hap_ipc_send_irq(task_id, irq);
+    
+    return IRQ_HANDLED;
+}
+
+/* ============================================================
+   注册中断
+   ============================================================ */
+int hap_irq_register(uint32_t irq, uint64_t handler_task_id, uint32_t flags) {
+    int ret;
+    
+    if (irq_handler_count >= MAX_IRQ_HANDLERS) {
+        return -ENOMEM;
+    }
+    
+    // 检查是否已注册
+    for (int i = 0; i < irq_handler_count; i++) {
+        if (irq_handlers[i].irq == irq) {
+            return -EEXIST;
+        }
+    }
+    
+    // 注册到内核
+    ret = request_irq(irq, hap_irq_handler,
+                      flags & 0x1 ? IRQF_SHARED : 0,
+                      "hwrun_hap", NULL);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 记录
+    irq_handlers[irq_handler_count].irq = irq;
+    irq_handlers[irq_handler_count].handler_task_id = handler_task_id;
+    irq_handlers[irq_handler_count].registered = 1;
+    irq_handler_count++;
+    
+    return 0;
+}
+
+/* ============================================================
+   注销中断
+   ============================================================ */
+int hap_irq_unregister(uint32_t irq) {
+    int found = 0;
+    
+    for (int i = 0; i < irq_handler_count; i++) {
+        if (irq_handlers[i].irq == irq) {
+            found = 1;
+            // 从内核注销
+            free_irq(irq, NULL);
+            // 从列表中移除
+            irq_handlers[i] = irq_handlers[irq_handler_count - 1];
+            irq_handler_count--;
+            break;
+        }
+    }
+    
+    return found ? 0 : -ENOENT;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// hap/src/hap_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "hap.h"
+#include "hap_ipc.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void hap_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case HAP_MSG_GET_CPU_INFO: {
+            hap_cpu_info_t info;
+            hap_cpu_probe(&info);
+            ipc_reply(from_task, &info, sizeof(info));
+            break;
+        }
+        
+        case HAP_MSG_GET_MEMORY_INFO: {
+            hap_memory_info_t info;
+            hap_memory_probe(&info);
+            ipc_reply(from_task, &info, sizeof(info));
+            break;
+        }
+        
+        case HAP_MSG_GET_PCIE_DEVICES: {
+            hap_pcie_device_t *devices;
+            uint32_t count;
+            hap_pcie_probe(&devices, &count);
+            // 发送设备列表
+            ipc_reply(from_task, devices, count * sizeof(hap_pcie_device_t));
+            if (devices) kfree(devices);
+            break;
+        }
+        
+        case HAP_MSG_ALLOC_MEMORY: {
+            hap_mem_alloc_req_t *req = (hap_mem_alloc_req_t *)data;
+            hap_mem_alloc_resp_t resp;
+            // 分配物理内存
+            // 使用 dma_alloc_coherent 或 alloc_pages
+            resp.size = req->size;
+            resp.phys_addr = 0;
+            resp.virt_addr = NULL;
+            resp.numa_node = 0;
+            resp.error = 0;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case HAP_MSG_REGISTER_IRQ: {
+            hap_irq_register_req_t *req = (hap_irq_register_req_t *)data;
+            int ret = hap_irq_register(req->irq, req->handler_task_id, req->flags);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun HAP: Unknown IPC message type: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/hap/plugin.yml
+plugin:
+  id: "hap"
+  name: "Hardware Abstraction Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 硬件抽象协议，提供对 CPU、内存、PCIe、GPU、中断等硬件资源的统一访问"
+  
+  provides:
+    - protocol: "HAP"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+  
+  params:
+    - key: "hap.dma_size"
+      type: "string"
+      default: "64MB"
+      description: "DMA 预分配内存大小"
+    - key: "hap.irq_threaded"
+      type: "bool"
+      default: true
+      description: "使用中断线程化"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/hap.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# hap/Makefile
+
+obj-m += hap.o
+
+hap-objs := hap.o hap_cpu.o hap_memory.o hap_pcie.o hap_gpu.o hap_irq.o hap_dma.o hap_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 hap.ko /usr/lib/hwrun/plugins/
+```
+
+6.3 安装脚本
+
+```bash
+#!/bin/bash
+# hap/scripts/post_install.sh
+
+# 加载 HAP 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/hap.ko
+
+# 如果加载成功，注册到 HWRun 系统
+if [ $? -eq 0 ]; then
+    echo "HAP kernel module loaded successfully"
+else
+    echo "Failed to load HAP kernel module"
+    exit 1
+fi
+```
+
+七、命令行接口
+
+```bash
+# 查看 CPU 信息
+hwrun hap cpu
+
+# 查看内存信息
+hwrun hap memory
+
+# 查看 NUMA 拓扑
+hwrun hap numa
+
+# 查看 PCIe 设备列表
+hwrun hap pcie
+
+# 查看 GPU 信息
+hwrun hap gpu
+
+# 查看传感器数据
+hwrun hap sensors
+```
+
+八、代码组织
+
+```
+hap/
+├── Makefile
+├── plugin.yml                     # 插件描述文件
+│
+├── include/
+│   ├── hap.h                      # 核心数据结构
+│   ├── hap_cpu.h                  # CPU 信息
+│   ├── hap_memory.h               # 内存信息
+│   ├── hap_pcie.h                 # PCIe 枚举
+│   ├── hap_gpu.h                  # GPU 信息
+│   ├── hap_irq.h                  # 中断管理
+│   ├── hap_dma.h                  # DMA 管理
+│   └── hap_ipc.h                  # IPC 通信
+│
+└── src/
+    ├── hap.c                      # 模块初始化
+    ├── hap_cpu.c                  # CPU 实现
+    ├── hap_memory.c               # 内存实现
+    ├── hap_pcie.c                 # PCIe 实现
+    ├── hap_gpu.c                  # GPU 实现
+    ├── hap_irq.c                  # 中断实现
+    ├── hap_dma.c                  # DMA 实现
+    └── hap_ipc.c                  # IPC 处理
+```
+
+九、总结
+
+维度 决策
+定位 硬件抽象协议，所有硬件访问的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~2000 行 C
+提供协议 HAP (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG
+加载时机 在 PMP、FSP、NP 等硬件相关插件之前
+
+HAP 是 HWRun OS 中第一个加载的硬件相关插件。它作为内核模块运行，直接操作硬件，通过 HAP 协议向上层插件提供统一的硬件访问接口。上层插件（PMP、FSP、NP、SP、SCHED 等）通过 HAP 协议访问 CPU、内存、PCIe、GPU、中断等硬件资源，不直接操作硬件。

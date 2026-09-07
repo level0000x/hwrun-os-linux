@@ -1,0 +1,1337 @@
+﻿HWRun OS FIRMWARE 实现文档
+
+模块名称： FIRMWARE (Firmware Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 固件管理协议，提供 UEFI/BIOS 固件信息查询、设置管理、固件更新、安全启动配置等功能的统一抽象
+实现语言： C（内核模块 + 用户态服务，基于 libefivar 和 fwupd）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统）、STORAGE（存储后端）
+提供协议： FIRMWARE
+
+一、设计哲学
+
+1.1 核心定位
+
+FIRMWARE 是 HWRun OS 的固件管理核心——所有与 UEFI/BIOS 固件信息查询、设置管理、固件更新、安全启动配置相关的操作都通过 FIRMWARE 协议进行。
+
+```
+FIRMWARE = 固件管理协议 = 所有固件操作的统一入口
+
+上层插件 (BOOT, SECURITY, SYSTEM_STATE, MONITOR, ...)
+    │
+    │  通过 FIRMWARE 协议管理固件
+    ▼
+FIRMWARE 插件 (内核模块 + 用户态服务)
+    │
+    │  基于 Linux 固件管理栈
+    │  ├── efivarfs          → UEFI 变量读写 (/sys/firmware/efi/efivars)
+    │  ├── libefivar         → UEFI 变量操作库
+    │  ├── ESRT              → EFI 系统资源表 (固件更新资源)
+    │  ├── UEFI Capsule      → 固件更新胶囊
+    │  └── fwupd 集成        → 设备固件更新框架
+    │
+    ▼
+Linux 内核 (EFI Runtime Services / efivarfs / ESRT)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有固件操作通过 FIRMWARE 协议进行
+2. 标准化接口：基于 UEFI 规范和 Linux 内核标准接口
+3. 安全优先：固件更新需要验证签名，防止恶意固件
+4. 双后端支持：支持 UEFI 和 Legacy BIOS 两种固件接口
+5. 设置管理：支持读取和修改 BIOS/UEFI 设置项
+6. 更新机制：支持 UEFI Capsule 更新和 fwupd 设备固件更新
+
+1.3 固件管理栈概述
+
+Linux 提供了多层固件管理接口：
+
+层 接口 说明
+用户态工具 fwupdmgr, efibootmgr 命令行工具
+用户态库 libefivar, libfwupd 编程接口
+内核接口 /sys/firmware/efi/efivars efivarfs 文件系统
+内核接口 /dev/efi_capsule_loader Capsule 更新设备
+内核接口 /sys/firmware/efi/esrt/ ESRT 资源表
+EFI 运行时 GetVariable, SetVariable, UpdateCapsule UEFI Runtime Services
+
+1.4 UEFI 变量与 EFI 运行时服务
+
+UEFI 规范定义了 EFI Runtime Services，其中与固件管理直接相关的是变量服务和胶囊更新服务：
+
+· GetVariable()：读取 UEFI 变量
+· SetVariable()：写入 UEFI 变量
+· GetNextVariableName()：枚举变量
+· UpdateCapsule()：提交固件更新胶囊
+
+UEFI 变量是键值对存储，位于 EFI_GLOBAL_VARIABLE_GUID 命名空间，通过 /sys/firmware/efi/efivars/ 暴露。
+
+UEFI Capsule 是固件更新的标准机制，支持在操作系统运行时将固件更新包提交给固件，在下次重启时应用。
+
+二、整体架构
+
+2.1 FIRMWARE 插件的组成
+
+```
+FIRMWARE 插件
+├── 内核模块 (firmware.ko)
+│   ├── 协议处理层
+│   │   ├── firmware_ipc_handler()  ← IPC 消息分发
+│   │   ├── firmware_get_info()     ← 获取固件信息
+│   │   ├── firmware_get_version()  ← 获取固件版本
+│   │   ├── firmware_get_settings() ← 获取固件设置
+│   │   ├── firmware_set_setting()  ← 修改固件设置
+│   │   └── firmware_update()       ← 固件更新
+│   ├── efivarfs 封装
+│   │   ├── firmware_efivar.c       ← UEFI 变量读写
+│   │   ├── firmware_esrt.c         ← ESRT 资源表读取
+│   │   └── firmware_capsule.c      ← Capsule 更新
+│   └── 初始化/清理
+│       ├── firmware_init()         ← 模块加载
+│       └── firmware_exit()         ← 模块卸载
+│
+└── 用户态服务 (hwrun-firmwared)
+    ├── fwupd 集成
+    │   ├── fwupd_client.c          ← fwupd 客户端
+    │   ├── device_list.c           ← 设备列表
+    │   └── device_update.c         ← 设备更新
+    ├── BIOS 设置解析
+    │   ├── hii_parser.c            ← HII 表单解析
+    │   └── setting_list.c          ← 设置项列表
+    └── 安全验证
+        ├── signature_verify.c      ← 签名验证
+        └── rollback_protect.c      ← 回滚保护
+```
+
+2.2 FIRMWARE 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → FIRMWARE → 其他插件
+                                                                                                                              ↑
+                                                                                                                    FIRMWARE 在这里加载
+```
+
+FIRMWARE 插件在 CONSENSUS 之后加载，为系统提供固件管理能力，是 BOOT 和 SECURITY 插件的补充。
+
+2.3 FIRMWARE 的上层消费者
+
+上层插件 需要 FIRMWARE 提供什么
+BOOT (引导协议) 查询/修改 UEFI 启动项
+SECURITY (安全协议) 安全启动状态查询、配置
+SYSTEM_STATE (系统状态) 固件版本信息
+MONITOR (监控) 固件健康状态监控
+PKGMGR (包管理) 固件更新包安装
+
+三、核心数据结构
+
+```c
+// firmware/include/firmware.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   固件类型
+   ============================================================ */
+typedef enum {
+    FIRMWARE_TYPE_UEFI = 0,         // UEFI 固件
+    FIRMWARE_TYPE_BIOS,             // Legacy BIOS
+    FIRMWARE_TYPE_UNKNOWN,
+} firmware_type_t;
+
+/* ============================================================
+   固件信息
+   ============================================================ */
+typedef struct firmware_info {
+    firmware_type_t type;           // 固件类型
+    char vendor[64];                // 厂商名称
+    char version[64];               // 固件版本
+    char date[32];                  // 发布日期
+    uint64_t release_date;          // 发布日期 (Unix 时间戳)
+    char product_name[128];         // 产品名称
+    char serial[64];                // 序列号
+    uint32_t smbios_version;        // SMBIOS 版本
+    int secure_boot_enabled;        // 安全启动是否启用
+    int tpm_present;                // TPM 是否存在
+    int uefi_boot;                  // 是否 UEFI 启动
+    uint32_t memory_size_mb;        // 内存大小
+    uint32_t cpu_count;             // CPU 数量
+} firmware_info_t;
+
+/* ============================================================
+   固件设置项
+   ============================================================ */
+typedef enum {
+    FIRMWARE_SETTING_TYPE_BOOLEAN = 0,
+    FIRMWARE_SETTING_TYPE_INTEGER,
+    FIRMWARE_SETTING_TYPE_STRING,
+    FIRMWARE_SETTING_TYPE_ENUM,
+    FIRMWARE_SETTING_TYPE_PASSWORD,
+} firmware_setting_type_t;
+
+typedef struct firmware_setting {
+    char name[128];                 // 设置名称
+    char description[256];          // 描述
+    firmware_setting_type_t type;   // 类型
+    char current_value[256];        // 当前值
+    char default_value[256];        // 默认值
+    char **options;                 // 枚举选项 (仅 ENUM 类型)
+    uint32_t options_count;
+    int readonly;                   // 是否只读
+    int requires_reboot;            // 修改后是否需要重启
+    struct firmware_setting *next;
+} firmware_setting_t;
+
+/* ============================================================
+   固件更新信息
+   ============================================================ */
+typedef struct firmware_update_info {
+    char version[64];               // 新版本号
+    char description[256];          // 更新描述
+    uint64_t size;                  // 更新包大小 (字节)
+    char checksum[128];             // 校验和
+    char url[256];                  // 下载地址
+    int critical;                   // 是否关键更新
+    int requires_reboot;            // 是否需要重启
+    uint64_t release_date;          // 发布日期
+} firmware_update_info_t;
+
+/* ============================================================
+   固件设备 (用于 fwupd 集成)
+   ============================================================ */
+typedef struct firmware_device {
+    char id[64];                    // 设备 ID
+    char name[128];                 // 设备名称
+    char vendor[64];                // 厂商
+    char version[64];               // 当前固件版本
+    char version_format[32];        // 版本格式
+    int updatable;                  // 是否可更新
+    uint64_t created_at;            // 创建时间
+    struct firmware_device *next;
+} firmware_device_t;
+
+/* ============================================================
+   FIRMWARE 上下文
+   ============================================================ */
+typedef struct firmware_context {
+    int initialized;
+    uint64_t firmware_task_id;      // FIRMWARE 自身的任务 ID
+    
+    firmware_info_t info;           // 固件信息
+    firmware_setting_t *settings;   // 固件设置列表
+    firmware_device_t *devices;     // 固件设备列表
+    
+    int efivarfs_available;         // efivarfs 是否可用
+    int esrt_available;             // ESRT 是否可用
+    
+    void *lock;
+} firmware_context_t;
+```
+
+四、FIRMWARE 协议定义
+
+```protobuf
+// protocols/firmware.proto
+syntax = "proto3";
+
+package hwrun.firmware;
+
+service Firmware {
+    // === 固件信息 ===
+    rpc GetInfo(Empty) returns (GetInfoResponse);
+    rpc GetVersion(Empty) returns (GetVersionResponse);
+    
+    // === 固件设置 ===
+    rpc GetSettings(Empty) returns (GetSettingsResponse);
+    rpc GetSetting(GetSettingRequest) returns (GetSettingResponse);
+    rpc SetSetting(SetSettingRequest) returns (SetSettingResponse);
+    
+    // === 固件更新 ===
+    rpc CheckUpdate(Empty) returns (CheckUpdateResponse);
+    rpc Update(UpdateRequest) returns (UpdateResponse);
+    rpc GetUpdateStatus(Empty) returns (UpdateStatusResponse);
+    
+    // === 固件设备 (fwupd) ===
+    rpc ListDevices(Empty) returns (ListDevicesResponse);
+    rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
+    rpc UpdateDevice(UpdateDeviceRequest) returns (UpdateDeviceResponse);
+    
+    // === 安全启动 ===
+    rpc GetSecureBootStatus(Empty) returns (SecureBootStatusResponse);
+    rpc SetSecureBoot(SetSecureBootRequest) returns (SetSecureBootResponse);
+}
+
+message Empty {}
+
+// ============ 固件信息 ============
+
+message FirmwareInfo {
+    string type = 1;                // "UEFI" / "BIOS"
+    string vendor = 2;
+    string version = 3;
+    string date = 4;
+    string product_name = 5;
+    string serial = 6;
+    bool secure_boot_enabled = 7;
+    bool tpm_present = 8;
+    bool uefi_boot = 9;
+    uint32 memory_size_mb = 10;
+    uint32 cpu_count = 11;
+}
+
+message GetInfoResponse {
+    FirmwareInfo info = 1;
+    int32 error = 2;
+}
+
+message GetVersionResponse {
+    string version = 1;
+    string date = 2;
+    int32 error = 3;
+}
+
+// ============ 固件设置 ============
+
+message FirmwareSetting {
+    string name = 1;
+    string description = 2;
+    uint32 type = 3;                // firmware_setting_type_t
+    string current_value = 4;
+    string default_value = 5;
+    repeated string options = 6;
+    bool readonly = 7;
+    bool requires_reboot = 8;
+}
+
+message GetSettingsResponse {
+    repeated FirmwareSetting settings = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetSettingRequest {
+    string name = 1;
+}
+
+message GetSettingResponse {
+    FirmwareSetting setting = 1;
+    int32 error = 2;
+}
+
+message SetSettingRequest {
+    string name = 1;
+    string value = 2;
+}
+
+message SetSettingResponse {
+    bool success = 1;
+    bool requires_reboot = 2;
+    int32 error = 3;
+}
+
+// ============ 固件更新 ============
+
+message UpdateInfo {
+    string version = 1;
+    string description = 2;
+    uint64 size = 3;
+    string checksum = 4;
+    string url = 5;
+    bool critical = 6;
+    bool requires_reboot = 7;
+}
+
+message CheckUpdateResponse {
+    bool available = 1;
+    UpdateInfo update = 2;
+    int32 error = 3;
+}
+
+message UpdateRequest {
+    bytes firmware_data = 1;        // 固件数据
+    string checksum = 2;            // 校验和 (可选)
+}
+
+message UpdateResponse {
+    bool success = 1;
+    bool requires_reboot = 2;
+    string message = 3;
+    int32 error = 4;
+}
+
+message UpdateStatusResponse {
+    string status = 1;              // "idle", "updating", "pending_reboot", "failed"
+    uint32 progress = 2;            // 0-100
+    string error = 3;
+}
+
+// ============ 固件设备 ============
+
+message FirmwareDevice {
+    string id = 1;
+    string name = 2;
+    string vendor = 3;
+    string version = 4;
+    string version_format = 5;
+    bool updatable = 6;
+}
+
+message ListDevicesResponse {
+    repeated FirmwareDevice devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetDeviceRequest {
+    string device_id = 1;
+}
+
+message GetDeviceResponse {
+    FirmwareDevice device = 1;
+    int32 error = 2;
+}
+
+message UpdateDeviceRequest {
+    string device_id = 1;
+    bytes firmware_data = 2;
+    string checksum = 3;
+}
+
+message UpdateDeviceResponse {
+    bool success = 1;
+    bool requires_reboot = 2;
+    string message = 3;
+    int32 error = 4;
+}
+
+// ============ 安全启动 ============
+
+message SecureBootStatusResponse {
+    bool enabled = 1;
+    bool setup_mode = 2;
+    bool secure_boot_mode = 3;
+    string error = 4;
+}
+
+message SetSecureBootRequest {
+    bool enabled = 1;
+}
+
+message SetSecureBootResponse {
+    bool success = 1;
+    bool requires_reboot = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// firmware/src/firmware.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/efi.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
+
+#include "firmware.h"
+#include "firmware_ipc.h"
+#include "firmware_efivar.h"
+#include "firmware_esrt.h"
+#include "firmware_capsule.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Firmware Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static firmware_context_t g_fw_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init firmware_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun FIRMWARE: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_fw_ctx, 0, sizeof(firmware_context_t));
+    
+    // 2. 检测 efivarfs 是否可用
+    g_fw_ctx.efivarfs_available = firmware_efivarfs_check();
+    if (g_fw_ctx.efivarfs_available) {
+        printk(KERN_INFO "HWRun FIRMWARE: efivarfs available\n");
+    } else {
+        printk(KERN_WARNING "HWRun FIRMWARE: efivarfs not available\n");
+    }
+    
+    // 3. 检测 ESRT 是否可用
+    g_fw_ctx.esrt_available = firmware_esrt_check();
+    if (g_fw_ctx.esrt_available) {
+        printk(KERN_INFO "HWRun FIRMWARE: ESRT available\n");
+    }
+    
+    // 4. 获取固件信息
+    ret = firmware_get_info(&g_fw_ctx.info);
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun FIRMWARE: Failed to get firmware info\n");
+    }
+    
+    // 5. 注册 IPC 消息处理器
+    ret = firmware_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun FIRMWARE: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 6. 注册 FIRMWARE 协议
+    firmware_register_protocol();
+    
+    g_fw_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun FIRMWARE: Initialized successfully\n");
+    printk(KERN_INFO "  Firmware: %s %s %s\n",
+           g_fw_ctx.info.vendor,
+           g_fw_ctx.info.version,
+           g_fw_ctx.info.date);
+    printk(KERN_INFO "  Secure Boot: %s\n",
+           g_fw_ctx.info.secure_boot_enabled ? "enabled" : "disabled");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit firmware_exit(void) {
+    printk(KERN_INFO "HWRun FIRMWARE: Exiting...\n");
+    
+    firmware_ipc_unregister();
+    firmware_cleanup_settings(&g_fw_ctx);
+    firmware_cleanup_devices(&g_fw_ctx);
+    
+    g_fw_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun FIRMWARE: Exited\n");
+}
+
+module_init(firmware_init);
+module_exit(firmware_exit);
+```
+
+5.2 efivarfs 封装
+
+efivarfs 是 Linux 内核提供的 UEFI 变量文件系统，挂载在 /sys/firmware/efi/efivars。UEFI 变量通过文件系统中的文件暴露，文件名格式为 {VariableName}-{VendorGuid}。UEFI 变量支持通过 libefivar 库操作。
+
+```c
+// firmware/src/firmware_efivar.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/efi.h>
+#include <linux/uaccess.h>
+
+#include "firmware.h"
+
+#define EFIVARFS_PATH "/sys/firmware/efi/efivars"
+#define EFI_GLOBAL_VARIABLE_GUID "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+/* ============================================================
+   检测 efivarfs 是否可用
+   ============================================================ */
+int firmware_efivarfs_check(void) {
+    struct file *file;
+    int ret;
+    
+    // 检查 efivarfs 是否挂载
+    file = filp_open(EFIVARFS_PATH, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(file)) {
+        return 0;
+    }
+    filp_close(file, NULL);
+    
+    // 检查是否支持 UEFI 变量
+    ret = efi_variables_supported();
+    if (ret <= 0) {
+        return 0;
+    }
+    
+    return 1;
+}
+
+/* ============================================================
+   读取 UEFI 变量
+   ============================================================ */
+int firmware_efivar_read(const char *name, const char *guid,
+                          uint8_t *data, uint32_t *data_size,
+                          uint32_t *attributes) {
+    char path[256];
+    struct file *file;
+    ssize_t ret;
+    loff_t pos = 0;
+    
+    // 构建变量路径
+    snprintf(path, sizeof(path), "%s/%s-%s", EFIVARFS_PATH, name, guid);
+    
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        return PTR_ERR(file);
+    }
+    
+    // 读取变量数据
+    ret = kernel_read(file, data, *data_size, &pos);
+    if (ret < 0) {
+        filp_close(file, NULL);
+        return ret;
+    }
+    
+    *data_size = ret;
+    
+    // 读取属性 (从文件 inode 中获取)
+    // 实际实现中需要从文件属性中提取
+    if (attributes) {
+        *attributes = 0;
+    }
+    
+    filp_close(file, NULL);
+    return 0;
+}
+
+/* ============================================================
+   写入 UEFI 变量
+   ============================================================ */
+int firmware_efivar_write(const char *name, const char *guid,
+                           const uint8_t *data, uint32_t data_size,
+                           uint32_t attributes) {
+    char path[256];
+    struct file *file;
+    ssize_t ret;
+    loff_t pos = 0;
+    
+    // 构建变量路径
+    snprintf(path, sizeof(path), "%s/%s-%s", EFIVARFS_PATH, name, guid);
+    
+    file = filp_open(path, O_WRONLY | O_CREAT, 0644);
+    if (IS_ERR(file)) {
+        return PTR_ERR(file);
+    }
+    
+    ret = kernel_write(file, data, data_size, &pos);
+    
+    filp_close(file, NULL);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   删除 UEFI 变量
+   ============================================================ */
+int firmware_efivar_delete(const char *name, const char *guid) {
+    char path[256];
+    
+    snprintf(path, sizeof(path), "%s/%s-%s", EFIVARFS_PATH, name, guid);
+    
+    return sysfs_remove_file(NULL, path);
+}
+```
+
+5.3 UEFI 变量与 EFI 运行时服务
+
+UEFI 运行时服务通过 include/linux/efi.h 中的 efi 结构体暴露。核心的变量操作函数包括：
+
+· efi.get_variable()：获取 UEFI 变量
+· efi.set_variable()：设置 UEFI 变量
+· efi.get_next_variable()：枚举变量
+
+这些函数通过 efi_runtime_services 结构体调用，在系统运行时可用。
+
+```c
+// firmware/src/firmware_efi_runtime.c
+
+#include <linux/efi.h>
+#include <linux/slab.h>
+#include <linux/uuid.h>
+#include <linux/string.h>
+
+#include "firmware.h"
+
+/* ============================================================
+   通过 EFI Runtime Services 读取 UEFI 变量
+   ============================================================ */
+int firmware_efi_runtime_get_variable(const char *name, const efi_guid_t *guid,
+                                       uint32_t *attributes, void *data,
+                                       unsigned long *data_size) {
+    efi_status_t status;
+    unsigned long size = *data_size;
+    
+    if (!efi.get_variable) {
+        return -ENOSYS;
+    }
+    
+    status = efi.get_variable((char *)name, (efi_guid_t *)guid,
+                               attributes, &size, data);
+    if (status != EFI_SUCCESS) {
+        return -EIO;
+    }
+    
+    *data_size = size;
+    return 0;
+}
+
+/* ============================================================
+   通过 EFI Runtime Services 设置 UEFI 变量
+   ============================================================ */
+int firmware_efi_runtime_set_variable(const char *name, const efi_guid_t *guid,
+                                       uint32_t attributes, const void *data,
+                                       unsigned long data_size) {
+    efi_status_t status;
+    
+    if (!efi.set_variable) {
+        return -ENOSYS;
+    }
+    
+    status = efi.set_variable((char *)name, (efi_guid_t *)guid,
+                               attributes, data_size, (void *)data);
+    if (status != EFI_SUCCESS) {
+        return -EIO;
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   读取安全启动状态 (通过 UEFI 变量)
+   ============================================================ */
+int firmware_get_secure_boot_status(int *enabled, int *setup_mode) {
+    uint8_t data[256];
+    unsigned long size = sizeof(data);
+    uint32_t attributes;
+    efi_guid_t guid = EFI_GLOBAL_VARIABLE_GUID;
+    int ret;
+    
+    // 读取 SecureBoot 变量
+    ret = firmware_efi_runtime_get_variable("SecureBoot", &guid,
+                                             &attributes, data, &size);
+    if (ret == 0 && size >= 1) {
+        *enabled = (data[0] == 1);
+    } else {
+        *enabled = 0;
+    }
+    
+    // 读取 SetupMode 变量
+    size = sizeof(data);
+    ret = firmware_efi_runtime_get_variable("SetupMode", &guid,
+                                             &attributes, data, &size);
+    if (ret == 0 && size >= 1) {
+        *setup_mode = (data[0] == 1);
+    } else {
+        *setup_mode = 0;
+    }
+    
+    return 0;
+}
+```
+
+5.4 ESRT (EFI 系统资源表)
+
+ESRT (EFI System Resource Table) 是 UEFI 2.5 引入的表，用于描述系统中可更新的固件资源。Linux 内核通过 /sys/firmware/efi/esrt/ 目录暴露 ESRT 信息。
+
+```c
+// firmware/src/firmware_esrt.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/efi.h>
+
+#include "firmware.h"
+
+/* ============================================================
+   检测 ESRT 是否可用
+   ============================================================ */
+int firmware_esrt_check(void) {
+    struct file *file;
+    
+    file = filp_open("/sys/firmware/efi/esrt/", O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(file)) {
+        return 0;
+    }
+    filp_close(file, NULL);
+    
+    return 1;
+}
+
+/* ============================================================
+   读取 ESRT 固件资源信息
+   ============================================================ */
+int firmware_esrt_get_entries(firmware_update_info_t **out, uint32_t *count) {
+    // 实际实现中读取 /sys/firmware/efi/esrt/ 下的文件
+    // 每个固件资源对应一个子目录
+    
+    // ESRT 条目包含:
+    // - fw_class: 固件类 GUID
+    // - fw_type: 固件类型
+    // - fw_version: 当前版本
+    // - lowest_supported_fw_version: 最低支持版本
+    // - capsule_flags: 胶囊标志
+    // - last_attempt_version: 上次尝试的版本
+    // - last_attempt_status: 上次尝试的状态
+    
+    return 0;
+}
+```
+
+5.5 UEFI Capsule 更新
+
+UEFI Capsule 是 UEFI 规范定义的固件更新机制。内核提供 /dev/efi_capsule_loader 字符设备用于提交胶囊更新。
+
+```c
+// firmware/src/firmware_capsule.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
+
+#include "firmware.h"
+
+#define CAPSULE_DEVICE "/dev/efi_capsule_loader"
+
+/* ============================================================
+   提交 UEFI Capsule 更新
+   ============================================================ */
+int firmware_capsule_update(const uint8_t *data, uint32_t data_size) {
+    struct file *file;
+    ssize_t ret;
+    loff_t pos = 0;
+    
+    // 打开 Capsule 设备
+    file = filp_open(CAPSULE_DEVICE, O_WRONLY, 0);
+    if (IS_ERR(file)) {
+        return PTR_ERR(file);
+    }
+    
+    // 写入胶囊数据
+    ret = kernel_write(file, data, data_size, &pos);
+    
+    filp_close(file, NULL);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   检查 Capsule 更新是否支持
+   ============================================================ */
+int firmware_capsule_supported(void) {
+    struct file *file;
+    
+    file = filp_open(CAPSULE_DEVICE, O_WRONLY, 0);
+    if (IS_ERR(file)) {
+        return 0;
+    }
+    filp_close(file, NULL);
+    
+    return 1;
+}
+```
+
+5.6 固件信息获取
+
+```c
+// firmware/src/firmware_info.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/dmi.h>
+#include <linux/efi.h>
+
+#include "firmware.h"
+
+/* ============================================================
+   获取固件信息
+   ============================================================ */
+int firmware_get_info(firmware_info_t *info) {
+    const struct dmi_system_id *id;
+    struct file *file;
+    char buf[256];
+    loff_t pos = 0;
+    ssize_t ret;
+    
+    memset(info, 0, sizeof(firmware_info_t));
+    
+    // 1. 检测固件类型 (UEFI / BIOS)
+    if (efi_enabled(EFI_BOOT)) {
+        info->type = FIRMWARE_TYPE_UEFI;
+        info->uefi_boot = 1;
+    } else {
+        info->type = FIRMWARE_TYPE_BIOS;
+        info->uefi_boot = 0;
+    }
+    
+    // 2. 从 DMI/SMBIOS 获取信息
+    // DMI 信息通过 /sys/devices/virtual/dmi/id/ 暴露
+    
+    // 厂商
+    file = filp_open("/sys/devices/virtual/dmi/id/sys_vendor", O_RDONLY, 0);
+    if (!IS_ERR(file)) {
+        ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            strncpy(info->vendor, buf, sizeof(info->vendor) - 1);
+            // 去除换行符
+            char *nl = strchr(info->vendor, '\n');
+            if (nl) *nl = '\0';
+        }
+        filp_close(file, NULL);
+    }
+    
+    // 产品名称
+    pos = 0;
+    file = filp_open("/sys/devices/virtual/dmi/id/product_name", O_RDONLY, 0);
+    if (!IS_ERR(file)) {
+        ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            strncpy(info->product_name, buf, sizeof(info->product_name) - 1);
+            char *nl = strchr(info->product_name, '\n');
+            if (nl) *nl = '\0';
+        }
+        filp_close(file, NULL);
+    }
+    
+    // BIOS 版本
+    pos = 0;
+    file = filp_open("/sys/devices/virtual/dmi/id/bios_version", O_RDONLY, 0);
+    if (!IS_ERR(file)) {
+        ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            strncpy(info->version, buf, sizeof(info->version) - 1);
+            char *nl = strchr(info->version, '\n');
+            if (nl) *nl = '\0';
+        }
+        filp_close(file, NULL);
+    }
+    
+    // 序列号
+    pos = 0;
+    file = filp_open("/sys/devices/virtual/dmi/id/product_serial", O_RDONLY, 0);
+    if (!IS_ERR(file)) {
+        ret = kernel_read(file, buf, sizeof(buf) - 1, &pos);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            strncpy(info->serial, buf, sizeof(info->serial) - 1);
+            char *nl = strchr(info->serial, '\n');
+            if (nl) *nl = '\0';
+        }
+        filp_close(file, NULL);
+    }
+    
+    // 3. 获取安全启动状态
+    firmware_get_secure_boot_status(&info->secure_boot_enabled, NULL);
+    
+    // 4. 检查 TPM
+    // 通过 /sys/class/tpm/ 检测
+    file = filp_open("/sys/class/tpm/", O_RDONLY | O_DIRECTORY, 0);
+    if (!IS_ERR(file)) {
+        info->tpm_present = 1;
+        filp_close(file, NULL);
+    }
+    
+    return 0;
+}
+```
+
+5.7 固件设置管理 (BIOS 设置)
+
+UEFI 固件设置通过 HII (Human Interface Infrastructure) 表单管理，可以通过 UEFI 变量访问。Linux 内核通过 RCI2 (Runtime Configuration Interface) 表提供 BIOS 设置访问。
+
+```c
+// firmware/src/firmware_settings.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/efi.h>
+
+#include "firmware.h"
+
+/* ============================================================
+   列出固件设置
+   ============================================================ */
+int firmware_list_settings(firmware_setting_t **out) {
+    // 实际实现中需要解析 UEFI HII 表单
+    // 或通过 RCI2 表获取 BIOS 设置
+    
+    // RCI2 表包含 BIOS HII 的 XML 格式数据[reference:18]
+    // 可以通过 /sys/firmware/efi/tables/RCI2 读取
+    
+    // 这里给出框架
+    *out = NULL;
+    return 0;
+}
+
+/* ============================================================
+   修改固件设置
+   ============================================================ */
+int firmware_set_setting(const char *name, const char *value) {
+    // 实际实现中通过 UEFI 变量写入
+    // 设置项通常存储在 "Setup" 变量中
+    
+    // 1. 读取 Setup 变量
+    // 2. 解析二进制结构
+    // 3. 修改对应字段
+    // 4. 写回 Setup 变量
+    
+    return 0;
+}
+```
+
+5.8 IPC 消息处理
+
+```c
+// firmware/src/firmware_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "firmware.h"
+#include "firmware_ipc.h"
+#include "firmware_efivar.h"
+#include "firmware_capsule.h"
+#include "firmware_settings.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void firmware_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case FIRMWARE_MSG_GET_INFO: {
+            firmware_info_t info;
+            firmware_get_info(&info);
+            ipc_reply(from_task, &info, sizeof(info));
+            break;
+        }
+        
+        case FIRMWARE_MSG_GET_VERSION: {
+            firmware_info_t info;
+            firmware_get_info(&info);
+            ipc_reply(from_task, info.version, strlen(info.version) + 1);
+            break;
+        }
+        
+        case FIRMWARE_MSG_GET_SETTINGS: {
+            firmware_setting_t *settings;
+            firmware_list_settings(&settings);
+            ipc_reply(from_task, settings, 0);  // 实际实现中需要序列化
+            break;
+        }
+        
+        case FIRMWARE_MSG_SET_SETTING: {
+            firmware_set_setting_req_t *req = (firmware_set_setting_req_t *)data;
+            int ret = firmware_set_setting(req->name, req->value);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case FIRMWARE_MSG_UPDATE: {
+            firmware_update_req_t *req = (firmware_update_req_t *)data;
+            int ret = firmware_capsule_update(req->data, req->data_len);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case FIRMWARE_MSG_GET_SECURE_BOOT: {
+            int enabled, setup_mode;
+            firmware_get_secure_boot_status(&enabled, &setup_mode);
+            // 返回状态
+            ipc_reply(from_task, NULL, 0);
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun FIRMWARE: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、用户态服务 (fwupd 集成)
+
+```c
+// firmware/userspace/fwupd_client.c
+
+#include <fwupd.h>
+#include <glib.h>
+#include <gio/gio.h>
+
+#include "firmware.h"
+
+/* ============================================================
+   初始化 fwupd 客户端
+   ============================================================ */
+static FwupdClient *fwupd_client = NULL;
+
+int firmware_fwupd_init(void) {
+    fwupd_client = fwupd_client_new();
+    if (!fwupd_client) {
+        return -1;
+    }
+    
+    // 设置超时
+    fwupd_client_set_timeout(fwupd_client, 30);
+    
+    // 连接 daemon
+    g_autoptr(GError) error = NULL;
+    if (!fwupd_client_connect(fwupd_client, NULL, &error)) {
+        g_warning("Failed to connect to fwupd daemon: %s", error->message);
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   列出所有可更新的设备
+   ============================================================ */
+int firmware_fwupd_list_devices(firmware_device_t **out) {
+    g_autoptr(GPtrArray) devices = NULL;
+    g_autoptr(GError) error = NULL;
+    firmware_device_t *list = NULL;
+    int count = 0;
+    
+    devices = fwupd_client_get_devices(fwupd_client, NULL, &error);
+    if (!devices) {
+        return -1;
+    }
+    
+    for (guint i = 0; i < devices->len; i++) {
+        FwupdDevice *dev = g_ptr_array_index(devices, i);
+        if (!fwupd_device_has_flag(dev, FWUPD_DEVICE_FLAG_UPDATABLE)) {
+            continue;
+        }
+        
+        firmware_device_t *entry = malloc(sizeof(firmware_device_t));
+        if (!entry) break;
+        
+        memset(entry, 0, sizeof(firmware_device_t));
+        strncpy(entry->id, fwupd_device_get_id(dev), sizeof(entry->id) - 1);
+        strncpy(entry->name, fwupd_device_get_name(dev), sizeof(entry->name) - 1);
+        strncpy(entry->vendor, fwupd_device_get_vendor(dev), sizeof(entry->vendor) - 1);
+        strncpy(entry->version, fwupd_device_get_version(dev), sizeof(entry->version) - 1);
+        entry->updatable = 1;
+        
+        entry->next = list;
+        list = entry;
+        count++;
+    }
+    
+    *out = list;
+    return count;
+}
+```
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/firmware.yml
+firmware:
+  # 固件更新
+  update:
+    # 更新源 (LVFS 或其他)
+    source: "https://fwupd.org/downloads/"
+    # 自动检查更新
+    auto_check: true
+    # 检查间隔 (小时)
+    check_interval: 24
+    # 自动安装安全更新
+    auto_install_security: false
+  
+  # 安全启动
+  secure_boot:
+    # 是否允许修改安全启动设置
+    allow_modify: true
+  
+  # 固件设置
+  settings:
+    # 是否允许修改固件设置
+    allow_modify: true
+    # 修改后是否自动重启
+    auto_reboot: false
+```
+
+八、命令行接口
+
+```bash
+# 固件信息
+hwrun firmware info
+# 输出:
+# 类型: UEFI
+# 厂商: Dell Inc.
+# 版本: 2.15.0
+# 日期: 2024-01-15
+# 安全启动: 启用
+
+hwrun firmware version
+
+# 固件设置
+hwrun firmware settings list
+hwrun firmware settings get "Boot Order"
+hwrun firmware settings set "Boot Order" "HDD,USB,CDROM"
+
+# 固件更新
+hwrun firmware check-update
+hwrun firmware update /path/to/firmware.bin
+hwrun firmware update-status
+
+# 固件设备 (fwupd)
+hwrun firmware devices
+hwrun firmware device info <device-id>
+hwrun firmware device update <device-id> /path/to/firmware.bin
+
+# 安全启动
+hwrun firmware secure-boot status
+hwrun firmware secure-boot enable
+hwrun firmware secure-boot disable
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+```yaml
+# plugins/firmware/plugin.yml
+plugin:
+  id: "firmware"
+  name: "Firmware Management Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 固件管理协议，提供 UEFI/BIOS 固件信息查询、设置管理、固件更新、安全启动配置等功能"
+  
+  provides:
+    - protocol: "FIRMWARE"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "STORAGE"
+      version: "1.0"
+  
+  params:
+    - key: "firmware.update.auto_check"
+      type: "bool"
+      default: true
+      description: "是否自动检查固件更新"
+    - key: "firmware.update.check_interval"
+      type: "int"
+      default: 24
+      description: "检查间隔 (小时)"
+    - key: "firmware.secure_boot.allow_modify"
+      type: "bool"
+      default: true
+      description: "是否允许修改安全启动设置"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/firmware.ko"
+    - "/usr/bin/hwrun-firmwared"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+9.2 构建脚本
+
+```makefile
+# firmware/Makefile
+
+obj-m += firmware.o
+
+firmware-objs := firmware.o firmware_efivar.o \
+                 firmware_esrt.o firmware_capsule.o \
+                 firmware_info.o firmware_settings.o \
+                 firmware_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 firmware.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-firmwared /usr/bin/
+```
+
+9.3 安装后脚本
+
+```bash
+#!/bin/bash
+# firmware/scripts/post_install.sh
+
+# 加载 FIRMWARE 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/firmware.ko
+
+if [ $? -eq 0 ]; then
+    echo "FIRMWARE kernel module loaded successfully"
+    
+    # 检查 efivarfs 是否挂载
+    if [ -d /sys/firmware/efi/efivars ]; then
+        echo "efivarfs available"
+    else
+        echo "Warning: efivarfs not available"
+    fi
+else
+    echo "Failed to load FIRMWARE kernel module"
+    exit 1
+fi
+```
+
+十、总结
+
+维度 决策
+定位 固件管理协议，所有固件操作的统一入口
+实现方式 Linux 内核模块 + 用户态服务
+代码量 ~1500-2000 行 C
+提供协议 FIRMWARE (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + STORAGE
+核心接口 efivarfs、EFI Runtime Services、ESRT、UEFI Capsule、fwupd
+关键功能 固件信息查询、设置管理、固件更新、安全启动配置、设备固件管理
+
+FIRMWARE 是 HWRun OS 中固件管理的核心插件。它基于 Linux 内核的 efivarfs、EFI Runtime Services、ESRT 和 UEFI Capsule 接口，通过 FIRMWARE 协议向上层插件提供固件信息查询、固件设置管理、固件更新、安全启动配置、设备固件管理等完整的固件管理功能。上层插件（BOOT、SECURITY、SYSTEM_STATE、MONITOR、PKGMGR 等）通过 FIRMWARE 协议进行固件操作，不直接操作 efivarfs 或 EFI Runtime Services。

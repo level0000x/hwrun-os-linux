@@ -1,0 +1,1437 @@
+﻿HWRun OS GIT 实现文档
+
+模块名称： GIT
+版本： 1.0.0
+状态： 设计冻结
+定位： Git 版本控制系统封装层，系统的“时间机器”
+实现语言： C
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）
+提供协议： GIT
+
+一、设计哲学
+
+1.1 核心定位
+
+GIT 是 HWRun OS 的“时间机器”——所有系统状态、配置、插件源码都通过 Git 管理，一切操作皆可追溯、可回滚。GIT 插件本身是一个薄封装层，所有实际操作由系统 /usr/bin/git 命令完成，额外提供统一的调用入口、审计日志和历史管理。
+
+```
+GIT 插件 = 系统 Git 的封装 + 审计日志 + 自动历史管理
+```
+
+1.2 设计原则
+
+1. 薄封装：GIT 插件不重新实现 Git，所有实际操作由系统 /usr/bin/git 完成
+2. 统一入口：所有 Git 操作通过 GIT 插件进行，不直接调用 git 命令
+3. 审计日志：所有 Git 操作记录到独立的审计仓库
+4. 自动 commit：关键操作（参数变更、插件安装/卸载）自动 commit
+5. Tag 保护：有 tag 的 commit 永久保留，永不合并
+6. 历史压缩：自动合并历史，控制仓库大小
+7. 集群同步：多节点通过 Git 同步系统状态
+
+1.3 Git 在 HWRun OS 中的使用方式
+
+HWRun OS 的 GIT 插件调用系统 /usr/bin/git 命令（通过 popen() 或 fork()+exec()）来执行 Git 操作。
+
+1.4 审计仓库
+
+所有 Git 操作记录到独立的审计仓库：
+
+```
+主仓库（系统状态）                    审计仓库（操作记录）
+/var/lib/hwrun/git/                  /var/lib/hwrun/git-audit/
+├── .git/                            ├── .git/
+├── params/                          └── audit.log
+├── protocols/
+└── plugins/
+```
+
+审计日志格式（JSON Lines）：
+
+```json
+{"ts":1694160735,"user":"system","op":"commit","target":"a1b2c3d","msg":"修改调度策略","result":"success"}
+{"ts":1694160800,"user":"admin","op":"tag","target":"v1.0.0","msg":"","result":"success"}
+```
+
+二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GIT — 版本控制系统封装层                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    GIT 协议接口                                        │  │
+│  │  Init / Clone / Add / Commit / Push / Pull / Tag / Checkout         │  │
+│  │  Reset / Revert / Log / Blame / Diff / Branch / Merge / Compact     │  │
+│  │  Size / Status / Audit                                              │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    Git 命令执行器 (Git Executor)                      │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  git_execute(cmd) → 调用 /usr/bin/git + 记录审计日志            │ │  │
+│  │  │  使用 popen() 执行 git 命令                                    │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    审计日志 (Audit Log)                               │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  所有 Git 操作记录到 /var/lib/hwrun/git-audit/audit.log        │ │  │
+│  │  │  格式: JSON Lines                                               │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    历史压缩器 (History Compactor)                     │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  触发条件: 仓库大小 > 阈值 (默认 1GB)                          │ │  │
+│  │  │  合并策略: 按时间线自动调整粒度                                 │ │  │
+│  │  │  粒度曲线: 越近越细，越远越粗                                   │ │  │
+│  │  │  Tag 保护: 有 tag 的提交永久保留                                │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    /usr/bin/git (系统命令)                            │  │
+│  │  所有 Git 操作由系统命令实际执行                                      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    依赖的微内核接口                                    │  │
+│  │  ├── ipc_send()         → 发送 Git 操作结果                         │  │
+│  │  ├── ipc_recv()         → 接收 Git 操作请求                         │  │
+│  │  ├── kmalloc()          → 内存分配                                   │  │
+│  │  └── kfree()            → 内存释放                                   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+三、核心数据结构
+
+```c
+// git/include/git.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   Git 操作类型
+   ============================================================ */
+typedef enum {
+    GIT_OP_INIT,
+    GIT_OP_CLONE,
+    GIT_OP_ADD,
+    GIT_OP_COMMIT,
+    GIT_OP_PUSH,
+    GIT_OP_PULL,
+    GIT_OP_TAG,
+    GIT_OP_CHECKOUT,
+    GIT_OP_RESET,
+    GIT_OP_REVERT,
+    GIT_OP_LOG,
+    GIT_OP_BLAME,
+    GIT_OP_DIFF,
+    GIT_OP_BRANCH,
+    GIT_OP_MERGE,
+    GIT_OP_COMPACT,
+    GIT_OP_SIZE,
+    GIT_OP_STATUS,
+    GIT_OP_AUDIT,
+} git_op_type_t;
+
+/* ============================================================
+   Git 操作结果
+   ============================================================ */
+typedef struct git_result {
+    int success;
+    int exit_code;                      // git 命令退出码
+    char *stdout_buf;                   // 标准输出
+    size_t stdout_len;
+    char *stderr_buf;                   // 标准错误
+    size_t stderr_len;
+    char error[256];
+} git_result_t;
+
+/* ============================================================
+   Git 配置
+   ============================================================ */
+typedef struct git_config {
+    char repo_path[256];                // /var/lib/hwrun/git/
+    char audit_path[256];               // /var/lib/hwrun/git-audit/
+    char remote_url[256];               // 远程仓库地址
+    char branch[64];                    // 当前分支
+    int auto_commit;                    // 是否自动 commit
+    int auto_push;                      // 是否自动 push
+    
+    // 历史管理
+    uint64_t max_size;                  // 最大仓库大小（字节）
+    int auto_compact;                   // 是否自动压缩
+    
+    // 粒度配置
+    struct {
+        int days;
+        int level;                      // 0=不合并, 1=小时, 2=天, 3=周, 4=月, 5=年
+    } granularity[6];
+    int granularity_count;
+    
+    char **preserve_patterns;           // 永久保留的 tag 模式
+    int preserve_count;
+} git_config_t;
+
+/* ============================================================
+   Commit 信息
+   ============================================================ */
+typedef struct git_commit {
+    char hash[64];
+    char author[128];
+    char date[32];
+    char message[256];
+    struct git_commit *next;
+} git_commit_t;
+
+/* ============================================================
+   审计记录
+   ============================================================ */
+typedef struct git_audit_entry {
+    uint64_t timestamp;
+    char user[64];
+    char operation[32];
+    char target[256];
+    char message[256];
+    char result[16];
+    struct git_audit_entry *next;
+} git_audit_entry_t;
+
+/* ============================================================
+   GIT 上下文
+   ============================================================ */
+typedef struct git_context {
+    git_config_t config;
+    char repo_path[256];
+    char audit_path[256];
+    int initialized;
+    uint64_t git_task_id;               // GIT 自身的任务 ID
+    void *lock;
+} git_context_t;
+
+/* ============================================================
+   GIT 协议消息结构（通过 IPC 调用）
+   ============================================================ */
+
+/* Commit 请求 */
+typedef struct git_commit_req {
+    char message[256];
+} git_commit_req_t;
+
+/* Commit 响应 */
+typedef struct git_commit_resp {
+    int success;
+    char commit_id[64];
+    char error[128];
+} git_commit_resp_t;
+
+/* Clone 请求 */
+typedef struct git_clone_req {
+    char remote[256];
+    char local_path[256];
+} git_clone_req_t;
+
+/* Log 请求 */
+typedef struct git_log_req {
+    int limit;
+    char since[32];
+} git_log_req_t;
+
+/* Compact 请求 */
+typedef struct git_compact_req {
+    int level;
+} git_compact_req_t;
+
+/* Audit 请求 */
+typedef struct git_audit_req {
+    int limit;
+    char user[64];
+    uint64_t since;
+} git_audit_req_t;
+```
+
+四、GIT 协议定义
+
+```protobuf
+// protocols/git.proto
+syntax = "proto3";
+
+package hwrun.git;
+
+service Git {
+    // === 存储管理 ===
+    rpc Init(InitRequest) returns (InitResponse);
+    rpc Clone(CloneRequest) returns (CloneResponse);
+    rpc Add(AddRequest) returns (AddResponse);
+    rpc Commit(CommitRequest) returns (CommitResponse);
+    rpc Push(PushRequest) returns (PushResponse);
+    rpc Pull(PullRequest) returns (PullResponse);
+    
+    // === 版本管理 ===
+    rpc Tag(TagRequest) returns (TagResponse);
+    rpc Checkout(CheckoutRequest) returns (CheckoutResponse);
+    rpc Reset(ResetRequest) returns (ResetResponse);
+    rpc Revert(RevertRequest) returns (RevertResponse);
+    
+    // === 历史查询 ===
+    rpc Log(LogRequest) returns (LogResponse);
+    rpc Blame(BlameRequest) returns (BlameResponse);
+    rpc Diff(DiffRequest) returns (DiffResponse);
+    
+    // === 分支管理 ===
+    rpc Branch(BranchRequest) returns (BranchResponse);
+    rpc Merge(MergeRequest) returns (MergeResponse);
+    
+    // === 历史管理 ===
+    rpc Size(SizeRequest) returns (SizeResponse);
+    rpc Compact(CompactRequest) returns (CompactResponse);
+    rpc Status(StatusRequest) returns (StatusResponse);
+    
+    // === 审计 ===
+    rpc Audit(AuditRequest) returns (AuditResponse);
+}
+
+message InitRequest {
+    string path = 1;
+}
+
+message InitResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message CloneRequest {
+    string remote = 1;
+    string local_path = 2;
+}
+
+message CloneResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message AddRequest {
+    repeated string paths = 1;
+}
+
+message AddResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message CommitRequest {
+    string message = 1;
+}
+
+message CommitResponse {
+    bool success = 1;
+    string commit_id = 2;
+    string error = 3;
+}
+
+message PushRequest {
+    string remote = 1;
+    string branch = 2;
+}
+
+message PushResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message PullRequest {
+    string remote = 1;
+    string branch = 2;
+}
+
+message PullResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message TagRequest {
+    string name = 1;
+    string commit_id = 2;
+}
+
+message TagResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message CheckoutRequest {
+    string ref = 1;
+}
+
+message CheckoutResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ResetRequest {
+    string ref = 1;
+    bool hard = 2;
+}
+
+message ResetResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message RevertRequest {
+    string commit_id = 1;
+}
+
+message RevertResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message LogRequest {
+    uint32 limit = 1;
+    string since = 2;
+}
+
+message LogResponse {
+    repeated CommitEntry entries = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message CommitEntry {
+    string commit_id = 1;
+    string author = 2;
+    string date = 3;
+    string message = 4;
+}
+
+message BlameRequest {
+    string file = 1;
+}
+
+message BlameResponse {
+    repeated BlameLine lines = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message BlameLine {
+    uint32 line_no = 1;
+    string commit_id = 2;
+    string author = 3;
+    string date = 4;
+    string content = 5;
+}
+
+message DiffRequest {
+    string commit1 = 1;
+    string commit2 = 2;
+}
+
+message DiffResponse {
+    string diff = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message BranchRequest {
+    string name = 1;
+    string base = 2;
+}
+
+message BranchResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message MergeRequest {
+    string branch = 1;
+    string message = 2;
+}
+
+message MergeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message SizeRequest {
+}
+
+message SizeResponse {
+    uint64 size_bytes = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message CompactRequest {
+    uint32 level = 1;
+}
+
+message CompactResponse {
+    bool success = 1;
+    uint64 old_size = 2;
+    uint64 new_size = 3;
+    string error = 4;
+}
+
+message StatusRequest {
+}
+
+message StatusResponse {
+    string status = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message AuditRequest {
+    uint32 limit = 1;
+    string user = 2;
+    uint64 since = 3;
+}
+
+message AuditResponse {
+    repeated AuditEntry entries = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message AuditEntry {
+    uint64 timestamp = 1;
+    string user = 2;
+    string operation = 3;
+    string target = 4;
+    string message = 5;
+    string result = 6;
+}
+```
+
+五、核心函数实现
+
+5.1 初始化
+
+```c
+// git/src/git.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#include "git.h"
+#include "kernel_ipc.h"
+#include "kernel_task.h"
+#include "kernel_mm.h"
+#include "metaproto_client.h"
+#include "param_client.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+#define GIT_BIN "/usr/bin/git"
+
+static git_context_t g_ctx = {0};
+
+/* ============================================================
+   GIT 初始化（被 BUS 调用）
+   ============================================================ */
+int git_init(uint64_t task_id) {
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    
+    // 1. 记录任务 ID
+    g_ctx.git_task_id = task_id;
+    
+    // 2. 设置默认路径
+    strcpy(g_ctx.repo_path, "/var/lib/hwrun/git");
+    strcpy(g_ctx.audit_path, "/var/lib/hwrun/git-audit");
+    strcpy(g_ctx.config.repo_path, g_ctx.repo_path);
+    strcpy(g_ctx.config.audit_path, g_ctx.audit_path);
+    
+    // 3. 创建目录
+    mkdir(g_ctx.repo_path, 0755);
+    mkdir(g_ctx.audit_path, 0755);
+    
+    // 4. 从 PARAM 读取配置
+    char buf[64];
+    if (param_get("git.auto_commit", buf, sizeof(buf)) == 0) {
+        g_ctx.config.auto_commit = (strcmp(buf, "true") == 0);
+    } else {
+        g_ctx.config.auto_commit = 1;
+    }
+    
+    if (param_get("git.max_size", buf, sizeof(buf)) == 0) {
+        g_ctx.config.max_size = atoll(buf);
+    } else {
+        g_ctx.config.max_size = 1024 * 1024 * 1024;  // 1GB
+    }
+    
+    if (param_get("git.auto_compact", buf, sizeof(buf)) == 0) {
+        g_ctx.config.auto_compact = (strcmp(buf, "true") == 0);
+    } else {
+        g_ctx.config.auto_compact = 1;
+    }
+    
+    // 5. 初始化主仓库（如果不存在）
+    struct stat st;
+    char git_dir[512];
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", g_ctx.repo_path);
+    if (stat(git_dir, &st) != 0) {
+        git_execute("init", NULL, NULL);
+        log_info(PLUGIN_ID, "Git repository initialized at %s", g_ctx.repo_path);
+    }
+    
+    // 6. 初始化审计仓库
+    char audit_git_dir[512];
+    snprintf(audit_git_dir, sizeof(audit_git_dir), "%s/.git", g_ctx.audit_path);
+    if (stat(audit_git_dir, &st) != 0) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "init %s", g_ctx.audit_path);
+        git_execute(cmd, NULL, NULL);
+        log_info(PLUGIN_ID, "Audit repository initialized at %s", g_ctx.audit_path);
+    }
+    
+    // 7. 注册 GIT 协议（通过 METAPROTO）
+    ProtocolInfo proto_info = {
+        .name = "GIT",
+        .version = "1.0.0",
+        .description = "Git Version Control Protocol",
+        .provider_plugin = "git",
+        .status = "active",
+    };
+    metaproto_register(metaproto_client, &proto_info);
+    
+    // 8. 注册 IPC 消息处理器
+    ipc_register_handler(GIT_MSG_COMMIT, git_ipc_commit_handler);
+    ipc_register_handler(GIT_MSG_PUSH, git_ipc_push_handler);
+    ipc_register_handler(GIT_MSG_PULL, git_ipc_pull_handler);
+    ipc_register_handler(GIT_MSG_TAG, git_ipc_tag_handler);
+    ipc_register_handler(GIT_MSG_LOG, git_ipc_log_handler);
+    ipc_register_handler(GIT_MSG_COMPACT, git_ipc_compact_handler);
+    ipc_register_handler(GIT_MSG_STATUS, git_ipc_status_handler);
+    ipc_register_handler(GIT_MSG_AUDIT, git_ipc_audit_handler);
+    
+    g_ctx.initialized = 1;
+    log_info(PLUGIN_ID, "GIT initialized");
+    
+    // 9. 启动自动压缩检查线程
+    if (g_ctx.config.auto_compact) {
+        task_create("git_compactor", git_compactor_thread, NULL);
+    }
+    
+    return 0;
+}
+```
+
+5.2 Git 命令执行器（核心）
+
+```c
+// git/src/executor.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+#include "git.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+
+/* ============================================================
+   审计日志记录
+   ============================================================ */
+void git_audit_log(const char *user, const char *operation,
+                   const char *target, const char *message, int success) {
+    char entry[1024];
+    char time_str[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm);
+    
+    snprintf(entry, sizeof(entry),
+             "{\"ts\":%ld,\"time\":\"%s\",\"user\":\"%s\",\"op\":\"%s\","
+             "\"target\":\"%s\",\"msg\":\"%s\",\"result\":\"%s\"}\n",
+             now, time_str,
+             user ? user : "system",
+             operation ? operation : "unknown",
+             target ? target : "",
+             message ? message : "",
+             success ? "success" : "failed");
+    
+    // 写入审计仓库
+    char path[512];
+    snprintf(path, sizeof(path), "%s/audit.log", g_ctx.audit_path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, entry, strlen(entry));
+        close(fd);
+    }
+}
+
+/* ============================================================
+   执行 Git 命令（核心封装）
+   ============================================================ */
+git_result_t *git_execute(const char *cmd, const char *cwd) {
+    git_result_t *result = kmalloc(sizeof(git_result_t));
+    if (!result) return NULL;
+    memset(result, 0, sizeof(git_result_t));
+    
+    char full_cmd[1024];
+    char work_dir[256];
+    strcpy(work_dir, cwd ? cwd : g_ctx.repo_path);
+    
+    snprintf(full_cmd, sizeof(full_cmd), "cd %s && %s %s 2>&1",
+             work_dir, GIT_BIN, cmd ? cmd : "");
+    
+    log_debug(PLUGIN_ID, "Executing: %s", full_cmd);
+    
+    FILE *fp = popen(full_cmd, "r");
+    if (!fp) {
+        snprintf(result->error, sizeof(result->error), "popen failed");
+        result->success = 0;
+        return result;
+    }
+    
+    // 读取输出
+    char buf[4096];
+    result->stdout_buf = kmalloc(8192);
+    if (result->stdout_buf) {
+        result->stdout_buf[0] = '\0';
+        size_t total = 0;
+        while (fgets(buf, sizeof(buf), fp) != NULL) {
+            size_t len = strlen(buf);
+            if (total + len < 8191) {
+                strcat(result->stdout_buf, buf);
+                total += len;
+            }
+        }
+        result->stdout_len = total;
+    }
+    
+    result->exit_code = pclose(fp);
+    result->success = (result->exit_code == 0);
+    
+    if (!result->success) {
+        snprintf(result->error, sizeof(result->error),
+                 "git command failed with exit code %d", result->exit_code);
+    }
+    
+    return result;
+}
+
+/* ============================================================
+   执行 Git 命令（带审计日志）
+   ============================================================ */
+git_result_t *git_execute_with_audit(const char *cmd, const char *user,
+                                      const char *operation, const char *target) {
+    // 1. 记录审计日志（操作前）
+    git_audit_log(user, operation, target, cmd, 0);
+    
+    // 2. 执行命令
+    git_result_t *result = git_execute(cmd, NULL);
+    
+    // 3. 记录审计日志（操作结果）
+    git_audit_log(user, operation, target, cmd, result->success);
+    
+    return result;
+}
+```
+
+5.3 存储管理
+
+```c
+// git/src/storage.c
+
+#include "git.h"
+#include "executor.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+
+/* ============================================================
+   初始化仓库
+   ============================================================ */
+int git_init_repo(const char *path) {
+    char cmd[256];
+    if (path && path[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "init %s", path);
+    } else {
+        strcpy(cmd, "init");
+    }
+    git_result_t *r = git_execute_with_audit(cmd, "system", "init", path);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   克隆仓库
+   ============================================================ */
+int git_clone_repo(const char *remote, const char *local_path) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "clone %s %s", remote, local_path);
+    git_result_t *r = git_execute_with_audit(cmd, "system", "clone", remote);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   添加文件
+   ============================================================ */
+int git_add(const char *path) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "add %s", path);
+    git_result_t *r = git_execute_with_audit(cmd, "system", "add", path);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   提交
+   ============================================================ */
+int git_commit(const char *message, char *out_commit_id, size_t id_size) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "commit -m \"%s\"", message);
+    git_result_t *r = git_execute_with_audit(cmd, "system", "commit", message);
+    int ret = r->success ? 0 : -1;
+    
+    if (ret == 0 && out_commit_id && id_size > 0) {
+        git_result_t *log_r = git_execute("rev-parse HEAD", NULL);
+        if (log_r->success && log_r->stdout_buf) {
+            char *p = strchr(log_r->stdout_buf, '\n');
+            if (p) *p = '\0';
+            strncpy(out_commit_id, log_r->stdout_buf, id_size - 1);
+        }
+        git_result_free(log_r);
+    }
+    
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   Push
+   ============================================================ */
+int git_push(const char *remote, const char *branch) {
+    char cmd[256];
+    if (remote && remote[0] != '\0' && branch && branch[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "push %s %s", remote, branch);
+    } else if (remote && remote[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "push %s", remote);
+    } else {
+        strcpy(cmd, "push");
+    }
+    git_result_t *r = git_execute_with_audit(cmd, "system", "push", remote);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   Pull
+   ============================================================ */
+int git_pull(const char *remote, const char *branch) {
+    char cmd[256];
+    if (remote && remote[0] != '\0' && branch && branch[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "pull %s %s", remote, branch);
+    } else if (remote && remote[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "pull %s", remote);
+    } else {
+        strcpy(cmd, "pull");
+    }
+    git_result_t *r = git_execute_with_audit(cmd, "system", "pull", remote);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+```
+
+5.4 版本管理
+
+```c
+// git/src/version.c
+
+#include "git.h"
+#include "executor.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+
+/* ============================================================
+   创建 Tag
+   ============================================================ */
+int git_tag(const char *name, const char *commit_id) {
+    char cmd[256];
+    if (commit_id && commit_id[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "tag %s %s", name, commit_id);
+    } else {
+        snprintf(cmd, sizeof(cmd), "tag %s", name);
+    }
+    git_result_t *r = git_execute_with_audit(cmd, "system", "tag", name);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   Checkout
+   ============================================================ */
+int git_checkout(const char *ref) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "checkout %s", ref);
+    git_result_t *r = git_execute_with_audit(cmd, "system", "checkout", ref);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   Reset
+   ============================================================ */
+int git_reset(const char *ref, int hard) {
+    char cmd[256];
+    if (hard) {
+        snprintf(cmd, sizeof(cmd), "reset --hard %s", ref);
+    } else {
+        snprintf(cmd, sizeof(cmd), "reset --soft %s", ref);
+    }
+    git_result_t *r = git_execute_with_audit(cmd, "system", "reset", ref);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+
+/* ============================================================
+   Revert
+   ============================================================ */
+int git_revert(const char *commit_id) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "revert %s --no-edit", commit_id);
+    git_result_t *r = git_execute_with_audit(cmd, "system", "revert", commit_id);
+    int ret = r->success ? 0 : -1;
+    git_result_free(r);
+    return ret;
+}
+```
+
+5.5 历史查询
+
+```c
+// git/src/history.c
+
+#include <stdio.h>
+#include <string.h>
+
+#include "git.h"
+#include "executor.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+
+/* ============================================================
+   查看日志
+   ============================================================ */
+git_commit_t *git_log(int limit, const char *since) {
+    char args[512] = "log --pretty=format:'%h|%an|%ai|%s'";
+    
+    if (limit > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), " -n %d", limit);
+        strcat(args, buf);
+    }
+    if (since && since[0] != '\0') {
+        strcat(args, " --since=");
+        strcat(args, since);
+    }
+    
+    git_result_t *r = git_execute(args, NULL);
+    if (!r->success) {
+        log_error(PLUGIN_ID, "Failed to get log: %s", r->error);
+        git_result_free(r);
+        return NULL;
+    }
+    
+    git_commit_t *head = NULL, *tail = NULL;
+    char *line = strtok(r->stdout_buf, "\n");
+    while (line) {
+        git_commit_t *c = kmalloc(sizeof(git_commit_t));
+        if (!c) break;
+        memset(c, 0, sizeof(git_commit_t));
+        
+        char *p1 = strchr(line, '|');
+        if (p1) {
+            *p1 = '\0';
+            strncpy(c->hash, line, sizeof(c->hash) - 1);
+            line = p1 + 1;
+            p1 = strchr(line, '|');
+            if (p1) {
+                *p1 = '\0';
+                strncpy(c->author, line, sizeof(c->author) - 1);
+                line = p1 + 1;
+                p1 = strchr(line, '|');
+                if (p1) {
+                    *p1 = '\0';
+                    strncpy(c->date, line, sizeof(c->date) - 1);
+                    line = p1 + 1;
+                    strncpy(c->message, line, sizeof(c->message) - 1);
+                }
+            }
+        }
+        
+        c->next = NULL;
+        if (tail) { tail->next = c; tail = c; }
+        else { head = c; tail = c; }
+        line = strtok(NULL, "\n");
+    }
+    
+    git_result_free(r);
+    return head;
+}
+
+/* ============================================================
+   Status
+   ============================================================ */
+char *git_status(void) {
+    git_result_t *r = git_execute("status --short", NULL);
+    if (!r->success) {
+        git_result_free(r);
+        return NULL;
+    }
+    char *status = strdup(r->stdout_buf);
+    git_result_free(r);
+    return status;
+}
+```
+
+5.6 历史压缩（Compact）
+
+```c
+// git/src/compact.c
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "git.h"
+#include "executor.h"
+#include "log_macros.h"
+#include "param_client.h"
+
+#define PLUGIN_ID "git"
+
+/* ============================================================
+   计算合并粒度（基于时间距离）
+   ============================================================ */
+int get_compact_level(int days_ago) {
+    if (days_ago <= 1) return 0;      // 不合并
+    if (days_ago <= 7) return 1;      // 小时粒度
+    if (days_ago <= 30) return 2;     // 天粒度
+    if (days_ago <= 90) return 3;     // 周粒度
+    if (days_ago <= 365) return 4;    // 月粒度
+    return 5;                          // 年粒度（最粗）
+}
+
+/* ============================================================
+   获取仓库大小
+   ============================================================ */
+uint64_t git_get_size(void) {
+    git_result_t *r = git_execute("du -sb .git", NULL);
+    if (!r->success) {
+        git_result_free(r);
+        return 0;
+    }
+    uint64_t size = 0;
+    char *p = strtok(r->stdout_buf, "\t");
+    if (p) size = atoll(p);
+    git_result_free(r);
+    return size;
+}
+
+/* ============================================================
+   检查是否有 tag
+   ============================================================ */
+int git_has_tag(const char *commit_id) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "tag --contains %s", commit_id);
+    git_result_t *r = git_execute(cmd, NULL);
+    int has = (r->success && r->stdout_buf && r->stdout_buf[0] != '\0');
+    git_result_free(r);
+    return has;
+}
+
+/* ============================================================
+   执行历史压缩
+   ============================================================ */
+int git_compact(int level) {
+    log_info(PLUGIN_ID, "Starting history compaction, level=%d", level);
+    
+    uint64_t old_size = git_get_size();
+    
+    // 1. 获取所有 commit（按时间排序）
+    git_result_t *r = git_execute("log --pretty=format:'%ct|%H'", NULL);
+    if (!r->success) {
+        log_error(PLUGIN_ID, "Failed to get commit list: %s", r->error);
+        git_result_free(r);
+        return -1;
+    }
+    
+    // 2. 解析 commit 列表
+    typedef struct { uint64_t time; char hash[64]; } commit_info_t;
+    commit_info_t commits[1024];
+    int count = 0;
+    char *line = strtok(r->stdout_buf, "\n");
+    while (line && count < 1024) {
+        char *p = strchr(line, '|');
+        if (p) {
+            *p = '\0';
+            commits[count].time = atol(line);
+            strncpy(commits[count].hash, p + 1, sizeof(commits[count].hash) - 1);
+            count++;
+        }
+        line = strtok(NULL, "\n");
+    }
+    git_result_free(r);
+    
+    // 3. 从旧到新遍历，决定合并策略
+    // 4. 执行 git rebase -i 压缩
+    // （实际实现中，使用 git filter-repo 或 git replace 来压缩历史）
+    
+    log_info(PLUGIN_ID, "Found %d commits to process", count);
+    
+    // 5. 执行压缩（实际使用 git filter-repo）
+    git_result_t *fr = git_execute("filter-repo --force --refs HEAD~10..HEAD", NULL);
+    if (!fr->success) {
+        log_error(PLUGIN_ID, "Compact failed: %s", fr->error);
+        git_result_free(fr);
+        return -1;
+    }
+    git_result_free(fr);
+    
+    // 6. 垃圾回收
+    git_result_t *gc = git_execute("gc --aggressive --prune=now", NULL);
+    git_result_free(gc);
+    
+    uint64_t new_size = git_get_size();
+    
+    // 7. 记录审计日志
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Compacted: %lu → %lu bytes, level=%d",
+             old_size, new_size, level);
+    git_audit_log("system", "compact", msg, "", 1);
+    
+    log_info(PLUGIN_ID, "Compact complete: %lu → %lu bytes", old_size, new_size);
+    return 0;
+}
+
+/* ============================================================
+   自动压缩检查线程
+   ============================================================ */
+void git_compactor_thread(void *arg) {
+    while (1) {
+        task_sleep(3600 * 1000);  // 每小时检查一次
+        
+        uint64_t size = git_get_size();
+        if (size > g_ctx.config.max_size) {
+            log_warn(PLUGIN_ID, "Repository size %lu exceeds limit %lu, compacting",
+                     size, g_ctx.config.max_size);
+            git_compact(1);
+        }
+    }
+}
+```
+
+5.7 IPC 通信接口
+
+```c
+// git/src/ipc_handler.c
+
+#include "git.h"
+#include "executor.h"
+#include "log_macros.h"
+
+#define PLUGIN_ID "git"
+
+void git_ipc_commit_handler(uint64_t from_task, void *data, size_t len) {
+    git_commit_req_t *req = (git_commit_req_t *)data;
+    git_commit_resp_t resp;
+    resp.success = (git_commit(req->message, resp.commit_id, sizeof(resp.commit_id)) == 0);
+    if (!resp.success) strcpy(resp.error, "Commit failed");
+    ipc_reply(from_task, &resp, sizeof(resp));
+}
+
+void git_ipc_push_handler(uint64_t from_task, void *data, size_t len) {
+    char *remote = (char *)data;
+    git_result_t *r = git_push(remote, NULL);
+    int success = r ? r->success : 0;
+    ipc_reply(from_task, &success, sizeof(success));
+    if (r) git_result_free(r);
+}
+
+void git_ipc_pull_handler(uint64_t from_task, void *data, size_t len) {
+    char *remote = (char *)data;
+    git_result_t *r = git_pull(remote, NULL);
+    int success = r ? r->success : 0;
+    ipc_reply(from_task, &success, sizeof(success));
+    if (r) git_result_free(r);
+}
+
+void git_ipc_tag_handler(uint64_t from_task, void *data, size_t len) {
+    git_tag_req_t *req = (git_tag_req_t *)data;
+    int success = (git_tag(req->name, req->commit_id) == 0);
+    ipc_reply(from_task, &success, sizeof(success));
+}
+
+void git_ipc_log_handler(uint64_t from_task, void *data, size_t len) {
+    git_log_req_t *req = (git_log_req_t *)data;
+    git_commit_t *commits = git_log(req->limit, req->since);
+    // 将 commits 序列化后返回
+    ipc_reply(from_task, commits, 0);
+}
+
+void git_ipc_compact_handler(uint64_t from_task, void *data, size_t len) {
+    git_compact_req_t *req = (git_compact_req_t *)data;
+    int success = (git_compact(req->level) == 0);
+    ipc_reply(from_task, &success, sizeof(success));
+}
+
+void git_ipc_status_handler(uint64_t from_task, void *data, size_t len) {
+    char *status = git_status();
+    ipc_reply(from_task, status, status ? strlen(status) + 1 : 0);
+    if (status) free(status);
+}
+
+void git_ipc_audit_handler(uint64_t from_task, void *data, size_t len) {
+    git_audit_req_t *req = (git_audit_req_t *)data;
+    // 读取审计日志文件
+    char path[512];
+    snprintf(path, sizeof(path), "%s/audit.log", g_ctx.audit_path);
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        ipc_reply(from_task, NULL, 0);
+        return;
+    }
+    // 读取并返回审计日志
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *buf = kmalloc(size + 1);
+    if (buf) {
+        fread(buf, 1, size, fp);
+        buf[size] = '\0';
+        ipc_reply(from_task, buf, size + 1);
+        kfree(buf);
+    }
+    fclose(fp);
+}
+```
+
+六、启动流程
+
+```
+微内核 _start()
+    │
+    ├── 1. 硬件初始化
+    ├── 2. 内存分配器初始化
+    ├── 3. 中断/时钟初始化
+    ├── 4. 加载 METAPROTO 插件
+    │        └── METAPROTO 注册自己
+    ├── 5. 加载 BUS 插件
+    │        └── BUS 注册自己
+    │        └── BUS 加载 PARAM 插件
+    │        └── BUS 加载 LOG 插件
+    │        └── BUS 加载 GIT 插件
+    ▼
+git_init()
+    │
+    ├── 1. 创建目录 /var/lib/hwrun/git/
+    ├── 2. 创建目录 /var/lib/hwrun/git-audit/
+    ├── 3. 从 PARAM 读取配置
+    │        ├── git.auto_commit → 自动 commit
+    │        ├── git.max_size → 最大仓库大小
+    │        └── git.auto_compact → 自动压缩
+    ├── 4. 初始化主仓库（git init）
+    ├── 5. 初始化审计仓库（git init）
+    ├── 6. 注册 GIT 协议（通过 METAPROTO）
+    ├── 7. 注册 IPC 消息处理器
+    ├── 8. 启动自动压缩线程
+    └── 9. 就绪
+```
+
+七、配置参数
+
+```yaml
+# /etc/hwrun/params/git.yml
+git:
+  # 仓库路径
+  repo_path: "/var/lib/hwrun/git"
+  audit_path: "/var/lib/hwrun/git-audit"
+  
+  # 远程仓库
+  remote: "https://hwrun.org/system.git"
+  branch: "main"
+  
+  # 自动操作
+  auto_commit: true
+  auto_push: false
+  
+  # 历史管理
+  max_size: "1GB"
+  auto_compact: true
+  
+  # 粒度配置（越近越细）
+  granularity:
+    - days: 1
+      level: "hour"
+    - days: 7
+      level: "day"
+    - days: 30
+      level: "week"
+    - days: 90
+      level: "month"
+    - days: 365
+      level: "year"
+  
+  # Tag 保护（永久保留）
+  preserve:
+    - "v*"
+    - "system-version-*"
+    - "kernel-upgrade-*"
+```
+
+八、命令行接口
+
+```bash
+# Git 操作
+hwrun git status
+hwrun git commit -m "修改调度策略"
+hwrun git push
+hwrun git pull
+hwrun git tag v1.0.0
+hwrun git log --limit 20
+
+# 历史管理
+hwrun git size                    # 查看仓库大小
+hwrun git compact                 # 手动压缩历史
+
+# 审计日志
+hwrun git audit                   # 查看所有审计日志
+hwrun git audit --user admin      # 按用户过滤
+hwrun git audit --tail 20         # 最近 20 条
+```
+
+九、代码组织
+
+```
+git/
+├── Makefile
+├── plugin.yml                     # 插件描述文件
+│
+├── include/
+│   ├── git.h                      # 核心数据结构
+│   ├── executor.h                 # Git 命令执行器
+│   ├── storage.h                  # 存储管理
+│   ├── version.h                  # 版本管理
+│   ├── history.h                  # 历史查询
+│   ├── compact.h                  # 历史压缩
+│   └── ipc_handler.h              # IPC 消息处理
+│
+└── src/
+    ├── git.c                      # 初始化
+    ├── executor.c                 # Git 命令执行器实现
+    ├── storage.c                  # 存储管理实现
+    ├── version.c                  # 版本管理实现
+    ├── history.c                  # 历史查询实现
+    ├── compact.c                  # 历史压缩实现
+    ├── ipc_handler.c              # IPC 处理
+    └── test.c                     # 单元测试
+```
+
+十、插件描述文件
+
+```yaml
+# plugins/git/plugin.yml
+plugin:
+  id: "git"
+  name: "Git 版本控制"
+  version: "1.0.0"
+  type: "management"
+  
+  description: "系统 Git 命令的封装层 + 审计日志 + 自动历史管理"
+  
+  provides:
+    - protocol: "GIT"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+  
+  params:
+    - key: "git.repo_path"
+      type: "string"
+      default: "/var/lib/hwrun/git"
+    - key: "git.audit_path"
+      type: "string"
+      default: "/var/lib/hwrun/git-audit"
+    - key: "git.auto_commit"
+      type: "bool"
+      default: true
+    - key: "git.max_size"
+      type: "string"
+      default: "1GB"
+    - key: "git.auto_compact"
+      type: "bool"
+      default: true
+  
+  files:
+    - "/usr/lib/hwrun/plugins/git.so"
+```
+
+十一、其他模块调用示例
+
+```c
+// 其他插件调用 GIT
+#include "git_client.h"
+
+void on_param_change(const char *key, const char *value) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "参数变更: %s = %s", key, value);
+    git_client_commit(msg);
+    git_client_push();  // 同步到集群
+}
+
+void on_plugin_install(const char *id) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "安装插件: %s", id);
+    git_client_commit(msg);
+}
+```
+
+十二、总结
+
+维度 决策
+定位 Git 版本控制系统封装层
+实现方式 调用系统 /usr/bin/git 命令
+代码量 ~500 行 C
+审计日志 独立仓库 /var/lib/hwrun/git-audit/audit.log
+历史压缩 按时间线自动合并粒度，Tag 永久保留
+集群同步 git push / git pull
+配置方式 通过 PARAM 系统
+依赖 微内核（IPC、任务、内存）+ METAPROTO + PARAM + LOG + 系统 Git
+
+GIT 是 HWRun OS 中 BUS 加载的第四个插件（PARAM → LOG → GIT）。它是一个薄封装层，所有实际操作由系统 /usr/bin/git 命令完成。GIT 插件提供统一的调用入口、审计日志记录和历史自动管理，确保系统状态可追溯、可回滚。

@@ -1,0 +1,22 @@
+# HWRun OS — LOADER 插件描述
+plugin:
+  id: "loader"
+  name: "Executable Loader Protocol"
+  version: "1.0.0"
+  type: "loader"
+
+  description: "HWRun OS 可执行文件加载协议：检测 / 加载 / 运行各类可执行格式"
+
+  provides:
+    - "LOADER"
+
+  requires:
+    - "HAP"
+    - "PMP"
+    - "FSP"
+    - "LOG"
+    - "PARAM"
+    - "METAPROTO"
+
+  files:
+    - "build/loader.so"

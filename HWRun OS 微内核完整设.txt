@@ -1,0 +1,766 @@
+﻿HWRun OS 微内核完整设计文档
+
+模块名称： HWRun Microkernel
+版本： 1.0.0
+状态： 设计冻结
+设计哲学： 最小化（Minimality）、机制与策略分离
+实现语言： C + 少量汇编（架构相关部分）
+代码量目标： ~3000 行
+运行时内存： < 1MB
+依赖： 无（微内核是所有其他组件的基础）
+提供接口： 系统调用（通过 int 0x80 / svc 指令）
+
+一、设计哲学
+
+1.1 最小化原则
+
+HWRun 微内核严格遵循 Liedtke 的最小化原则：
+
+“只有当某个概念必须放在内核中才能实现系统所需功能时，才允许它存在于内核中。” 
+
+微内核只提供三样东西：
+
+1. 地址空间（Address Space） —— 内存隔离
+2. 线程（Thread） —— 执行单元
+3. IPC（Inter-Process Communication） —— 进程间通信
+
+所有其他功能——调度策略、文件系统、网络栈、设备驱动、安全管理——全部在用户态实现。
+
+1.2 机制与策略分离
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  微内核提供（机制）                    用户态提供（策略）                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  上下文切换                            调度算法（谁先跑、跑多久）            │
+│  页表管理                              内存分配策略（怎么分配、何时回收）    │
+│  消息传递通道                          通信协议（消息格式、握手方式）        │
+│  中断分发                              具体中断处理逻辑                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.3 微内核 vs 插件系统
+
+HWRun OS = 微内核（壳）+ 插件系统（魂）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HWRun OS = 微内核 + 插件系统                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  插件系统 (用户态)                                                  │   │
+│  │  ├── 组件总线 (BUS)          → 发现/安装/加载其他插件               │   │
+│  │  ├── 文件系统 (FSP)          → 文件管理                             │   │
+│  │  ├── 网络栈 (NP)             → 网络通信                             │   │
+│  │  ├── 调度器 (SCHED)          → 调度策略                             │   │
+│  │  ├── 驱动 (DRIVER)           → 设备驱动                             │   │
+│  │  └── 用户界面 (UI)           → 界面展示                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                              IPC / 系统调用                                 │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  微内核 (内核态)                                                    │   │
+│  │  ├── 硬件启动 (CPU/内存/中断/时钟)                                  │   │
+│  │  ├── 最简线程管理 (创建/切换)                                       │   │
+│  │  ├── 最简地址空间 (隔离/页表)                                       │   │
+│  │  ├── 最简IPC (消息传递)                                            │   │
+│  │  └── 插件加载器 (从固定位置加载第一个插件)                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  硬件层                                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 微内核组成
+
+模块 职责 代码量估算
+启动代码 CPU初始化、GDT/IDT设置、进入保护模式 ~300行
+内存管理 物理内存分配器、页表管理 ~400行
+线程管理 线程创建、切换、状态管理 ~400行
+IPC 消息发送/接收 ~400行
+中断/时钟 IRQ处理、时钟中断、调度触发 ~300行
+插件加载器 从固定位置加载第一个插件 ~400行
+架构抽象 CPU/MMU架构相关操作 ~300行
+总计  ~2500行
+
+2.2 微内核不包含
+
+```
+❌ 文件系统
+❌ 网络协议栈
+❌ 设备驱动
+❌ 安全管理器
+❌ 调度策略
+❌ 内存分配策略
+❌ 用户界面
+❌ 任何具体功能
+```
+
+2.3 微内核包含
+
+```
+✅ 硬件启动（CPU、内存、中断、时钟）
+✅ 最简线程管理（创建、切换、状态）
+✅ 最简地址空间（页表、隔离）
+✅ 最简IPC（发送、接收、回复）
+✅ 插件加载器（从固定位置加载第一个插件）
+✅ 时钟中断（触发调度）
+```
+
+三、核心数据结构
+
+3.1 任务控制块（极简版）
+
+```c
+// kernel/include/task.h
+
+#define TASK_NAME_LEN    32
+#define TASK_STACK_SIZE  8192
+#define MAX_TASKS        64
+
+/* 任务状态 */
+typedef enum {
+    TASK_STATE_READY = 0,
+    TASK_STATE_RUNNING,
+    TASK_STATE_BLOCKED,
+    TASK_STATE_ZOMBIE,
+} task_state_t;
+
+/* 任务控制块 */
+typedef struct task {
+    uint64_t id;                    // 唯一ID
+    char name[TASK_NAME_LEN];       // 名称
+    task_state_t state;             // 状态
+    uint8_t priority;               // 0=最高, 255=最低
+    
+    /* 上下文（架构相关） */
+    void *sp;                       // 栈指针
+    void *entry;                    // 入口地址
+    
+    /* 地址空间 */
+    void *page_table;               // 页表指针
+    
+    /* IPC */
+    struct task *waiting_for;       // 等待的目标任务ID
+    void *pending_msg;              // 待处理消息
+    
+    /* 链表 */
+    struct task *next;
+    struct task *prev;
+} task_t;
+
+/* 内核全局状态 */
+typedef struct kernel {
+    task_t *tasks;                  // 任务链表
+    task_t *current;                // 当前任务
+    task_t *idle;                   // 空闲任务
+    uint64_t next_tid;              // 下一个任务ID
+    
+    void *msg_queue;                // IPC消息队列
+    
+    void *heap_start;               // 堆起始
+    void *heap_end;                 // 堆结束
+    void *heap_ptr;                 // 当前堆指针
+    
+    uint64_t ticks;                 // 时钟滴答
+    int running;                    // 运行标志
+    
+    void *plugin_entry;             // 第一个插件入口
+} kernel_t;
+
+extern kernel_t *k;
+```
+
+3.2 IPC消息（极简版）
+
+```c
+// kernel/include/ipc.h
+
+#define IPC_MAX_DATA  256
+
+/* IPC消息 */
+typedef struct ipc_msg {
+    uint64_t from;                  // 发送者ID
+    uint64_t to;                    // 接收者ID
+    uint8_t data[IPC_MAX_DATA];
+    size_t len;
+    struct ipc_msg *next;
+} ipc_msg_t;
+
+/* IPC系统调用号 */
+#define SYS_IPC_SEND    1
+#define SYS_IPC_RECV    2
+#define SYS_IPC_REPLY   3
+```
+
+四、核心实现
+
+4.1 启动代码
+
+```c
+// kernel/startup.c
+
+/* 内核入口（由引导加载器跳转到这里） */
+void _start(void) {
+    // 1. 关闭中断
+    asm volatile("cli");
+    
+    // 2. 设置栈（由汇编启动代码完成）
+    
+    // 3. 清零BSS段
+    extern char __bss_start, __bss_end;
+    memset(&__bss_start, 0, &__bss_end - &__bss_start);
+    
+    // 4. 初始化内存管理
+    mm_init();
+    
+    // 5. 初始化中断和时钟
+    irq_init();
+    timer_init(1000);  // 1ms时钟中断
+    
+    // 6. 创建空闲任务
+    task_t *idle = task_create("idle", idle_task, NULL);
+    k->idle = idle;
+    k->current = idle;
+    
+    // 7. 加载第一个插件（组件总线）
+    void *entry = plugin_load("/boot/hwrun/bus.so");
+    if (entry) {
+        task_t *bus = task_create("bus", entry, NULL);
+        if (bus) {
+            task_switch(bus);
+        }
+    }
+    
+    // 8. 如果插件加载失败，运行空闲任务
+    while (1) {
+        arch_idle();
+    }
+}
+```
+
+4.2 内存管理
+
+```c
+// kernel/mm.c
+
+/* 物理内存分配器（极简版 - 线性分配） */
+
+void mm_init(void) {
+    // 假设内核从地址 0x100000 开始
+    // 内存大小由引导加载器传入（这里硬编码为16MB）
+    k->heap_start = (void *)0x200000;
+    k->heap_end = (void *)0x1000000;
+    k->heap_ptr = k->heap_start;
+}
+
+void *kmalloc(size_t size) {
+    size = (size + 7) & ~7;  // 8字节对齐
+    if ((char *)k->heap_ptr + size > (char *)k->heap_end) {
+        return NULL;  // 内存不足
+    }
+    void *ptr = k->heap_ptr;
+    k->heap_ptr = (char *)k->heap_ptr + size;
+    return ptr;
+}
+
+/* 页表创建（极简版） */
+void *create_page_table(void) {
+    return kmalloc(4096);  // 分配一个4KB页表
+}
+
+/* 映射页面 */
+void map_page(void *page_table, uintptr_t virt, uintptr_t phys, int flags) {
+    // 最简单的映射：直接设置页表项
+    // 具体实现依赖架构（x86_64/ARM64）
+}
+```
+
+4.3 任务管理
+
+```c
+// kernel/task.c
+
+/* 创建任务 */
+task_t *task_create(const char *name, void *entry, void *arg) {
+    task_t *t = kmalloc(sizeof(task_t));
+    if (!t) return NULL;
+    
+    t->id = k->next_tid++;
+    strncpy(t->name, name, TASK_NAME_LEN - 1);
+    t->entry = entry;
+    t->state = TASK_STATE_READY;
+    t->priority = 128;
+    t->waiting_for = NULL;
+    t->pending_msg = NULL;
+    
+    // 分配栈
+    void *stack = kmalloc(TASK_STACK_SIZE);
+    if (!stack) return NULL;
+    t->sp = (char *)stack + TASK_STACK_SIZE;  // 栈顶
+    
+    // 创建页表（每个任务独立地址空间）
+    t->page_table = create_page_table();
+    
+    // 设置初始上下文（架构相关）
+    arch_setup_context(t, entry, arg);
+    
+    // 加入任务链表
+    t->next = k->tasks;
+    if (k->tasks) k->tasks->prev = t;
+    t->prev = NULL;
+    k->tasks = t;
+    
+    return t;
+}
+
+/* 任务切换 */
+void task_switch(task_t *next) {
+    if (!next || next == k->current) return;
+    
+    task_t *prev = k->current;
+    
+    // 切换页表（架构相关）
+    arch_switch_page_table(next->page_table);
+    
+    // 切换上下文（架构相关）
+    arch_context_switch(prev, next);
+    
+    k->current = next;
+}
+
+/* 主动让出CPU */
+void yield(void) {
+    // 简单轮转：找下一个就绪任务
+    task_t *next = k->current->next;
+    while (next) {
+        if (next->state == TASK_STATE_READY) {
+            task_switch(next);
+            return;
+        }
+        next = next->next;
+    }
+    // 回到空闲任务
+    task_switch(k->idle);
+}
+
+/* 时钟中断处理 */
+void timer_irq_handler(void) {
+    k->ticks++;
+    // 每10个tick触发一次调度
+    if (k->ticks % 10 == 0) {
+        yield();
+    }
+}
+```
+
+4.4 IPC实现
+
+```c
+// kernel/ipc.c
+
+/* 发送消息（同步） */
+int ipc_send(uint64_t target_tid, const void *data, size_t len) {
+    if (len > IPC_MAX_DATA) return -1;
+    
+    // 查找目标任务
+    task_t *target = task_find(target_tid);
+    if (!target) return -2;
+    
+    // 分配消息
+    ipc_msg_t *msg = kmalloc(sizeof(ipc_msg_t));
+    if (!msg) return -3;
+    
+    msg->from = k->current->id;
+    msg->to = target_tid;
+    memcpy(msg->data, data, len);
+    msg->len = len;
+    msg->next = NULL;
+    
+    // 加入消息队列
+    ipc_msg_t **queue = (ipc_msg_t **)&k->msg_queue;
+    if (!*queue) {
+        *queue = msg;
+    } else {
+        ipc_msg_t *last = *queue;
+        while (last->next) last = last->next;
+        last->next = msg;
+    }
+    
+    // 阻塞当前任务，等待接收者处理
+    k->current->state = TASK_STATE_BLOCKED;
+    k->current->waiting_for = target;
+    yield();
+    
+    return 0;
+}
+
+/* 接收消息（阻塞） */
+ipc_msg_t *ipc_recv(void) {
+    ipc_msg_t *prev = NULL;
+    ipc_msg_t *cur = (ipc_msg_t *)k->msg_queue;
+    
+    // 查找发给当前任务的消息
+    while (cur) {
+        if (cur->to == k->current->id) {
+            // 从队列中移除
+            if (prev) {
+                prev->next = cur->next;
+            } else {
+                k->msg_queue = cur;
+            }
+            return cur;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    
+    // 没有消息，阻塞
+    k->current->state = TASK_STATE_BLOCKED;
+    yield();
+    return NULL;  // 被唤醒后重新调用
+}
+
+/* 回复消息 */
+int ipc_reply(uint64_t target_tid, const void *data, size_t len) {
+    return ipc_send(target_tid, data, len);
+}
+```
+
+4.5 系统调用
+
+```c
+// kernel/syscall.c
+
+/* 系统调用分发器 */
+void syscall_handler(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+    switch (num) {
+        case SYS_IPC_SEND:
+            ipc_send(arg1, (void *)arg2, arg3);
+            break;
+        case SYS_IPC_RECV:
+            ipc_recv();
+            break;
+        case SYS_IPC_REPLY:
+            ipc_reply(arg1, (void *)arg2, arg3);
+            break;
+        case SYS_YIELD:
+            yield();
+            break;
+        case SYS_EXIT:
+            task_exit();
+            break;
+        default:
+            break;
+    }
+}
+```
+
+4.6 插件加载器
+
+```c
+// kernel/loader.c
+
+/* 从固定位置加载第一个插件 */
+void *plugin_load(const char *path) {
+    // 简化：插件被引导加载器加载到固定内存地址
+    // 这里只需要找到入口地址
+    
+    void *base = (void *)0x1000000;
+    
+    // 检查ELF魔数
+    uint32_t magic = *(uint32_t *)base;
+    if (magic != 0x7f454c46) {  // ELF魔数
+        return NULL;
+    }
+    
+    // 解析ELF头，找到入口地址
+    // 实际实现需要完整的ELF解析器
+    // 这里简化为固定偏移
+    void *entry = (void *)((uintptr_t)base + 0x1000);
+    
+    return entry;
+}
+```
+
+4.7 架构抽象层
+
+```c
+// kernel/arch/x86_64/context.c
+
+/* 设置初始上下文 */
+void arch_setup_context(task_t *t, void *entry, void *arg) {
+    uint64_t *stack = (uint64_t *)t->sp;
+    *--stack = (uint64_t)arg;   // 参数
+    *--stack = 0;               // 返回地址
+    *--stack = (uint64_t)entry; // 入口地址
+    t->sp = stack;
+}
+
+/* 上下文切换（汇编实现） */
+void arch_context_switch(task_t *prev, task_t *next) {
+    __asm__ volatile(
+        "mov %%rsp, %0\n"
+        "mov %1, %%rsp\n"
+        : "=m"(prev->sp)
+        : "r"(next->sp)
+        : "memory"
+    );
+}
+
+/* 切换页表 */
+void arch_switch_page_table(void *page_table) {
+    // 设置CR3寄存器
+    __asm__ volatile(
+        "mov %0, %%cr3\n"
+        : : "r"(page_table)
+        : "memory"
+    );
+}
+
+/* 空闲 */
+void arch_idle(void) {
+    __asm__ volatile("hlt");
+}
+
+/* 启用中断 */
+void arch_enable_irq(void) {
+    __asm__ volatile("sti");
+}
+```
+
+五、启动流程
+
+5.1 完整启动流程
+
+```
+BIOS/UEFI
+    │
+    ▼
+引导加载器 (GRUB)
+    │ 加载微内核到 0x100000
+    │ 加载第一个插件到 0x1000000
+    ▼
+_start() [微内核入口]
+    │
+    ├── 1. 关闭中断 (cli)
+    ├── 2. 设置栈
+    ├── 3. 清零BSS段
+    ├── 4. mm_init()       → 初始化内存分配器
+    ├── 5. irq_init()      → 初始化中断
+    ├── 6. timer_init()    → 初始化时钟 (1ms)
+    ├── 7. task_create("idle") → 创建空闲任务
+    ├── 8. plugin_load()   → 加载第一个插件
+    ├── 9. task_create("bus")  → 为插件创建任务
+    └── 10. task_switch(bus) → 切换到插件
+                    │
+                    ▼
+                插件运行
+```
+
+5.2 启动后的系统状态
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  启动完成后的系统状态                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  微内核：                                                                   │
+│  ├── 内存分配器就绪（线性分配，16MB）                                       │
+│  ├── 时钟中断就绪（1ms周期，每10个tick触发调度）                           │
+│  ├── 任务列表：空闲任务 + 总线任务                                          │
+│  └── IPC消息队列为空                                                       │
+│                                                                             │
+│  当前运行：总线任务 (组件总线插件)                                          │
+│                                                                             │
+│  总线任务 (用户态)：                                                        │
+│  ├── 通过IPC与微内核通信                                                   │
+│  ├── 注册BUS协议                                                           │
+│  ├── 扫描插件目录                                                          │
+│  └── 加载其他插件（FSP、NP、DRIVER...）                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+六、系统调用接口
+
+6.1 系统调用列表
+
+调用号 名称 参数 说明
+1 SYS_IPC_SEND target_tid, data, len 发送消息
+2 SYS_IPC_RECV - 接收消息（阻塞）
+3 SYS_IPC_REPLY target_tid, data, len 回复消息
+4 SYS_YIELD - 主动让出CPU
+5 SYS_EXIT - 退出当前任务
+
+6.2 用户态调用示例
+
+```c
+// 用户态代码：发送IPC消息
+
+int ipc_send(uint64_t target, const void *data, size_t len) {
+    int ret;
+    __asm__ volatile(
+        "int $0x80\n"
+        : "=a"(ret)
+        : "a"(SYS_IPC_SEND), "b"(target), "c"(data), "d"(len)
+        : "memory"
+    );
+    return ret;
+}
+```
+
+七、错误处理
+
+7.1 错误码
+
+错误码 含义
+0 成功
+-1 数据过大（超过IPC_MAX_DATA）
+-2 目标任务不存在
+-3 内存不足（无法分配消息）
+-4 参数无效
+
+7.2 内核Panic
+
+```c
+// kernel/panic.c
+
+void panic(const char *msg) {
+    // 禁用中断
+    asm volatile("cli");
+    
+    // 打印错误信息
+    printk("KERNEL PANIC: %s\n", msg);
+    printk("Halting system...\n");
+    
+    // 死循环
+    while (1) {
+        arch_idle();
+    }
+}
+```
+
+八、代码组织
+
+8.1 目录结构
+
+```
+kernel/
+├── boot/
+│   └── boot.S              # 引导汇编（多架构）
+├── include/
+│   ├── kernel.h            # 内核全局定义
+│   ├── task.h              # 任务管理
+│   ├── mm.h                # 内存管理
+│   ├── ipc.h               # IPC
+│   ├── syscall.h           # 系统调用
+│   └── arch/
+│       └── x86_64/
+│           └── arch.h      # 架构相关
+├── src/
+│   ├── startup.c           # 启动入口
+│   ├── task.c              # 任务管理实现
+│   ├── mm.c                # 内存管理实现
+│   ├── ipc.c               # IPC实现
+│   ├── syscall.c           # 系统调用实现
+│   ├── loader.c            # 插件加载器
+│   ├── panic.c             # Panic处理
+│   └── arch/
+│       └── x86_64/
+│           ├── context.S   # 上下文切换（汇编）
+│           ├── irq.c       # 中断处理
+│           └── timer.c     # 时钟
+├── linker.ld              # 链接脚本
+└── Makefile               # 构建文件
+```
+
+8.2 构建
+
+```makefile
+# Makefile
+
+CC = gcc
+CFLAGS = -ffreestanding -nostdlib -O2 -Wall -Wextra
+AS = nasm
+LD = ld
+
+OBJS = startup.o task.o mm.o ipc.o syscall.o loader.o panic.o \
+       arch/x86_64/context.o arch/x86_64/irq.o arch/x86_64/timer.o
+
+kernel.bin: $(OBJS)
+    $(LD) -T linker.ld -o $@ $^
+
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.S
+    $(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+    rm -f *.o kernel.bin
+```
+
+九、配置
+
+9.1 内核配置（硬编码）
+
+```c
+// kernel/include/config.h
+
+#define KERNEL_STACK_SIZE   8192
+#define TASK_STACK_SIZE     8192
+#define MAX_TASKS           64
+#define IPC_MAX_DATA        256
+#define HEAP_START          0x200000
+#define HEAP_END            0x1000000
+#define TIMER_FREQ          1000      // 1ms
+#define SCHED_TICKS         10        // 每10个tick调度一次
+#define PLUGIN_BASE         0x1000000
+```
+
+十、总结
+
+10.1 微内核定义
+
+```
+HWRun 微内核 = 能启动 + 能加载插件 + 最简IPC
+
+大小: ~2500-3000 行 C + 少量汇编
+内存: < 1MB
+职责:
+├── 硬件启动 (CPU、内存、中断、时钟)
+├── 最简内存分配 (线性分配)
+├── 最简任务管理 (创建/切换/状态)
+├── 最简IPC (发送/接收/回复)
+├── 时钟中断 (触发调度)
+└── 插件加载 (从固定位置加载第一个插件)
+
+不包含:
+├── ❌ 文件系统
+├── ❌ 网络
+├── ❌ 驱动
+├── ❌ 安全
+├── ❌ 调度策略
+├── ❌ 内存分配策略
+├── ❌ 用户界面
+└── ❌ 任何具体功能
+```
+
+10.2 设计原则
+
+1. 最小化：只包含必须在内核中的功能
+2. 机制与策略分离：内核提供机制，用户态决定策略
+3. 协议驱动：所有服务通过IPC和标准协议通信
+4. 插件优先：第一个插件是组件总线，由它加载其他所有功能
+
+10.3 一句话总结
+
+HWRun 微内核只有约 3000 行代码，只做三件事：启动硬件、加载第一个插件、提供最简 IPC 让插件间通信。所有其他事情都由插件系统在用户态完成。微内核是“壳”，插件系统是“魂”。

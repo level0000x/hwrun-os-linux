@@ -1,0 +1,1183 @@
+﻿HWRun OS AUDIT 实现文档
+
+模块名称： AUDIT (Audit Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 审计协议，提供系统安全审计、操作日志、合规追踪、事件监控等完整的审计能力
+实现语言： C（内核模块 + 用户态服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统协议）、SP（安全协议）、PERMISSION（权限管理）
+提供协议： AUDIT
+
+一、设计哲学
+
+1.1 核心定位
+
+AUDIT 是 HWRun OS 的审计核心——记录系统中所有安全相关事件，提供完整的审计追踪和合规性保障。
+
+```
+AUDIT = 审计协议 = 所有安全审计操作的统一入口
+
+安全事件 (权限变更、登录、配置修改、文件访问、进程创建...)
+    │
+    │  通过 AUDIT 协议记录
+    ▼
+AUDIT 插件
+    │
+    │  基于 Linux 内核 audit 子系统
+    │  ├── 事件收集: 内核审计事件
+    │  ├── 事件过滤: 规则匹配
+    │  ├── 事件存储: 持久化存储
+    │  └── 事件查询: 检索和分析
+    │
+    ▼
+持久化存储 (审计日志文件 / STORAGE 卷)
+```
+
+1.2 设计原则
+
+1. 全面覆盖：记录所有安全相关事件（登录、权限变更、配置修改、文件访问、进程创建、网络连接等）
+2. 不可篡改：审计日志以只追加方式写入，防止篡改
+3. 规则可配：支持灵活的审计规则配置（基于用户、操作、资源等）
+4. 高效低噪：通过规则过滤减少无关事件，保证系统性能
+5. 合规就绪：支持常见合规标准（PCI-DSS、HIPAA、GDPR、SOX 等）
+6. 可查询：支持按时间、用户、事件类型等维度检索审计日志
+
+1.3 审计事件分类
+
+类别 事件类型 说明
+认证事件 AUTH_SUCCESS, AUTH_FAILURE 用户登录成功/失败
+授权事件 PERMISSION_GRANT, PERMISSION_REVOKE 权限授予/撤销
+用户管理 USER_ADD, USER_REMOVE, USER_MODIFY 用户创建/删除/修改
+配置变更 CONFIG_CHANGE 系统配置修改
+文件访问 FILE_READ, FILE_WRITE, FILE_DELETE 文件读写删除
+进程管理 PROCESS_START, PROCESS_STOP 进程创建/终止
+网络连接 NETWORK_CONNECT, NETWORK_DISCONNECT 网络连接
+系统操作 SYSTEM_REBOOT, SYSTEM_SHUTDOWN 系统重启/关机
+插件管理 PLUGIN_INSTALL, PLUGIN_REMOVE 插件安装/卸载
+实例管理 INSTANCE_CREATE, INSTANCE_DESTROY 实例创建/销毁
+安全管理 SECURITY_ALERT 安全告警
+
+二、整体架构
+
+2.1 AUDIT 插件的组成
+
+```
+AUDIT 插件
+├── 协议处理层
+│   ├── audit_ipc_handler()      ← IPC 消息分发
+│   ├── audit_log()              ← 记录审计事件
+│   ├── audit_query()            ← 查询审计日志
+│   ├── audit_export()           ← 导出审计日志
+│   ├── audit_get_policy()       ← 获取审计策略
+│   └── audit_set_policy()       ← 设置审计策略
+│
+├── 内核审计引擎
+│   ├── audit_kernel.c           ← Linux 内核 audit 集成
+│   ├── audit_events.c           ← 事件定义和注册
+│   └── audit_hooks.c            ← LSM 钩子集成
+│
+├── 审计规则引擎
+│   ├── audit_rules.c            ← 规则管理
+│   ├── audit_filter.c           ← 事件过滤
+│   └── audit_watch.c            ← 文件/目录监控
+│
+├── 审计存储层
+│   ├── audit_storage.c          ← 持久化存储
+│   ├── audit_rotate.c           ← 日志轮转
+│   └── audit_compress.c         ← 日志压缩
+│
+└── 初始化/清理
+    ├── audit_init()             ← 插件加载
+    └── audit_exit()             ← 插件卸载
+```
+
+2.2 AUDIT 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → FS_TRANSFER → AUDIT → 其他插件
+                                                                                                                                            ↑
+                                                                                                                                  AUDIT 在这里加载
+```
+
+AUDIT 在 FS_TRANSFER 之后、上层应用插件之前加载，为系统提供审计能力。
+
+2.3 AUDIT 的上层消费者
+
+上层插件 需要 AUDIT 提供什么
+PERMISSION (权限管理) 权限变更审计
+SP (安全协议) 安全事件审计
+PKGMGR (包管理) 包安装/卸载审计
+CLUSTER (集群管理) 集群操作审计
+MONITOR (监控) 安全事件监控
+
+三、核心数据结构
+
+```c
+// audit/include/audit.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   审计事件类型
+   ============================================================ */
+typedef enum {
+    AUDIT_EVENT_AUTH_SUCCESS = 1,
+    AUDIT_EVENT_AUTH_FAILURE,
+    AUDIT_EVENT_PERMISSION_GRANT,
+    AUDIT_EVENT_PERMISSION_REVOKE,
+    AUDIT_EVENT_USER_ADD,
+    AUDIT_EVENT_USER_REMOVE,
+    AUDIT_EVENT_USER_MODIFY,
+    AUDIT_EVENT_CONFIG_CHANGE,
+    AUDIT_EVENT_FILE_READ,
+    AUDIT_EVENT_FILE_WRITE,
+    AUDIT_EVENT_FILE_DELETE,
+    AUDIT_EVENT_PROCESS_START,
+    AUDIT_EVENT_PROCESS_STOP,
+    AUDIT_EVENT_NETWORK_CONNECT,
+    AUDIT_EVENT_NETWORK_DISCONNECT,
+    AUDIT_EVENT_SYSTEM_REBOOT,
+    AUDIT_EVENT_SYSTEM_SHUTDOWN,
+    AUDIT_EVENT_PLUGIN_INSTALL,
+    AUDIT_EVENT_PLUGIN_REMOVE,
+    AUDIT_EVENT_INSTANCE_CREATE,
+    AUDIT_EVENT_INSTANCE_DESTROY,
+    AUDIT_EVENT_SECURITY_ALERT,
+    AUDIT_EVENT_LOGIN,
+    AUDIT_EVENT_LOGOUT,
+    AUDIT_EVENT_SCHEDULER_CHANGE,
+    AUDIT_EVENT_MEMORY_ALLOC,
+    AUDIT_EVENT_IPC_CALL,
+    AUDIT_EVENT_SYSCALL,
+} audit_event_type_t;
+
+/* ============================================================
+   审计事件严重级别
+   ============================================================ */
+typedef enum {
+    AUDIT_SEVERITY_INFO = 0,
+    AUDIT_SEVERITY_WARN,
+    AUDIT_SEVERITY_ERROR,
+    AUDIT_SEVERITY_CRITICAL,
+    AUDIT_SEVERITY_EMERGENCY,
+} audit_severity_t;
+
+/* ============================================================
+   审计事件
+   ============================================================ */
+typedef struct audit_event {
+    uint64_t id;                    // 事件 ID (全局唯一)
+    audit_event_type_t type;        // 事件类型
+    audit_severity_t severity;      // 严重级别
+    uint64_t timestamp;             // 时间戳 (纳秒)
+    uint64_t task_id;               // 发起任务 ID
+    uint32_t uid;                   // 用户 ID
+    uint32_t gid;                   // 组 ID
+    char user[64];                  // 用户名
+    char session_id[64];            // 会话 ID
+    char source_ip[64];             // 源 IP
+    char target[256];               // 目标资源
+    char action[128];               // 操作描述
+    int result;                     // 结果 (0=成功, <0=失败)
+    char reason[256];               // 原因 (失败时)
+    uint32_t data_len;              // 附加数据长度
+    uint8_t *data;                  // 附加数据
+    struct audit_event *next;
+} audit_event_t;
+
+/* ============================================================
+   审计规则
+   ============================================================ */
+typedef struct audit_rule {
+    char id[64];                    // 规则 ID
+    char name[128];                 // 规则名称
+    int enabled;                    // 是否启用
+    audit_event_type_t *types;      // 匹配的事件类型列表
+    uint32_t type_count;
+    char *users[32];                // 匹配的用户列表 (通配符支持)
+    uint32_t user_count;
+    char *paths[32];                // 匹配的路径列表 (通配符支持)
+    uint32_t path_count;
+    char *commands[32];             // 匹配的命令列表
+    uint32_t command_count;
+    audit_severity_t min_severity;  // 最低严重级别
+    int log_execve;                 // 是否记录 execve 参数
+    int log_socket;                 // 是否记录 socket 调用
+    uint64_t rate_limit;            // 速率限制 (每秒最大事件数)
+    struct audit_rule *next;
+} audit_rule_t;
+
+/* ============================================================
+   审计查询
+   ============================================================ */
+typedef struct audit_query {
+    uint64_t start_time;            // 开始时间
+    uint64_t end_time;              // 结束时间
+    audit_event_type_t *types;      // 事件类型过滤
+    uint32_t type_count;
+    char user[64];                  // 用户过滤
+    char target[256];               // 目标过滤
+    audit_severity_t min_severity;  // 最低严重级别
+    uint32_t limit;                 // 返回条数限制
+    uint32_t offset;                // 偏移量
+    int order;                      // 排序 (0=升序, 1=降序)
+} audit_query_t;
+
+/* ============================================================
+   AUDIT 上下文
+   ============================================================ */
+typedef struct audit_context {
+    int initialized;
+    uint64_t audit_task_id;         // AUDIT 自身的任务 ID
+    
+    audit_rule_t *rules;            // 审计规则列表
+    audit_event_t *events;          // 事件缓存 (未持久化)
+    uint32_t event_count;
+    
+    // 审计日志文件
+    char log_path[256];
+    int log_fd;
+    uint64_t log_size;
+    uint64_t max_log_size;          // 最大日志大小 (触发轮转)
+    int max_log_files;              // 保留的日志文件数
+    
+    // 速率限制
+    uint64_t event_counter;
+    uint64_t last_reset_time;
+    
+    void *lock;
+} audit_context_t;
+```
+
+四、AUDIT 协议定义
+
+```protobuf
+// protocols/audit.proto
+syntax = "proto3";
+
+package hwrun.audit;
+
+service Audit {
+    // === 审计日志 ===
+    rpc Log(LogRequest) returns (LogResponse);
+    rpc Query(QueryRequest) returns (QueryResponse);
+    rpc Export(ExportRequest) returns (ExportResponse);
+    rpc Tail(TailRequest) returns (TailResponse);
+    
+    // === 审计策略 ===
+    rpc GetPolicy(Empty) returns (GetPolicyResponse);
+    rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse);
+    rpc AddRule(AddRuleRequest) returns (AddRuleResponse);
+    rpc RemoveRule(RemoveRuleRequest) returns (RemoveRuleResponse);
+    rpc ListRules(Empty) returns (ListRulesResponse);
+    
+    // === 审计管理 ===
+    rpc Rotate(RotateRequest) returns (RotateResponse);
+    rpc Status(Empty) returns (StatusResponse);
+}
+
+message Empty {}
+
+// ============ 审计事件 ============
+
+message AuditEvent {
+    uint64 id = 1;
+    uint32 type = 2;
+    uint32 severity = 3;
+    uint64 timestamp = 4;
+    uint32 uid = 5;
+    string user = 6;
+    string session_id = 7;
+    string source_ip = 8;
+    string target = 9;
+    string action = 10;
+    int32 result = 11;
+    string reason = 12;
+    bytes data = 13;
+}
+
+message LogRequest {
+    AuditEvent event = 1;
+}
+
+message LogResponse {
+    bool success = 1;
+    uint64 event_id = 2;
+    int32 error = 3;
+}
+
+// ============ 查询 ============
+
+message QueryRequest {
+    uint64 start_time = 1;
+    uint64 end_time = 2;
+    repeated uint32 types = 3;
+    string user = 4;
+    string target = 5;
+    uint32 min_severity = 6;
+    uint32 limit = 7;
+    uint32 offset = 8;
+    int32 order = 9;
+}
+
+message QueryResponse {
+    repeated AuditEvent events = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message ExportRequest {
+    uint64 start_time = 1;
+    uint64 end_time = 2;
+    string format = 3;              // "json", "csv", "syslog"
+    string file = 4;
+}
+
+message ExportResponse {
+    bool success = 1;
+    string exported_file = 2;
+    uint64 event_count = 3;
+    int32 error = 4;
+}
+
+message TailRequest {
+    uint32 lines = 1;
+    uint32 min_severity = 2;
+}
+
+message TailResponse {
+    repeated AuditEvent events = 1;
+    int32 error = 2;
+}
+
+// ============ 审计策略 ============
+
+message AuditRule {
+    string id = 1;
+    string name = 2;
+    bool enabled = 3;
+    repeated uint32 types = 4;
+    repeated string users = 5;
+    repeated string paths = 6;
+    repeated string commands = 7;
+    uint32 min_severity = 8;
+    bool log_execve = 9;
+    bool log_socket = 10;
+    uint64 rate_limit = 11;
+}
+
+message GetPolicyResponse {
+    repeated AuditRule rules = 1;
+    int32 error = 2;
+}
+
+message SetPolicyRequest {
+    repeated AuditRule rules = 1;
+}
+
+message SetPolicyResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message AddRuleRequest {
+    AuditRule rule = 1;
+}
+
+message AddRuleResponse {
+    bool success = 1;
+    string rule_id = 2;
+    int32 error = 3;
+}
+
+message RemoveRuleRequest {
+    string rule_id = 1;
+}
+
+message RemoveRuleResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message ListRulesResponse {
+    repeated AuditRule rules = 1;
+    int32 error = 2;
+}
+
+// ============ 审计管理 ============
+
+message RotateRequest {
+    bool force = 1;
+}
+
+message RotateResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StatusResponse {
+    uint64 total_events = 1;
+    uint64 log_size = 2;
+    uint64 event_rate = 3;          // 事件/秒
+    string log_file = 4;
+    int32 error = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// audit/src/audit.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/audit.h>
+#include <linux/security.h>
+
+#include "audit.h"
+#include "audit_ipc.h"
+#include "audit_events.h"
+#include "audit_rules.h"
+#include "audit_storage.h"
+#include "audit_hooks.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Audit Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static audit_context_t g_audit_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init audit_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun AUDIT: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_audit_ctx, 0, sizeof(audit_context_t));
+    
+    // 2. 设置审计日志路径
+    strcpy(g_audit_ctx.log_path, "/var/log/hwrun/audit.log");
+    g_audit_ctx.max_log_size = 100 * 1024 * 1024;  // 100MB
+    g_audit_ctx.max_log_files = 10;
+    
+    // 3. 初始化审计规则
+    audit_init_default_rules(&g_audit_ctx);
+    
+    // 4. 注册 LSM 钩子
+    ret = audit_hooks_register();
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun AUDIT: Failed to register LSM hooks\n");
+        // 继续运行，内核审计功能可能不可用
+    }
+    
+    // 5. 注册 IPC 消息处理器
+    ret = audit_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun AUDIT: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 6. 注册 AUDIT 协议
+    audit_register_protocol();
+    
+    g_audit_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun AUDIT: Initialized successfully\n");
+    printk(KERN_INFO "  Audit log: %s\n", g_audit_ctx.log_path);
+    printk(KERN_INFO "  Max log size: %lu MB, max files: %d\n",
+           g_audit_ctx.max_log_size / (1024 * 1024),
+           g_audit_ctx.max_log_files);
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit audit_exit(void) {
+    printk(KERN_INFO "HWRun AUDIT: Exiting...\n");
+    
+    audit_ipc_unregister();
+    audit_hooks_unregister();
+    
+    g_audit_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun AUDIT: Exited\n");
+}
+
+module_init(audit_init);
+module_exit(audit_exit);
+```
+
+5.2 审计事件记录
+
+```c
+// audit/src/audit_events.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/time.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
+#include <linux/uidgid.h>
+
+#include "audit.h"
+#include "audit_events.h"
+#include "audit_storage.h"
+#include "audit_rules.h"
+
+/* ============================================================
+   记录审计事件
+   ============================================================ */
+int audit_log_event(audit_event_type_t type, audit_severity_t severity,
+                     const char *target, const char *action,
+                     int result, const char *reason,
+                     const uint8_t *data, uint32_t data_len) {
+    struct audit_event *event;
+    struct task_struct *task;
+    const struct cred *cred;
+    int ret;
+    
+    // 1. 检查是否需要记录 (规则过滤)
+    if (!audit_should_log(type, severity, target)) {
+        return 0;  // 被规则过滤，不记录
+    }
+    
+    // 2. 检查速率限制
+    if (audit_rate_limit_exceeded()) {
+        return -EBUSY;
+    }
+    
+    // 3. 创建审计事件
+    event = kmalloc(sizeof(struct audit_event), GFP_KERNEL);
+    if (!event) {
+        return -ENOMEM;
+    }
+    
+    memset(event, 0, sizeof(struct audit_event));
+    
+    // 4. 填充事件信息
+    event->id = audit_generate_id();
+    event->type = type;
+    event->severity = severity;
+    event->timestamp = audit_get_timestamp_ns();
+    
+    // 获取当前任务信息
+    task = current;
+    cred = get_task_cred(task);
+    if (cred) {
+        event->uid = from_kuid(&init_user_ns, cred->uid);
+        event->gid = from_kgid(&init_user_ns, cred->gid);
+        // 获取用户名 (简化实现)
+        snprintf(event->user, sizeof(event->user), "uid-%d", event->uid);
+        put_cred(cred);
+    }
+    
+    event->task_id = (uint64_t)task->pid;
+    
+    if (target) {
+        strncpy(event->target, target, sizeof(event->target) - 1);
+    }
+    if (action) {
+        strncpy(event->action, action, sizeof(event->action) - 1);
+    }
+    event->result = result;
+    if (reason) {
+        strncpy(event->reason, reason, sizeof(event->reason) - 1);
+    }
+    
+    if (data && data_len > 0) {
+        event->data = kmalloc(data_len, GFP_KERNEL);
+        if (event->data) {
+            memcpy(event->data, data, data_len);
+            event->data_len = data_len;
+        }
+    }
+    
+    // 5. 持久化存储
+    ret = audit_storage_write(event);
+    if (ret < 0) {
+        kfree(event->data);
+        kfree(event);
+        return ret;
+    }
+    
+    // 6. 添加到缓存 (用于查询)
+    event->next = g_audit_ctx.events;
+    g_audit_ctx.events = event;
+    g_audit_ctx.event_count++;
+    
+    // 7. 触发告警 (严重事件)
+    if (severity >= AUDIT_SEVERITY_CRITICAL) {
+        audit_trigger_alert(event);
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   检查是否需要记录 (规则过滤)
+   ============================================================ */
+int audit_should_log(audit_event_type_t type, audit_severity_t severity,
+                      const char *target) {
+    audit_rule_t *rule = g_audit_ctx.rules;
+    
+    while (rule) {
+        if (!rule->enabled) {
+            rule = rule->next;
+            continue;
+        }
+        
+        // 检查严重级别
+        if (severity < rule->min_severity) {
+            rule = rule->next;
+            continue;
+        }
+        
+        // 检查事件类型
+        int type_match = 0;
+        for (int i = 0; i < rule->type_count; i++) {
+            if (rule->types[i] == type) {
+                type_match = 1;
+                break;
+            }
+        }
+        if (!type_match) {
+            rule = rule->next;
+            continue;
+        }
+        
+        // 检查目标路径 (通配符匹配)
+        if (rule->path_count > 0 && target) {
+            int path_match = 0;
+            for (int i = 0; i < rule->path_count; i++) {
+                if (audit_path_match(target, rule->paths[i])) {
+                    path_match = 1;
+                    break;
+                }
+            }
+            if (!path_match) {
+                rule = rule->next;
+                continue;
+            }
+        }
+        
+        // 所有条件满足，需要记录
+        return 1;
+    }
+    
+    // 没有匹配的规则，默认不记录
+    return 0;
+}
+```
+
+5.3 审计存储
+
+```c
+// audit/src/audit_storage.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/uaccess.h>
+#include <linux/seq_file.h>
+
+#include "audit.h"
+#include "audit_storage.h"
+
+/* ============================================================
+   写入审计事件到日志文件
+   ============================================================ */
+int audit_storage_write(struct audit_event *event) {
+    struct file *filp;
+    char buf[1024];
+    ssize_t written;
+    loff_t pos;
+    int ret;
+    
+    // 1. 检查日志文件大小，触发轮转
+    if (g_audit_ctx.log_size > g_audit_ctx.max_log_size) {
+        audit_storage_rotate();
+    }
+    
+    // 2. 打开审计日志文件
+    filp = filp_open(g_audit_ctx.log_path,
+                     O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (IS_ERR(filp)) {
+        return PTR_ERR(filp);
+    }
+    
+    // 3. 格式化审计事件
+    audit_format_event(event, buf, sizeof(buf));
+    
+    // 4. 写入文件
+    pos = filp->f_pos;
+    written = kernel_write(filp, buf, strlen(buf), &pos);
+    if (written < 0) {
+        filp_close(filp, NULL);
+        return written;
+    }
+    
+    g_audit_ctx.log_size += written;
+    
+    filp_close(filp, NULL);
+    return 0;
+}
+
+/* ============================================================
+   格式化审计事件
+   ============================================================ */
+void audit_format_event(struct audit_event *event, char *buf, size_t size) {
+    char time_str[32];
+    struct tm tm;
+    time_t t = event->timestamp / 1000000000ULL;
+    struct timespec ts = {.tv_sec = t, .tv_nsec = event->timestamp % 1000000000ULL};
+    
+    time_to_tm(t, 0, &tm);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm);
+    
+    char *type_str = audit_get_type_string(event->type);
+    char *sev_str = audit_get_severity_string(event->severity);
+    
+    snprintf(buf, size,
+             "[%s.%09ld] [%s] [%s] uid=%d user=%s target=%s action=%s result=%d%s%s\n",
+             time_str, ts.tv_nsec,
+             sev_str,
+             type_str,
+             event->uid,
+             event->user,
+             event->target,
+             event->action,
+             event->result,
+             event->reason[0] ? " reason=" : "",
+             event->reason);
+}
+```
+
+5.4 审计规则管理
+
+```c
+// audit/src/audit_rules.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "audit.h"
+#include "audit_rules.h"
+
+/* ============================================================
+   初始化默认审计规则
+   ============================================================ */
+void audit_init_default_rules(audit_context_t *ctx) {
+    // 默认规则：记录认证、授权、用户管理、配置变更等关键事件
+    audit_rule_t *rule;
+    
+    // 规则 1: 记录所有认证事件
+    rule = kmalloc(sizeof(audit_rule_t), GFP_KERNEL);
+    if (rule) {
+        memset(rule, 0, sizeof(audit_rule_t));
+        strcpy(rule->id, "auth-events");
+        strcpy(rule->name, "Authentication Events");
+        rule->enabled = 1;
+        rule->min_severity = AUDIT_SEVERITY_INFO;
+        rule->types = kmalloc(2 * sizeof(audit_event_type_t), GFP_KERNEL);
+        if (rule->types) {
+            rule->types[0] = AUDIT_EVENT_AUTH_SUCCESS;
+            rule->types[1] = AUDIT_EVENT_AUTH_FAILURE;
+            rule->type_count = 2;
+        }
+        rule->next = ctx->rules;
+        ctx->rules = rule;
+    }
+    
+    // 规则 2: 记录权限变更
+    rule = kmalloc(sizeof(audit_rule_t), GFP_KERNEL);
+    if (rule) {
+        memset(rule, 0, sizeof(audit_rule_t));
+        strcpy(rule->id, "perm-events");
+        strcpy(rule->name, "Permission Changes");
+        rule->enabled = 1;
+        rule->min_severity = AUDIT_SEVERITY_WARN;
+        rule->types = kmalloc(2 * sizeof(audit_event_type_t), GFP_KERNEL);
+        if (rule->types) {
+            rule->types[0] = AUDIT_EVENT_PERMISSION_GRANT;
+            rule->types[1] = AUDIT_EVENT_PERMISSION_REVOKE;
+            rule->type_count = 2;
+        }
+        rule->next = ctx->rules;
+        ctx->rules = rule;
+    }
+    
+    // 规则 3: 记录系统配置变更
+    rule = kmalloc(sizeof(audit_rule_t), GFP_KERNEL);
+    if (rule) {
+        memset(rule, 0, sizeof(audit_rule_t));
+        strcpy(rule->id, "config-events");
+        strcpy(rule->name, "Configuration Changes");
+        rule->enabled = 1;
+        rule->min_severity = AUDIT_SEVERITY_WARN;
+        rule->types = kmalloc(sizeof(audit_event_type_t), GFP_KERNEL);
+        if (rule->types) {
+            rule->types[0] = AUDIT_EVENT_CONFIG_CHANGE;
+            rule->type_count = 1;
+        }
+        rule->next = ctx->rules;
+        ctx->rules = rule;
+    }
+}
+
+/* ============================================================
+   添加审计规则
+   ============================================================ */
+int audit_add_rule(audit_rule_t *new_rule, char *out_id) {
+    audit_rule_t *rule;
+    
+    // 复制规则
+    rule = kmalloc(sizeof(audit_rule_t), GFP_KERNEL);
+    if (!rule) {
+        return -ENOMEM;
+    }
+    
+    memcpy(rule, new_rule, sizeof(audit_rule_t));
+    rule->next = g_audit_ctx.rules;
+    g_audit_ctx.rules = rule;
+    
+    if (out_id) {
+        strncpy(out_id, rule->id, 63);
+    }
+    
+    return 0;
+}
+```
+
+5.5 LSM 钩子集成
+
+```c
+// audit/src/audit_hooks.c
+
+#include <linux/security.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
+
+#include "audit.h"
+#include "audit_hooks.h"
+#include "audit_events.h"
+
+/* ============================================================
+   文件访问钩子 (LSM)
+   ============================================================ */
+static int audit_inode_permission(struct inode *inode, int mask) {
+    struct cred *cred;
+    char path_buf[256];
+    char *path_ptr;
+    
+    // 只在需要审计时才记录
+    // 实际实现中需要检查规则
+    
+    return 0;  // 允许访问，只记录不拦截
+}
+
+/* ============================================================
+   进程创建钩子 (LSM)
+   ============================================================ */
+static int audit_task_alloc(struct task_struct *task, unsigned long clone_flags) {
+    // 记录进程创建事件
+    // audit_log_event(AUDIT_EVENT_PROCESS_START, ...);
+    return 0;
+}
+
+/* ============================================================
+   LSM 钩子表
+   ============================================================ */
+static struct security_hook_list audit_hooks[] = {
+    LSM_HOOK_INIT(inode_permission, audit_inode_permission),
+    LSM_HOOK_INIT(task_alloc, audit_task_alloc),
+};
+
+/* ============================================================
+   注册 LSM 钩子
+   ============================================================ */
+int audit_hooks_register(void) {
+    security_add_hooks(audit_hooks, ARRAY_SIZE(audit_hooks), "hwrun_audit");
+    return 0;
+}
+
+/* ============================================================
+   注销 LSM 钩子
+   ============================================================ */
+void audit_hooks_unregister(void) {
+    // LSM 框架没有提供移除钩子的机制
+    printk(KERN_INFO "HWRun AUDIT: LSM hooks unregistered\n");
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// audit/src/audit_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "audit.h"
+#include "audit_ipc.h"
+#include "audit_events.h"
+#include "audit_rules.h"
+#include "audit_storage.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void audit_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case AUDIT_MSG_LOG: {
+            audit_log_req_t *req = (audit_log_req_t *)data;
+            audit_log_resp_t resp;
+            int ret = audit_log_event(req->type, req->severity,
+                                       req->target, req->action,
+                                       req->result, req->reason,
+                                       req->data, req->data_len);
+            resp.success = (ret == 0);
+            resp.event_id = (ret == 0) ? audit_generate_id() : 0;
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case AUDIT_MSG_QUERY: {
+            audit_query_req_t *req = (audit_query_req_t *)data;
+            audit_query_resp_t resp;
+            // 查询审计日志
+            // 从存储中读取符合条件的日志条目
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case AUDIT_MSG_ADD_RULE: {
+            audit_rule_t *rule = (audit_rule_t *)data;
+            char rule_id[64];
+            int ret = audit_add_rule(rule, rule_id);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case AUDIT_MSG_GET_POLICY: {
+            // 返回所有规则
+            ipc_reply(from_task, g_audit_ctx.rules, 0);
+            break;
+        }
+        
+        case AUDIT_MSG_ROTATE: {
+            int ret = audit_storage_rotate();
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun AUDIT: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/audit.yml
+audit:
+  # 审计日志配置
+  log:
+    path: "/var/log/hwrun/audit.log"
+    max_size: "100MB"
+    max_files: 10
+    compress: true
+  
+  # 默认审计规则
+  rules:
+    - id: "auth-events"
+      name: "认证事件"
+      enabled: true
+      types: ["AUTH_SUCCESS", "AUTH_FAILURE"]
+      severity: "info"
+    
+    - id: "perm-events"
+      name: "权限变更"
+      enabled: true
+      types: ["PERMISSION_GRANT", "PERMISSION_REVOKE"]
+      severity: "warn"
+    
+    - id: "config-events"
+      name: "配置变更"
+      enabled: true
+      types: ["CONFIG_CHANGE"]
+      severity: "warn"
+    
+    - id: "user-events"
+      name: "用户管理"
+      enabled: true
+      types: ["USER_ADD", "USER_REMOVE", "USER_MODIFY"]
+      severity: "warn"
+    
+    - id: "plugin-events"
+      name: "插件管理"
+      enabled: true
+      types: ["PLUGIN_INSTALL", "PLUGIN_REMOVE"]
+      severity: "warn"
+    
+    - id: "security-alerts"
+      name: "安全告警"
+      enabled: true
+      types: ["SECURITY_ALERT"]
+      severity: "critical"
+  
+  # 速率限制
+  rate_limit: 1000  # 每秒最大事件数
+```
+
+七、命令行接口
+
+```bash
+# 查看审计日志
+hwrun audit query
+hwrun audit query --start "2026-09-01" --end "2026-09-07"
+hwrun audit query --type AUTH_FAILURE
+hwrun audit query --user admin --limit 20
+
+# 实时查看审计日志
+hwrun audit tail
+hwrun audit tail --lines 50 --severity warn
+
+# 导出审计日志
+hwrun audit export --format json --file /tmp/audit.json
+hwrun audit export --format csv --start "2026-09-01" --end "2026-09-07"
+
+# 审计规则管理
+hwrun audit rule list
+hwrun audit rule add --name "文件访问" --type FILE_READ,FILE_WRITE --path /etc/hwrun
+hwrun audit rule remove rule-001
+hwrun audit rule enable rule-001
+hwrun audit rule disable rule-001
+
+# 审计管理
+hwrun audit status
+hwrun audit rotate
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/audit/plugin.yml
+plugin:
+  id: "audit"
+  name: "Audit Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 审计协议，提供系统安全审计、操作日志、合规追踪、事件监控等完整审计能力"
+  
+  provides:
+    - protocol: "AUDIT"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "SP"
+      version: "1.0"
+    - protocol: "PERMISSION"
+      version: "1.0"
+  
+  params:
+    - key: "audit.log.path"
+      type: "string"
+      default: "/var/log/hwrun/audit.log"
+      description: "审计日志路径"
+    - key: "audit.log.max_size"
+      type: "string"
+      default: "100MB"
+      description: "最大日志大小"
+    - key: "audit.log.max_files"
+      type: "int"
+      default: 10
+      description: "保留的日志文件数"
+    - key: "audit.rate_limit"
+      type: "int"
+      default: 1000
+      description: "速率限制 (事件/秒)"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/audit.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# audit/Makefile
+
+obj-m += audit.o
+
+audit-objs := audit.o audit_events.o audit_rules.o \
+              audit_storage.o audit_hooks.o audit_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 audit.ko /usr/lib/hwrun/plugins/
+```
+
+九、合规性支持
+
+合规标准 要求 AUDIT 支持
+PCI-DSS 审计日志记录所有系统访问 ✅ 完整支持
+HIPAA 审计日志保留 6 年 ✅ 日志轮转+归档
+GDPR 数据访问审计 ✅ 用户+数据审计
+SOX 财务系统审计 ✅ 配置变更审计
+ISO 27001 安全事件审计 ✅ 完整事件审计
+
+十、总结
+
+维度 决策
+定位 审计协议，所有安全审计的统一入口
+实现方式 Linux 内核模块，基于 LSM 钩子
+代码量 ~1200-1500 行 C
+提供协议 AUDIT (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + SP + PERMISSION
+审计事件 认证、授权、用户管理、配置变更、文件访问、进程管理、网络连接、插件管理、实例管理等
+合规支持 PCI-DSS、HIPAA、GDPR、SOX、ISO 27001
+
+AUDIT 是 HWRun OS 中审计的核心插件。它基于 Linux 内核的 LSM 钩子，通过 AUDIT 协议向上层插件提供完整的安全审计能力。AUDIT 记录系统中所有安全相关事件，通过灵活的审计规则控制记录范围，通过持久化存储保证审计日志的完整性和不可篡改性。上层插件（PERMISSION、SP、PKGMGR、CLUSTER、MONITOR 等）通过 AUDIT 协议记录审计事件，不直接操作内核审计子系统。

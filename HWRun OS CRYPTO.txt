@@ -1,0 +1,1095 @@
+HWRun OS CRYPTO 实现文档
+
+模块名称： CRYPTO (Cryptographic Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 加密协议，提供对称/非对称加密、哈希、数字签名、密钥管理、随机数等密码学操作的统一抽象（SP 安全协议的子模块）
+实现语言： C（内核模块，基于 Linux Kernel Crypto API）
+依赖： 微内核（任务、IPC、内存）、PARAM（参数读取）、LOG（日志记录）、SP（安全协议宿主，提供密钥与授权上下文）
+提供协议： CRYPTO
+宿主模块： SP（CRYPTO 作为 SP 的加密子模块，随 SP 一起加载，通过 CRYPTO 协议对外提供加密服务）
+
+一、设计哲学
+
+1.1 核心定位
+
+CRYPTO 是 HWRun OS 的密码学服务核心，作为 SP（安全协议）的加密子模块，为系统提供对称加密、非对称加密、哈希摘要、数字签名、密钥管理与安全随机数等全部密码学原语。
+
+```
+CRYPTO = 加密协议 = 所有密码学操作的统一入口 (SP 子模块)
+
+上层插件 (PERMISSION, CLUSTER, FS_TRANSFER, STORAGE, NODE_DISCOVERY,
+          CONSENSUS, COMPRESS, AUDIT, ...)
+    │
+    │  通过 CRYPTO 协议执行加密/签名/哈希/密钥管理
+    ▼
+SP 插件 (内核模块)
+    ├── CRYPTO 子模块 (sp_crypto)
+    │   ├── 对称加密 (SKCipher/AEAD)   → AES-GCM, ChaCha20-Poly1305, ...
+    │   ├── 哈希 (Shash)               → SHA-256, SHA-512, SM3, ...
+    │   ├── 非对称 (AKCipher/ECC)      → RSA, ECDSA, SM2, ...
+    │   ├── 密钥管理 (Keyring)         → 密钥环/长期密钥
+    │   └── 随机数 (RNG)               → 安全随机数
+    │
+    ▼
+Linux 内核 (Crypto API / asm-generic/crypto)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有密码学操作通过 CRYPTO 协议进行
+2. 内核原语：直接使用 Linux Kernel Crypto API，不重复实现算法
+3. 算法可配：支持的算法清单通过配置控制，可禁用弱算法
+4. 密钥保护：密钥仅存在于内核密钥环，用户态不可直接读取明文密钥
+5. 认证结合：加密同时提供认证（AEAD），默认使用带认证的对称加密
+6. 子模块归属：CRYPTO 逻辑上属于 SP，随 SP 生命周期加载/卸载
+
+1.3 为何 CRYPTO 属于 SP
+
+SP（Security Protocol）负责 HWRun OS 的整体安全（加密、认证、授权、签名、密钥、IMA）。其中加密原语独立抽取为 CRYPTO 子模块与 CRYPTO 协议，使：
+
+· SP 其余部分（认证、授权、访问控制）可作为上层安全策略引用 CRYPTO 提供的透明加密能力
+· 其它模块（STORAGE 卷加密、FS_TRANSFER 传输加密、CONSENSUS 签名）只依赖 CRYPTO 协议，不关心 SP 内部策略
+
+```
+CRYPTO 提供的原语：加密/解密、哈希、签名/验签、密钥生成/导入/封存、随机数
+SP 提供的策略：    认证、授权、访问控制、完整性度量 (IMA)、密钥访问授权
+```
+
+1.4 Linux Kernel Crypto API
+
+Linux 内核通过 crypto API 暴露加密算法，主要接口：
+
+接口 用途
+crypto_alloc_skcipher() 对称流/块密码 (如 AES-CBC)
+crypto_alloc_aead() AEAD 认证加密 (如 AES-GCM)
+crypto_alloc_shash() 同步哈希 (如 SHA-256)
+crypto_alloc_akcipher() 非对称 (如 RSA)
+crypto_alloc_kpp() ECC 密钥交换 (ECDH)
+crypto_alloc_rng() 随机数生成器
+
+密钥管理使用内核密钥环（keyring）与 keyctl 接口，密钥生命周期由内核管理。
+
+二、整体架构
+
+2.1 CRYPTO 子模块的组成
+
+```
+SP 插件 (sp.ko)
+└── CRYPTO 子模块 (sp_crypto)
+    ├── 协议处理层
+    │   ├── crypto_ipc_handler()     ← IPC 消息分发
+    │   ├── crypto_encrypt()         ← 对称加密
+    │   ├── crypto_decrypt()         ← 对称解密
+    │   ├── crypto_hash()            ← 哈希
+    │   ├── crypto_hmac()            ← HMAC
+    │   ├── crypto_sign()            ← 签名
+    │   ├── crypto_verify()          ← 验签
+    │   ├── crypto_generate_key()    ← 密钥生成
+    │   └── crypto_random()          ← 安全随机数
+    │
+    ├── 算法封装层
+    │   ├── crypto_symmetric.c       ← SKCipher/AEAD 对称加解密
+    │   ├── crypto_hash.c            ← Shash 哈希/HMAC
+    │   ├── crypto_asymmetric.c      ← AKCipher/ECC 签名/非对称
+    │   ├── crypto_key.c             ← keyring 密钥管理
+    │   └── crypto_rng.c             ← 随机数
+    │
+    └── 初始/清理
+        ├── crypto_init()            ← 随 SP 初始化
+        └── crypto_exit()            ← 随 SP 卸载
+```
+
+2.2 CRYPTO 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → ...
+                                                                          ↑
+                                                         SP (含 CRYPTO 子模块) 在这里加载
+```
+
+CRYPTO 不单独占启动位点，它随 SP 在 FSP、NP 之后加载，在 LOADER、CLUSTER 等需要加密能力的模块之前就绪。
+
+2.3 CRYPTO 的上层消费者
+
+上层插件 需要 CRYPTO 提供什么
+PERMISSION (权限) 凭据哈希、成形令牌校验
+CLUSTER (集群) 节点间成员凭证签名
+FS_TRANSFER (文件传输) 传输数据加密与完整性
+STORAGE (存储) 卷级加密 (dm-crypt)、快照哈希
+NODE_DISCOVERY (节点发现) 发现消息认证
+CONSENSUS (共识) 日志条目签名/HMAC
+COMPRESS (压缩) 压缩流的校验与可选加密
+AUDIT (审计) 审计日志完整性 (哈希链)
+
+三、核心数据结构
+
+```c
+// sp/include/crypto.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   密码算法标识
+   ============================================================ */
+typedef enum {
+    CRYPTO_CIPHER_AES_GCM_128 = 0,      // AES-128-GCM (AEAD)
+    CRYPTO_CIPHER_AES_GCM_256,          // AES-256-GCM (AEAD)
+    CRYPTO_CIPHER_CHACHA20_POLY1305,    // ChaCha20-Poly1305 (AEAD)
+    CRYPTO_CIPHER_AES_CBC_256,          // AES-256-CBC (SKCipher)
+    CRYPTO_CIPHER_AES_XTS_256,          // AES-256-XTS (存储卷)
+} crypto_cipher_t;
+
+typedef enum {
+    CRYPTO_HASH_SHA_256 = 0,
+    CRYPTO_HASH_SHA_512,
+    CRYPTO_HASH_SHA3_256,
+    CRYPTO_HASH_SM3,
+    CRYPTO_HASH_BLAKE2S,
+} crypto_hash_t;
+
+typedef enum {
+    CRYPTO_ASYM_RSA_2048 = 0,
+    CRYPTO_ASYM_RSA_4096,
+    CRYPTO_ASYM_ECDSA_P256,
+    CRYPTO_ASYM_ECDSA_P384,
+    CRYPTO_ASYM_ED25519,
+    CRYPTO_ASYM_SM2,
+} crypto_asym_t;
+
+/* ============================================================
+   加密结果
+   ============================================================ */
+typedef struct crypto_aead_result {
+    uint8_t *ciphertext;             // 密文
+    uint32_t ciphertext_len;         // 密文长度
+    uint8_t *tag;                    // 认证标签 (AEAD)
+    uint32_t tag_len;                // 标签长度
+    uint8_t *iv;                     // 初始化向量 (由内核生成)
+    uint32_t iv_len;                 // IV 长度
+} crypto_aead_result_t;
+
+/* ============================================================
+   密钥描述
+   ============================================================ */
+typedef struct crypto_key {
+    char key_id[64];                 // keyring 中密钥 ID
+    uint32_t key_type;               // user / logon / trusted / encrypted
+    uint32_t cipher;                 // crypto_cipher_t
+    char description[128];           // 描述
+    uint32_t lifetime_s;             // 有效期 (秒)
+    int persistent;                  // 是否持久密钥
+} crypto_key_t;
+
+/* ============================================================
+   算法能力
+   ============================================================ */
+typedef struct crypto_capability {
+    int cipher_supported[16];        // 支持的对称算法位图
+    int hash_supported[16];          // 支持的哈希位图
+    int asym_supported[16];          // 支持的非对称位图
+    int rng_available;               // 随机数是否可用
+} crypto_capability_t;
+```
+
+四、CRYPTO 协议定义
+
+```protobuf
+// protocols/crypto.proto
+syntax = "proto3";
+
+package hwrun.crypto;
+
+service Crypto {
+    // === 对称加密 ===
+    rpc Encrypt(EncryptRequest) returns (EncryptResponse);
+    rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+
+    // === 哈希 ===
+    rpc Hash(HashRequest) returns (HashResponse);
+    rpc Hmac(HmacRequest) returns (HmacResponse);
+
+    // === 非对称/签名 ===
+    rpc Sign(SignRequest) returns (SignResponse);
+    rpc Verify(VerifyRequest) returns (VerifyResponse);
+    rpc EncryptAsym(AsymEncryptRequest) returns (AsymEncryptResponse);
+    rpc DecryptAsym(AsymDecryptRequest) returns (AsymDecryptResponse);
+
+    // === 密钥管理 ===
+    rpc GenerateKey(GenerateKeyRequest) returns (GenerateKeyResponse);
+    rpc ImportKey(ImportKeyRequest) returns (ImportKeyResponse);
+    rpc ExportKey(ExportKeyRequest) returns (ExportKeyResponse);
+    rpc DestroyKey(DestroyKeyRequest) returns (DestroyKeyResponse);
+    rpc ListKeys(Empty) returns (ListKeysResponse);
+
+    // === 随机数与能力 ===
+    rpc Random(RandomRequest) returns (RandomResponse);
+    rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
+}
+
+message Empty {}
+
+// ============ 对称加密 ============
+
+message EncryptRequest {
+    uint32 cipher = 1;              // crypto_cipher_t
+    string key_id = 2;              // 密钥 (由 GenerateKey/ImportKey 建立)
+    bytes plaintext = 3;
+    bytes aad = 4;                  // 附加认证数据 (可空)
+}
+
+message EncryptResponse {
+    bytes ciphertext = 1;
+    bytes iv = 2;
+    bytes tag = 3;
+    int32 error = 4;
+}
+
+message DecryptRequest {
+    uint32 cipher = 1;
+    string key_id = 2;
+    bytes ciphertext = 3;
+    bytes iv = 4;
+    bytes tag = 5;
+    bytes aad = 6;
+}
+
+message DecryptResponse {
+    bytes plaintext = 1;
+    int32 error = 2;
+}
+
+// ============ 哈希 ============
+
+message HashRequest {
+    uint32 hash_algo = 1;           // crypto_hash_t
+    bytes data = 2;
+}
+
+message HashResponse {
+    bytes digest = 1;
+    int32 error = 2;
+}
+
+message HmacRequest {
+    uint32 hash_algo = 1;
+    string key_id = 2;
+    bytes data = 3;
+}
+
+message HmacResponse {
+    bytes mac = 1;
+    int32 error = 2;
+}
+
+// ============ 非对称/签名 ============
+
+message SignRequest {
+    uint32 asym_algo = 1;
+    string key_id = 2;
+    bytes data = 3;
+}
+
+message SignResponse {
+    bytes signature = 1;
+    int32 error = 2;
+}
+
+message VerifyRequest {
+    uint32 asym_algo = 1;
+    string pubkey_id = 2;
+    bytes data = 3;
+    bytes signature = 4;
+}
+
+message VerifyResponse {
+    bool valid = 1;
+    int32 error = 2;
+}
+
+message AsymEncryptRequest {
+    uint32 asym_algo = 1;
+    string key_id = 2;
+    bytes plaintext = 3;
+}
+
+message AsymEncryptResponse {
+    bytes ciphertext = 1;
+    int32 error = 2;
+}
+
+message AsymDecryptRequest {
+    uint32 asym_algo = 1;
+    string key_id = 2;
+    bytes ciphertext = 3;
+}
+
+message AsymDecryptResponse {
+    bytes plaintext = 1;
+    int32 error = 2;
+}
+
+// ============ 密钥管理 ============
+
+message GenerateKeyRequest {
+    uint32 algorithm = 1;           // 对称或非对称
+    bool is_asymmetric = 2;
+    string description = 3;
+    uint32 lifetime_s = 4;
+    bool persistent = 5;
+}
+
+message GenerateKeyResponse {
+    string key_id = 1;
+    int32 error = 2;
+}
+
+message ImportKeyRequest {
+    bytes key_data = 1;
+    bool is_asymmetric = 2;
+    uint32 algorithm = 3;
+    string description = 4;
+    bool persistent = 5;
+}
+
+message ImportKeyResponse {
+    string key_id = 1;
+    int32 error = 2;
+}
+
+message ExportKeyRequest {
+    string key_id = 1;
+}
+
+message ExportKeyResponse {
+    bytes key_data = 1;
+    int32 error = 2;
+}
+
+message DestroyKeyRequest {
+    string key_id = 1;
+}
+
+message DestroyKeyResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message KeyEntry {
+    string key_id = 1;
+    string description = 2;
+    uint32 key_type = 3;
+    uint32 algorithm = 4;
+}
+
+message ListKeysResponse {
+    repeated KeyEntry keys = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+// ============ 随机数与能力 ============
+
+message RandomRequest {
+    uint32 length = 1;
+}
+
+message RandomResponse {
+    bytes data = 1;
+    int32 error = 2;
+}
+
+message CapabilitiesResponse {
+    repeated uint32 ciphers = 1;
+    repeated uint32 hashes = 2;
+    repeated uint32 asyms = 3;
+    bool rng_available = 4;
+    int32 error = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 初始化（随 SP 加载）
+
+```c
+// sp/src/crypto/crypto_init.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/crypto.h>
+#include <crypto/aead.h>
+#include <crypto/hash.h>
+#include <crypto/skcipher.h>
+#include <crypto/akcipher.h>
+#include <linux/random.h>
+
+#include "crypto.h"
+#include "crypto_ipc.h"
+
+/* ============================================================
+   CRYPTO 子模块初始化 (由 SP 调用)
+   ============================================================ */
+int crypto_init(void) {
+    int ret;
+
+    printk(KERN_INFO "HWRun CRYPTO: Initializing...\n");
+
+    // 1. 探测支持的算法
+    ret = crypto_probe_capabilities();
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun CRYPTO: capability probe warning\n");
+    }
+
+    // 2. 初始化密钥环
+    ret = crypto_key_init();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun CRYPTO: keyring init failed\n");
+        return ret;
+    }
+
+    // 3. 注册 IPC 处理器
+    ret = crypto_ipc_register();
+    if (ret < 0) {
+        return ret;
+    }
+
+    // 4. 注册 CRYPTO 协议
+    crypto_register_protocol();
+
+    printk(KERN_INFO "HWRun CRYPTO: Initialized successfully\n");
+    return 0;
+}
+
+/* ============================================================
+   CRYPTO 子模块清理 (由 SP 调用)
+   ============================================================ */
+void crypto_exit(void) {
+    crypto_ipc_unregister();
+    crypto_key_cleanup();
+    printk(KERN_INFO "HWRun CRYPTO: Exited\n");
+}
+```
+
+5.2 对称加密 (AEAD)
+
+使用 kernel crypto API 的 AEAD 接口，推荐 AES-GCM（同时提供机密性与完整性）。
+
+```c
+// sp/src/crypto/crypto_symmetric.c
+
+#include <linux/kernel.h>
+#include <linux/crypto.h>
+#include <crypto/aead.h>
+#include <crypto/skcipher.h>
+#include <crypto/gcm.h>
+#include <linux/scatterlist.h>
+#include <linux/gfp.h>
+#include <crypto/rng.h>
+#include <linux/random.h>
+
+#include "crypto.h"
+
+/* ============================================================
+   对称加密 (AEAD, 如 AES-GCM)
+   ============================================================ */
+int crypto_aead_encrypt(const char *alg_name,
+                        const uint8_t *key, uint32_t key_len,
+                        const uint8_t *iv, uint32_t iv_len,
+                        const uint8_t *aad, uint32_t aad_len,
+                        const uint8_t *pt, uint32_t pt_len,
+                        uint8_t *ct, uint8_t *tag, uint32_t tag_len) {
+    struct crypto_aead *tfm;
+    struct aead_request *req;
+    struct scatterlist sg[2];
+    uint8_t *data;
+    uint32_t cipher_len = pt_len;
+    int ret;
+
+    // 1. 分配算法实例
+    tfm = crypto_alloc_aead(alg_name, 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+
+    // 2. 设置密钥
+    ret = crypto_aead_setkey(tfm, key, key_len);
+    if (ret) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+
+    // 3. 设置标签长度
+    ret = crypto_aead_setauthsize(tfm, tag_len);
+    if (ret) {
+        crypto_free_aead(tfm);
+        return ret;
+    }
+
+    // 4. 准备请求与数据缓冲 (密文 = 明文 + 标签)
+    req = aead_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+
+    data = kmalloc(cipher_len + tag_len, GFP_KERNEL);
+    if (!data) {
+        aead_request_free(req);
+        crypto_free_aead(tfm);
+        return -ENOMEM;
+    }
+    memcpy(data, pt, pt_len);
+
+    sg_init_table(sg, 2);
+    sg_set_buf(&sg[0], data, pt_len);                       // 明文部分
+    sg_set_buf(&sg[1], data + pt_len, tag_len);             // 标签部分
+
+    aead_request_set_crypt(req, sg, sg, pt_len, iv);
+    aead_request_set_ad(req, aad_len);
+    aead_request_set_tfm(req, tfm);
+
+    // 5. 执行加密 (同步路径)
+    ret = crypto_aead_encrypt(req);
+
+    if (ret == 0) {
+        memcpy(ct, data, pt_len);
+        memcpy(tag, data + pt_len, tag_len);
+    }
+
+    kfree(data);
+    aead_request_free(req);
+    crypto_free_aead(tfm);
+    return ret;
+}
+
+/* ============================================================
+   对称解密 (AEAD, 校验标签失败返回错误)
+   ============================================================ */
+int crypto_aead_decrypt(const char *alg_name,
+                        const uint8_t *key, uint32_t key_len,
+                        const uint8_t *iv, uint32_t iv_len,
+                        const uint8_t *aad, uint32_t aad_len,
+                        const uint8_t *ct, uint32_t ct_len,
+                        const uint8_t *tag, uint32_t tag_len,
+                        uint8_t *pt) {
+    struct crypto_aead *tfm;
+    struct aead_request *req;
+    struct scatterlist sg[2];
+    uint8_t *data;
+    int ret;
+
+    tfm = crypto_alloc_aead(alg_name, 0, 0);
+    if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+    ret = crypto_aead_setkey(tfm, key, key_len);
+    if (ret) { crypto_free_aead(tfm); return ret; }
+
+    ret = crypto_aead_setauthsize(tfm, tag_len);
+    if (ret) { crypto_free_aead(tfm); return ret; }
+
+    req = aead_request_alloc(tfm, GFP_KERNEL);
+    if (!req) { crypto_free_aead(tfm); return -ENOMEM; }
+
+    // 密文 + 标签组成待解密数据
+    data = kmalloc(ct_len + tag_len, GFP_KERNEL);
+    if (!data) { aead_request_free(req); crypto_free_aead(tfm); return -ENOMEM; }
+    memcpy(data, ct, ct_len);
+    memcpy(data + ct_len, tag, tag_len);
+
+    sg_init_table(sg, 2);
+    sg_set_buf(&sg[0], data, ct_len);
+    sg_set_buf(&sg[1], data + ct_len, tag_len);
+
+    aead_request_set_crypt(req, sg, sg, ct_len, iv);
+    aead_request_set_ad(req, aad_len);
+
+    ret = crypto_aead_decrypt(req);
+
+    // 校验失败时 ret < 0，密文不可信
+    if (ret == 0) {
+        memcpy(pt, data, ct_len);
+    }
+
+    kfree(data);
+    aead_request_free(req);
+    crypto_free_aead(tfm);
+    return ret;
+}
+```
+
+5.3 哈希与 HMAC
+
+使用 shash 接口计算同步哈希。
+
+```c
+// sp/src/crypto/crypto_hash.c
+
+#include <linux/kernel.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+
+#include "crypto.h"
+
+/* ============================================================
+   计算哈希
+   ============================================================ */
+int crypto_hash(const char *alg_name,
+                const uint8_t *data, uint32_t data_len,
+                uint8_t *out_hash, uint32_t hash_len) {
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int ret;
+
+    tfm = crypto_alloc_shash(alg_name, 0, 0);
+    if (IS_ERR(tfm)) {
+        return PTR_ERR(tfm);
+    }
+
+    desc = kmalloc(sizeof(struct shash_desc) +
+                   crypto_shash_descsize(tfm), GFP_KERNEL);
+    if (!desc) {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+
+    desc->tfm = tfm;
+    ret = crypto_shash_digest(desc, data, data_len, out_hash);
+
+    kfree(desc);
+    crypto_free_shash(tfm);
+    return ret;
+}
+
+/* ============================================================
+   计算 HMAC (密钥哈希)
+   ============================================================ */
+int crypto_hmac(const char *alg_name,
+                const uint8_t *key, uint32_t key_len,
+                const uint8_t *data, uint32_t data_len,
+                uint8_t *out_mac, uint32_t mac_len) {
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int ret;
+
+    tfm = crypto_alloc_shash(alg_name, 0, 0);
+    if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+    desc = kmalloc(sizeof(struct shash_desc) +
+                   crypto_shash_descsize(tfm), GFP_KERNEL);
+    if (!desc) { crypto_free_shash(tfm); return -ENOMEM; }
+
+    desc->tfm = tfm;
+
+    // 1. setkey (HMAC 模式)
+    ret = crypto_shash_setkey(tfm, key, key_len);
+    if (ret) goto out;
+
+    // 2. 初始化
+    ret = crypto_shash_init(desc);
+    if (ret) goto out;
+
+    // 3. 更新 + 最终
+    ret = crypto_shash_update(desc, data, data_len);
+    if (ret) goto out;
+
+    ret = crypto_shash_final(desc, out_mac);
+
+out:
+    kfree(desc);
+    crypto_free_shash(tfm);
+    return ret;
+}
+```
+
+5.4 非对称加密与签名
+
+使用 akcipher 接口处理 RSA/ECC 签名与验签。
+
+```c
+// sp/src/crypto/crypto_asymmetric.c
+
+#include <linux/kernel.h>
+#include <linux/crypto.h>
+#include <crypto/akcipher.h>
+#include <crypto/sig.h>
+#include <crypto/public_key.h>
+
+#include "crypto.h"
+
+/* ============================================================
+   数字签名
+   ============================================================ */
+int crypto_sign(const char *alg_name,
+                const uint8_t *hash, uint32_t hash_len,
+                const uint8_t *priv_key, uint32_t key_len,
+                uint8_t *sig, uint32_t *sig_len) {
+    struct crypto_akcipher *tfm;
+    struct akcipher_request *req;
+    struct scatterlist src, dst;
+    int ret;
+    uint8_t *buf;
+
+    tfm = crypto_alloc_akcipher(alg_name, 0, 0);
+    if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+    // 设置私钥 (密钥格式化，PKCS#1 或原始参数)
+    ret = crypto_akcipher_set_pub_key(tfm, priv_key, key_len);
+    if (ret == -EINVAL) {
+        ret = crypto_akcipher_set_priv_key(tfm, priv_key, key_len);
+    }
+    if (ret) { crypto_free_akcipher(tfm); return ret; }
+
+    req = akcipher_request_alloc(tfm, GFP_KERNEL);
+    if (!req) { crypto_free_akcipher(tfm); return -ENOMEM; }
+
+    // 签名输出缓冲
+    buf = kzalloc(*sig_len, GFP_KERNEL);
+    if (!buf) { akcipher_request_free(req); crypto_free_akcipher(tfm); return -ENOMEM; }
+
+    sg_init_one(&src, (void *)hash, hash_len);
+    sg_init_one(&dst, buf, *sig_len);
+
+    // 敏感数据交换链接 (SIG 需要提供与密钥内嵌哈希算法一致的输入)
+    akcipher_request_set_crypt(req, &src, &dst, hash_len, *sig_len);
+    ret = crypto_akcipher_sign(req);
+
+    if (ret == 0) {
+        memcpy(sig, buf, *sig_len);
+    }
+
+    kfree(buf);
+    akcipher_request_free(req);
+    crypto_free_akcipher(tfm);
+    return ret;
+}
+
+/* ============================================================
+   验签
+   ============================================================ */
+int crypto_verify(const char *alg_name,
+                  const uint8_t *hash, uint32_t hash_len,
+                  const uint8_t *pub_key, uint32_t key_len,
+                  const uint8_t *sig, uint32_t sig_len) {
+    struct crypto_akcipher *tfm;
+    struct akcipher_request *req;
+    struct scatterlist src, dst;
+    uint8_t *out;
+    int ret;
+
+    tfm = crypto_alloc_akcipher(alg_name, 0, 0);
+    if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+    ret = crypto_akcipher_set_pub_key(tfm, pub_key, key_len);
+    if (ret) { crypto_free_akcipher(tfm); return ret; }
+
+    req = akcipher_request_alloc(tfm, GFP_KERNEL);
+    if (!req) { crypto_free_akcipher(tfm); return -ENOMEM; }
+
+    out = kzalloc(sig_len, GFP_KERNEL);
+    if (!out) { akcipher_request_free(req); crypto_free_akcipher(tfm); return -ENOMEM; }
+
+    sg_init_one(&src, (void *)sig, sig_len);
+    sg_init_one(&dst, out, sig_len);
+
+    akcipher_request_set_crypt(req, &src, &dst, sig_len, sig_len);
+    ret = crypto_akcipher_verify(req);
+
+    // ret == 0 表示签名有效
+    kfree(out);
+    akcipher_request_free(req);
+    crypto_free_akcipher(tfm);
+    return ret;
+}
+```
+
+5.5 密钥管理与安全随机数
+
+密钥存于内核密钥环，随机数来自内核 CSPRNG。
+
+```c
+// sp/src/crypto/crypto_key.c
+
+#include <linux/kernel.h>
+#include <linux/key.h>
+#include <linux/random.h>
+#include <linux/string.h>
+#include <linux/key-type.h>
+#include <crypto/rng.h>
+
+#include "crypto.h"
+
+/* ============================================================
+   生成安全随机数 (内核 CSPRNG)
+   ============================================================ */
+int crypto_random(uint8_t *buf, uint32_t len) {
+    get_random_bytes(buf, len);
+    return 0;
+}
+
+/* ============================================================
+   生成对称密钥 (使用 CSPRNG)
+   ============================================================ */
+int crypto_generate_sym_key(const char *desc, uint32_t key_len,
+                            crypto_cipher_t cipher, char *key_id_out,
+                            uint32_t id_len) {
+    uint8_t *key;
+    int ret;
+
+    key = kmalloc(key_len, GFP_KERNEL);
+    if (!key) return -ENOMEM;
+
+    // 1. 用 CSPRNG 生成密钥材料
+    get_random_bytes(key, key_len);
+
+    // 2. 存入内核密钥环
+    // 使用 add_key("logon", desc, key, key_len, KEY_SPEC_PROCESS_KEYRING)
+    // 返回密钥序列号。
+
+    // 3. 记录密钥 id
+    // snprintf(key_id_out, id_len, "%ld", key_serial);
+
+    kfree(key);
+    return ret;
+}
+
+/* ============================================================
+   从密钥环读取密钥
+   ============================================================ */
+int crypto_key_get(const char *key_id, uint8_t *key_out,
+                   uint32_t *key_len) {
+    // 通过 keyctl/keyctl_read_key 从指定密钥环读取密钥
+    // 仅授权进程可读取 ("logon" 类型密钥内核外不可读)
+    return 0;
+}
+
+/* ============================================================
+   销毁密钥
+   ============================================================ */
+int crypto_key_destroy(const char *key_id) {
+    // 通过 keyctl_revoke + keyctl_unlink 撤销并解除链接，使密钥不可用
+    return 0;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// sp/src/crypto/crypto_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "crypto.h"
+#include "crypto_ipc.h"
+#include "crypto_symmetric.h"
+#include "crypto_hash.h"
+#include "crypto_asymmetric.h"
+#include "crypto_key.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void crypto_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+
+    switch (msg_type) {
+        case CRYPTO_MSG_ENCRYPT: {
+            crypto_encrypt_req_t *req = (crypto_encrypt_req_t *)data;
+            // 取出密钥、明文，调用 crypto_aead_encrypt
+            crypto_aead_resp_t resp;
+            // ... 填充响应
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case CRYPTO_MSG_HASH: {
+            crypto_hash_req_t *req = (crypto_hash_req_t *)data;
+            crypto_hash_resp_t resp;
+            int ret = crypto_hash(req->algo, req->data, req->data_len,
+                                  resp.digest, sizeof(resp.digest));
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case CRYPTO_MSG_SIGN: {
+            // 用密钥环中的私钥签名
+            break;
+        }
+
+        case CRYPTO_MSG_RANDOM: {
+            crypto_random_req_t *req = (crypto_random_req_t *)data;
+            crypto_random_resp_t resp;
+            crypto_random(resp.data, req->len);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case CRYPTO_MSG_GENERATE_KEY: {
+            // 生成密钥并存入密钥环
+            break;
+        }
+
+        default:
+            printk(KERN_WARNING "HWRun CRYPTO: Unknown IPC message: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、安全策略与约束
+
+1. 弱算法禁用：默认禁用 DES、MD5、RC4 等弱算法，可通过配置显式启用（不建议）
+2. 密钥生命周期：临时密钥默认有效期仅限会话；持久密钥加密存储后才可导入
+3. 最小权限：只有明确授权（SP 授权上下文）的插件才能引用密钥 ID 进行加密/签名
+4. 日志审计：敏感操作（密钥生成、导入、销毁）写入审计日志
+5. 封装加密：STOAGE 卷加密复用 CRYPTO 的 AES-XTS，密钥由 CRYPTO 密钥环持有
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/crypto.yml
+crypto:
+  # 允许的算法白名单
+  allowed:
+    ciphers:
+      - "aes-gcm-128"
+      - "aes-gcm-256"
+      - "chacha20-poly1305"
+      - "aes-xts-256"
+    hashes:
+      - "sha256"
+      - "sha512"
+      - "sm3"
+    asym:
+      - "rsa-2048"
+      - "ecdsa-p256"
+      - "ed25519"
+      - "sm2"
+
+  # 密钥策略
+  keys:
+    # 默认密钥有效期 (秒)
+    default_lifetime: 86400
+    # 是否允许持久密钥
+    allow_persistent: true
+    # 持久密钥是否加密存储
+    encrypt_persistent: true
+
+  # 日志
+  audit:
+    # 是否记录敏感操作
+    log_sensitive_ops: true
+```
+
+八、命令行接口
+
+```bash
+# 哈希
+hwrun crypto hash sha256 --file /path/to/file
+hwrun crypto hash sha256 --data "hello"
+
+# 对称加密
+hwrun crypto encrypt --cipher aes-gcm-256 --key <key> --in plain.txt --out enc.bin
+hwrun crypto decrypt --cipher aes-gcm-256 --key <key> --in enc.bin --out plain.txt
+
+# 密钥管理
+hwrun crypto key generate --type sym --cipher aes-256 --name "mykey"
+hwrun crypto key generate --type rsa --size 2048 --name "rsa1"
+hwrun crypto key list
+hwrun crypto key export mykey
+hwrun crypto key destroy mykey
+
+# 签名
+hwrun crypto sign --key rsa1 --in data.bin --out sig.bin
+hwrun crypto verify --pubkey pub.pem --in data.bin --sig sig.bin
+
+# 随机数
+hwrun crypto random --length 32
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+CRYPTO 不单独打包，其文件并入 SP 插件随 SP 分发；此处仅登记协议能力供 METAPROTO 注册。
+
+```yaml
+# plugins/sp/sp_crypto.yml
+crypto_submodule:
+  id: "crypto"
+  name: "Cryptographic Protocol (SP submodule)"
+  version: "1.0.0"
+  type: "submodule"
+  host: "sp"
+
+  description: "HWRun OS 加密协议，SP 安全协议的子模块，提供对称/非对称加密、哈希、签名、密钥管理、随机数"
+
+  provides:
+    - protocol: "CRYPTO"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  params:
+    - key: "crypto.keys.default_lifetime"
+      type: "int"
+      default: 86400
+      description: "默认密钥有效期 (秒)"
+    - key: "crypto.keys.allow_persistent"
+      type: "bool"
+      default: true
+      description: "是否允许持久密钥"
+```
+
+9.2 构建脚本
+
+```makefile
+# sp/ (CRYPTO 子模块构建并入 SP)
+
+sp-objs := sp.o sp_crypto.o sp_hash.o sp_key.o sp_auth.o \
+           sp_ima.o sp_ipc.o \
+           crypto/crypto_symmetric.o \
+           crypto/crypto_hash.o \
+           crypto/crypto_asymmetric.o \
+           crypto/crypto_key.o \
+           crypto/crypto_rng.o \
+           crypto/crypto_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 sp.ko /usr/lib/hwrun/plugins/
+```
+
+十、总结
+
+维度 决策
+定位 加密协议，SP 的加密子模块，所有密码学操作的统一入口
+实现方式 内核模块 (随 SP 加载)，Linux Kernel Crypto API
+代码量 ~1200-1800 行 C
+提供协议 CRYPTO (v1.0)
+宿主 SP (Security Protocol)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG
+核心接口 SKCipher/AEAD、Shash、AKCipher、keyring、CSPRNG
+关键功能 对称/非对称加密、哈希、签名、密钥管理、安全随机数
+安全默认 AEAD 认证加密、弱算法禁用、密钥仅存内核密钥环
+
+CRYPTO 是 HWRun OS 的密码学服务核心，作为 SP（安全协议）的加密子模块随 SP 加载，基于 Linux Kernel Crypto API 与内核密钥环，通过 CRYPTO 协议向上层插件提供对称/非对称加密、哈希、HMAC、数字签名、密钥管理与安全随机数等全部密码学原语。上层插件（PERMISSION、CLUSTER、FS_TRANSFER、STORAGE、NODE_DISCOVERY、CONSENSUS、COMPRESS、AUDIT 等）通过 CRYPTO 协议进行密码学操作，密钥始终留存在内核密钥环，不向用户态暴露明文。

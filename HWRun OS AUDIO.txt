@@ -1,0 +1,1076 @@
+HWRun OS AUDIO 实现文档
+
+模块名称： AUDIO (Audio Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 音频协议，提供音频设备的枚举、播放/录音、混音、音量控制、声卡管理等功能的统一抽象
+实现语言： C（内核模块 + 用户态服务，基于 ALSA）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、DRIVER（设备驱动）
+提供协议： AUDIO
+
+一、设计哲学
+
+1.1 核心定位
+
+AUDIO 是 HWRun OS 的音频管理核心——所有与音频设备枚举、播放/录音、混音、音量控制相关的操作都通过 AUDIO 协议进行。
+
+```
+AUDIO = 音频协议 = 所有音频操作的统一入口
+
+上层插件 (UI, DESKTOP, NOTIFICATION, CONSOLE, RUNTIME 沙盒, ...)
+    │
+    │  通过 AUDIO 协议播放/录音/控制音量
+    ▼
+AUDIO 插件 (内核模块 + 用户态服务)
+    │
+    │  基于 Linux ALSA 音频栈
+    │  ├── ALSA 内核层           → snd_pcm / snd_control
+    │  ├── ALSA 用户态库 (alsa-lib) → 播放/录音/混音
+    │  ├── PulseAudio/PipeWire   → 高优先级音频服务 (可选)
+    │  └── /dev/snd/*            → 声卡设备节点
+    │
+    ▼
+Linux 内核 (ALSA 驱动栈)
+    │
+    ▼
+硬件 (声卡 / 音频 Codec / HDMI / USB 声卡)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有音频操作通过 AUDIO 协议进行
+2. 标准化接口：基于 Linux ALSA（Advanced Linux Sound Architecture）标准
+3. 多设备支持：支持声卡设备的枚举与默认设备选择
+4. 统一混音：提供混音与音量控制的统一抽象
+5. 分层设计：内核（音频资源）与用户态（音频服务）分离
+6. 沙盒兼容：支持在隔离沙盒内回放与采集音频
+
+1.3 Linux 音频栈概述
+
+Linux 音频栈分为从低到高多层：
+
+层 接口 说明
+硬件层 — 声卡 Codec、HDMI、USB 声卡
+ALSA 驱动层 snd_* ALSA 内核驱动，直接操作硬件
+ALSA 核心层 /dev/snd/* PCM、Control、Mixer 设备节点
+alsa-lib libasound 用户态编程库
+音频服务 PulseAudio / PipeWire 策略音频服务（混音、路由）
+应用层 — 使用 AUDIO 协议的上层插件
+
+AUDIO 插件直接向 ALSA 内核层（/dev/snd/*）或音频服务（PipeWire）交互。为兼顾通用性与轻量，AUDIO 插件优先对接 alsa-lib，可选对接 PipeWire。
+
+1.4 ALSA PCM 与 Control 接口
+
+ALSA 提供两类核心接口：
+
+· PCM（Pulse Code Modulation）：播放/录音的音频流接口，对应 /dev/snd/pcmC*D*
+· Control：混音、音量、采样率等控制接口，对应 /dev/snd/controlC*
+
+PCM 数据流以帧（frame）为单位，每个帧包含当前时刻左右声道的采样，采样点通过定时器（timer）或 align 中断驱动读写。
+
+二、整体架构
+
+2.1 AUDIO 插件的组成
+
+```
+AUDIO 插件
+├── 内核模块 (audio.ko)
+│   ├── 协议处理层
+│   │   ├── audio_ipc_handler()     ← IPC 消息分发
+│   │   ├── audio_list_devices()    ← 枚举音频设备
+│   │   ├── audio_get_device()      ← 获取设备信息
+│   │   ├── audio_get_volume()      ← 获取音量
+│   │   ├── audio_set_volume()      ← 设置音量
+│   │   ├── audio_play()            ← 播放
+│   │   ├── audio_record()          ← 录音
+│   │   └── audio_mute()            ← 静音控制
+│   ├── ALSA 封装层
+│   │   ├── audio_pcm.c             ← PCM 播放/录音
+│   │   ├── audio_control.c         ← 控制/混音
+│   │   ├── audio_mixer.c           ← 混音器
+│   │   └── audio_device.c          ← 设备枚举
+│   └── 初始化/清理
+│       ├── audio_init()            ← 模块加载
+│       └── audio_exit()            ← 模块卸载
+│
+└── 用户态服务 (hwrun-audiod)
+    ├── playback.c                 ← 播放引擎
+    ├── record.c                   ← 录音引擎
+    ├── mixer.c                    ← 混音路由
+    ├── pipewire_bridge.c          ← PipeWire 可选桥接
+    └── alarm/notification.c       ← 提示音
+```
+
+2.2 AUDIO 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → AUDIO → 其他插件
+                                                                                                              ↑
+                                                                                                   AUDIO 在这里加载
+```
+
+AUDIO 插件的启动顺序与设备层（INPUT、DISPLAY）位于同一层次，在 DISPLAY 之后加载，为上层提供音频能力。
+
+2.3 AUDIO 的上层消费者
+
+上层插件 需要 AUDIO 提供什么
+UI (用户界面) 提示音、按键反馈音
+DESKTOP (桌面) 系统声音、通知音
+NOTIFICATION (通知) 通知提示音
+CONSOLE (控制台) 蜂鸣提示
+RUNTIME 沙盒 (应用运行时) 沙盒内应用的音频回放/采集
+TERMINAL (终端) 铃声/提示
+
+三、核心数据结构
+
+```c
+// audio/include/audio.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   音频数据类型
+   ============================================================ */
+typedef enum {
+    AUDIO_FORMAT_S16LE = 0,          // 16-bit 小端有符号 PCM
+    AUDIO_FORMAT_S24LE,              // 24-bit 小端有符号 PCM
+    AUDIO_FORMAT_S32LE,              // 32-bit 小端有符号 PCM
+    AUDIO_FORMAT_FLOATLE,            // 32-bit 浮点
+    AUDIO_FORMAT_U8,                 // 8-bit 无符号
+} audio_format_t;
+
+/* ============================================================
+   音频设备方向
+   ============================================================ */
+typedef enum {
+    AUDIO_DIRECTION_UNKNOWN = 0,
+    AUDIO_DIRECTION_PLAYBACK,        // 播放
+    AUDIO_DIRECTION_CAPTURE,         // 录音
+    AUDIO_DIRECTION_DUPLEX,          // 全双工
+} audio_direction_t;
+
+/* ============================================================
+   音频设备
+   ============================================================ */
+typedef struct audio_device {
+    char id[64];                     // 设备 ID (如 "hw:0,0")
+    char name[128];                  // 设备名称
+    char desc[256];                  // 描述
+    int card;                        // 声卡编号
+    int device;                      // PCM 设备编号
+    audio_direction_t direction;     // 方向
+    int default_device;              // 是否默认设备
+    uint32_t max_channels;           // 最大通道数
+    uint32_t max_sample_rate;        // 最大采样率
+    struct audio_device *next;
+} audio_device_t;
+
+/* ============================================================
+   PCM 流参数
+   ============================================================ */
+typedef struct audio_stream_params {
+    audio_format_t format;           // 采样格式
+    uint32_t channels;               // 通道数 (1=单声道, 2=立体声)
+    uint32_t sample_rate;            // 采样率 (如 44100, 48000)
+    uint32_t period_size;            // 周期大小 (帧数)
+    uint32_t buffer_size;            // 缓冲区大小 (帧数)
+} audio_stream_params_t;
+
+/* ============================================================
+   音量控制 (对应 ALSA control)
+   ============================================================ */
+typedef struct audio_volume {
+    char control[64];                // control 名称 (如 "Master")
+    long min;                        // 最小值
+    long max;                        // 最大值
+    long value;                      // 当前值
+    int mute;                        // 是否静音
+} audio_volume_t;
+
+/* ============================================================
+   AUDIO 上下文
+   ============================================================ */
+typedef struct audio_context {
+    int initialized;
+    uint64_t audio_task_id;          // AUDIO 自身的任务 ID
+
+    audio_device_t *devices;         // 音频设备列表
+    audio_device_t *default_playback; // 默认播放设备
+    audio_device_t *default_capture; // 默认录音设备
+
+    audio_volume_t *volumes;         // 音量控制列表
+    long master_volume;              // 主音量 (0-100)
+
+    int alsa_available;              // ALSA 是否可用
+    int pipewire_available;          // PipeWire 是否可用
+
+    void *lock;
+} audio_context_t;
+```
+
+四、AUDIO 协议定义
+
+```protobuf
+// protocols/audio.proto
+syntax = "proto3";
+
+package hwrun.audio;
+
+service Audio {
+    // === 设备管理 ===
+    rpc ListDevices(Empty) returns (ListDevicesResponse);
+    rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
+    rpc SetDefaultDevice(SetDefaultDeviceRequest) returns (SetDefaultDeviceResponse);
+
+    // === 播放 ===
+    rpc Play(PlayRequest) returns (PlayResponse);
+    rpc Stop(StopRequest) returns (StopResponse);
+    rpc Pause(PauseRequest) returns (PauseResponse);
+    rpc PlayStream(PlayStreamRequest) returns (stream PlayStreamResponse);
+
+    // === 录音 ===
+    rpc StartRecord(RecordRequest) returns (RecordResponse);
+    rpc StopRecord(StopRequest) returns (StopResponse);
+    rpc RecordStream(stream RecordStreamRequest) returns (RecordStreamResponse);
+
+    // === 音量控制 ===
+    rpc GetVolume(Empty) returns (GetVolumeResponse);
+    rpc SetVolume(SetVolumeRequest) returns (SetVolumeResponse);
+    rpc Mute(MuteRequest) returns (MuteResponse);
+}
+
+message Empty {}
+
+// ============ 设备管理 ============
+
+message AudioDevice {
+    string id = 1;                  // "hw:0,0"
+    string name = 2;
+    string desc = 3;
+    uint32 card = 4;
+    uint32 device = 5;
+    uint32 direction = 6;           // audio_direction_t
+    bool default_device = 7;
+    uint32 max_channels = 8;
+    uint32 max_sample_rate = 9;
+}
+
+message ListDevicesResponse {
+    repeated AudioDevice devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetDeviceRequest {
+    string id = 1;
+}
+
+message GetDeviceResponse {
+    AudioDevice device = 1;
+    int32 error = 2;
+}
+
+message SetDefaultDeviceRequest {
+    string id = 1;                  // 默认播放设备
+    string capture_id = 2;          // 默认录音设备 (可选)
+}
+
+message SetDefaultDeviceResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 播放 ============
+
+message StreamParams {
+    uint32 format = 1;              // audio_format_t
+    uint32 channels = 2;
+    uint32 sample_rate = 3;
+    uint32 period_size = 4;
+    uint32 buffer_size = 5;
+}
+
+message PlayRequest {
+    string device_id = 1;           // 留空用默认设备
+    bytes data = 2;                 // PCM 数据
+    StreamParams params = 3;        // 参数
+}
+
+message PlayResponse {
+    bool success = 1;
+    uint64 played_bytes = 2;
+    int32 error = 3;
+}
+
+message StreamRequest {
+    bytes chunk = 1;                // 播放数据块
+    bool eos = 2;                   // 是否流结束
+}
+
+message PlayStreamRequest {
+    string device_id = 1;
+    StreamParams params = 2;
+    bytes data = 3;
+}
+
+message PlayStreamResponse {
+    uint64 played_bytes = 1;
+    uint64 elapsed_ms = 2;
+    bool playing = 3;
+    int32 error = 4;
+}
+
+message StopRequest {
+    string device_id = 1;
+}
+
+message StopResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message PauseRequest {
+    string device_id = 1;
+    bool paused = 2;
+}
+
+message PauseResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 录音 ============
+
+message RecordRequest {
+    string device_id = 1;
+    StreamParams params = 2;
+    uint32 duration_ms = 3;         // 0 = 手动停止
+}
+
+message RecordResponse {
+    bool success = 1;
+    bytes data = 2;                 // 采集到的 PCM
+    uint64 recorded_bytes = 3;
+    int32 error = 4;
+}
+
+message RecordStreamRequest {
+    string device_id = 1;
+    StreamParams params = 2;
+}
+
+message RecordStreamResponse {
+    bytes chunk = 1;                // 采集数据块
+    uint64 elapsed_ms = 2;
+    int32 error = 3;
+}
+
+// ============ 音量控制 ============
+
+message GetVolumeResponse {
+    repeated VolumeControl volumes = 1;
+    long master_volume = 2;         // 0-100
+    bool mute = 3;
+    int32 error = 4;
+}
+
+message VolumeControl {
+    string name = 1;                // "Master", "PCM", ...
+    long min = 2;
+    long max = 3;
+    long value = 4;
+}
+
+message SetVolumeRequest {
+    string name = 1;                // 留空 = 主音量
+    long value = 2;                 // 0-100
+}
+
+message SetVolumeResponse {
+    bool success = 1;
+    long value = 2;
+    int32 error = 3;
+}
+
+message MuteRequest {
+    bool mute = 1;
+}
+
+message MuteResponse {
+    bool success = 1;
+    bool mute = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// audio/src/audio.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "audio.h"
+#include "audio_ipc.h"
+#include "audio_pcm.h"
+#include "audio_control.h"
+#include "audio_device.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Audio Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static audio_context_t g_audio_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init audio_init(void) {
+    int ret;
+
+    printk(KERN_INFO "HWRun AUDIO: Initializing...\n");
+
+    // 1. 初始化上下文
+    memset(&g_audio_ctx, 0, sizeof(audio_context_t));
+
+    // 2. 检测 ALSA 是否可用
+    g_audio_ctx.alsa_available = audio_alsa_check();
+    if (g_audio_ctx.alsa_available) {
+        printk(KERN_INFO "HWRun AUDIO: ALSA available\n");
+    } else {
+        printk(KERN_WARNING "HWRun AUDIO: ALSA not available\n");
+    }
+
+    // 3. 枚举音频设备
+    ret = audio_list_devices(&g_audio_ctx.devices);
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun AUDIO: No audio device found\n");
+    }
+
+    // 4. 加载主音量
+    audio_load_master_volume(&g_audio_ctx);
+
+    // 5. 注册 IPC 消息处理器
+    ret = audio_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun AUDIO: Failed to register IPC handler\n");
+        return ret;
+    }
+
+    // 6. 注册 AUDIO 协议
+    audio_register_protocol();
+
+    g_audio_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun AUDIO: Initialized successfully\n");
+    printk(KERN_INFO "  Audio devices: %d\n", ret);
+
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit audio_exit(void) {
+    printk(KERN_INFO "HWRun AUDIO: Exiting...\n");
+
+    audio_ipc_unregister();
+    audio_cleanup_devices(&g_audio_ctx);
+
+    g_audio_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun AUDIO: Exited\n");
+}
+
+module_init(audio_init);
+module_exit(audio_exit);
+```
+
+5.2 音频设备枚举
+
+ALSA 设备枚举通过 alsa-lib 的 snd_device_name_hint() 或读取 /dev/snd/ 下的设备节点实现。内核模块侧通过检查 /dev/snd/ 下的 pcmC*D* 节点识别声卡。
+
+```c
+// audio/src/audio_device.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "audio.h"
+
+#define SND_DEV_PATH "/dev/snd"
+
+/* ============================================================
+   检测 ALSA 是否可用
+   ============================================================ */
+int audio_alsa_check(void) {
+    struct file *file;
+
+    file = filp_open(SND_DEV_PATH, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(file)) {
+        return 0;
+    }
+    filp_close(file, NULL);
+    return 1;
+}
+
+/* ============================================================
+   枚举音频设备
+   ============================================================ */
+int audio_list_devices(audio_device_t **out) {
+    // 实际实现中通过 alsa-lib 的 snd_device_name_hint() 枚举，
+    // 或解析 /dev/snd/pcmC*D* 设备节点。
+    // 内核模块侧以目录项 /dev/snd/pcmC*d*p 识别播放端、/dev/snd/pcmC*d*c 识别采集端。
+    *out = NULL;
+    return 0;
+}
+```
+
+5.3 PCM 播放
+
+用户态 hwrun-audiod 负责实际的 PCM 播放，使用 alsa-lib 打开 PCM 设备、设置参数、写数据。
+
+```c
+// audio/userspace/playback.c
+
+#include <alsa/asoundlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================
+   打开 PCM 播放设备
+   ============================================================ */
+static snd_pcm_t *audio_open_playback(const char *device,
+                                      const audio_stream_params_t *params) {
+    snd_pcm_t *handle;
+    snd_pcm_hw_params_t *hw;
+    int err;
+
+    // 1. 打开 PCM 设备
+    err = snd_pcm_open(&handle, device, SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        return NULL;
+    }
+
+    // 2. 分配硬件参数
+    snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_hw_params_any(handle, hw);
+
+    // 3. 设置访问模式 (交错)
+    snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+
+    // 4. 设置格式
+    switch (params->format) {
+        case AUDIO_FORMAT_S16LE:
+            snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S16_LE);
+            break;
+        case AUDIO_FORMAT_S32LE:
+            snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S32_LE);
+            break;
+        case AUDIO_FORMAT_FLOATLE:
+            snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_FLOAT_LE);
+            break;
+        default:
+            snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S16_LE);
+            break;
+    }
+
+    // 5. 设置通道数
+    snd_pcm_hw_params_set_channels(handle, hw, params->channels);
+
+    // 6. 设置采样率
+    unsigned int rate = params->sample_rate;
+    snd_pcm_hw_params_set_rate_near(handle, hw, &rate, 0);
+
+    // 7. 写入硬件参数
+    err = snd_pcm_hw_params(handle, hw);
+    if (err < 0) {
+        snd_pcm_close(handle);
+        return NULL;
+    }
+
+    return handle;
+}
+
+/* ============================================================
+   PCM 播放
+   ============================================================ */
+int audio_playback(const char *device, const audio_stream_params_t *params,
+                   const uint8_t *data, uint32_t data_len,
+                   uint64_t *played) {
+    snd_pcm_t *handle;
+    snd_pcm_sframes_t frames;
+    uint32_t frame_bytes, total_frames, written = 0;
+
+    handle = audio_open_playback(device, params);
+    if (!handle) {
+        return -1;
+    }
+
+    frame_bytes = params->channels * 2;  // S16LE = 2 bytes
+    total_frames = data_len / frame_bytes;
+
+    while (written < total_frames) {
+        frames = snd_pcm_writei(handle, data + written * frame_bytes,
+                                total_frames - written);
+        if (frames == -EPIPE) {
+            snd_pcm_prepare(handle);     // 缓冲区欠载恢复
+            continue;
+        }
+        if (frames < 0) {
+            snd_pcm_close(handle);
+            return -1;
+        }
+        written += frames;
+    }
+
+    // 等待播放完成
+    snd_pcm_drain(handle);
+    snd_pcm_close(handle);
+
+    *played = written * frame_bytes;
+    return 0;
+}
+```
+
+5.4 PCM 录音
+
+```c
+// audio/userspace/record.c
+
+#include <alsa/asoundlib.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================
+   PCM 录音
+   ============================================================ */
+int audio_record(const char *device, const audio_stream_params_t *params,
+                 uint32_t duration_ms, uint8_t **out_data,
+                 uint32_t *out_len) {
+    snd_pcm_t *handle;
+    int err;
+    uint32_t frame_bytes = params->channels * 2;
+    uint32_t rate = params->sample_rate;
+    uint32_t total_frames = (uint32_t)(rate * duration_ms / 1000.0);
+    uint32_t total_bytes = total_frames * frame_bytes;
+    uint8_t *buf;
+
+    err = snd_pcm_open(&handle, device, SND_PCM_STREAM_CAPTURE, 0);
+    if (err < 0) {
+        return -1;
+    }
+
+    // 设置硬件参数（简化）
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_hw_params_any(handle, hw);
+    snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(handle, hw, params->channels);
+    unsigned int r = rate;
+    snd_pcm_hw_params_set_rate_near(handle, hw, &r, 0);
+    if (snd_pcm_hw_params(handle, hw) < 0) {
+        snd_pcm_close(handle);
+        return -1;
+    }
+
+    buf = malloc(total_bytes);
+    if (!buf) {
+        snd_pcm_close(handle);
+        return -1;
+    }
+
+    uint32_t read_frames = 0;
+    // 循环读取采集数据
+    while (read_frames < total_frames) {
+        snd_pcm_sframes_t n = snd_pcm_readi(handle,
+            buf + read_frames * frame_bytes, total_frames - read_frames);
+        if (n == -EPIPE) {
+            snd_pcm_prepare(handle);
+            continue;
+        }
+        if (n < 0) break;
+        read_frames += n;
+    }
+
+    snd_pcm_close(handle);
+
+    *out_data = buf;
+    *out_len = read_frames * frame_bytes;
+    return 0;
+}
+```
+
+5.5 音量控制
+
+ALSA 音量通过 Control 接口（mixer）管理。alsa-lib 提供 snd_mixer_* 接口读写控件。
+
+```c
+// audio/userspace/volume.c
+
+#include <alsa/asoundlib.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================
+   获取主音量 (0-100)
+   ============================================================ */
+int audio_get_volume(long *value, int *mute) {
+    snd_mixer_t *handle;
+    snd_mixer_elem_t *elem;
+    snd_mixer_selem_id_t *sid;
+    int err;
+
+    err = snd_mixer_open(&handle, 0);
+    if (err < 0) return -1;
+    err = snd_mixer_attach(handle, "default");
+    if (err < 0) { snd_mixer_close(handle); return -1; }
+    err = snd_mixer_selem_register(handle, NULL, NULL);
+    if (err < 0) { snd_mixer_close(handle); return -1; }
+    err = snd_mixer_load(handle);
+    if (err < 0) { snd_mixer_close(handle); return -1; }
+
+    snd_mixer_selem_id_alloca(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, "Master");
+
+    elem = snd_mixer_find_selem(handle, sid);
+    if (!elem) {
+        // Master 不存在则回退到 PCM
+        snd_mixer_selem_id_set_name(sid, "PCM");
+        elem = snd_mixer_find_selem(handle, sid);
+    }
+
+    if (!elem) {
+        snd_mixer_close(handle);
+        return -1;
+    }
+
+    long min, max;
+    snd_mixer_selem_get_playback_volume_range(elem, &min, &max);
+    long cur;
+    snd_mixer_selem_get_playback_volume(elem, SND_MIXER_SCHN_MONO, &cur);
+
+    *value = (max > min) ? (100 * (cur - min)) / (max - min) : 0;
+    snd_mixer_selem_get_playback_switch(elem, SND_MIXER_SCHN_MONO, mute);
+
+    snd_mixer_close(handle);
+    return 0;
+}
+
+/* ============================================================
+   设置主音量 (0-100)
+   ============================================================ */
+int audio_set_volume(long value) {
+    snd_mixer_t *handle;
+    snd_mixer_elem_t *elem;
+    snd_mixer_selem_id_t *sid;
+    int err;
+
+    if (value < 0) value = 0;
+    if (value > 100) value = 100;
+
+    err = snd_mixer_open(&handle, 0);
+    if (err < 0) return -1;
+    snd_mixer_attach(handle, "default");
+    snd_mixer_selem_register(handle, NULL, NULL);
+    snd_mixer_load(handle);
+
+    snd_mixer_selem_id_alloca(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, "Master");
+
+    elem = snd_mixer_find_selem(handle, sid);
+    if (!elem) { snd_mixer_close(handle); return -1; }
+
+    long min, max;
+    snd_mixer_selem_get_playback_volume_range(elem, &min, &max);
+    long vol = min + (value * (max - min)) / 100;
+    snd_mixer_selem_set_playback_volume_all(elem, vol);
+
+    snd_mixer_close(handle);
+    return 0;
+}
+```
+
+5.6 提示音/通知音
+
+hwrun-audiod 内置一个轻量提示音引擎，可生成简短的短促提示音，无需外部音频文件。
+
+```c
+// audio/userspace/alarm.c
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* ============================================================
+   生成提示音 (正弦波，淡入淡出防爆音)
+   ============================================================ */
+int audio_generate_tone(uint8_t **out, uint32_t *out_len,
+                        double freq, uint32_t duration_ms,
+                        uint32_t sample_rate) {
+    uint32_t samples = (uint32_t)(sample_rate * duration_ms / 1000.0);
+    uint16_t *buf = malloc(samples * sizeof(uint16_t));
+    if (!buf) return -1;
+
+    int16_t *pcm = (int16_t *)buf;
+    uint32_t ramp = sample_rate / 100;   // 10ms 淡入淡出
+
+    for (uint32_t i = 0; i < samples; i++) {
+        double t = (double)i / sample_rate;
+        // 正弦波
+        int16_t v = (int16_t)(sin(2.0 * M_PI * freq * t) * 16000);
+        // 淡入淡出
+        if (i < ramp) v = v * i / ramp;
+        if (i > samples - ramp - 1 && samples > ramp)
+            v = v * (samples - i) / ramp;
+        pcm[i] = v;
+    }
+
+    *out = (uint8_t *)buf;
+    *out_len = samples * 2;
+    return 0;
+}
+```
+
+5.7 IPC 消息处理
+
+```c
+// audio/src/audio_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "audio.h"
+#include "audio_ipc.h"
+#include "audio_control.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void audio_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+
+    switch (msg_type) {
+        case AUDIO_MSG_LIST_DEVICES: {
+            audio_device_t *devices;
+            uint32_t count;
+            audio_list_devices(&devices);
+            ipc_reply(from_task, devices, 0);  // 实际实现中需序列化
+            break;
+        }
+
+        case AUDIO_MSG_GET_VOLUME: {
+            long volume;
+            int mute;
+            audio_get_volume(&volume, &mute);
+            ipc_reply(from_task, &volume, sizeof(volume));
+            break;
+        }
+
+        case AUDIO_MSG_SET_VOLUME: {
+            long *vol = (long *)data + 1;
+            int ret = audio_set_volume(*vol);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+
+        case AUDIO_MSG_MUTE: {
+            int *m = (int *)data + 1;
+            int ret = audio_control_mute(*m);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+
+        default:
+            printk(KERN_WARNING "HWRun AUDIO: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/audio.yml
+audio:
+  # 默认设备
+  device:
+    # 默认播放设备 (留空 = ALSA 默认)
+    playback: ""
+    # 默认录音设备 (留空 = ALSA 默认)
+    capture: ""
+    # 优先使用 PipeWire (true 则作为后端)
+    use_pipewire: false
+
+  # 音量
+  volume:
+    # 初始主音量 (0-100)
+    initial: 70
+    # 是否记住上次音量
+    remember: true
+
+  # 提示音
+  alert:
+    # 系统提示音开关
+    enabled: true
+    # 提示音频率 (Hz)
+    tone_freq: 880
+    # 提示音时长 (ms)
+    tone_duration: 120
+```
+
+七、命令行接口
+
+```bash
+# 设备管理
+hwrun audio devices
+hwrun audio device info hw:0,0
+hwrun audio device default --playback hw:0,0 --capture hw:0,0
+
+# 播放
+hwrun audio play /path/to/sound.wav
+hwrun audio play --device hw:0,0 /path/to/sound.pcm
+hwrun audio stop
+hwrun audio pause
+
+# 录音
+hwrun audio record out.wav --duration 5
+hwrun audio record-stream out.pcm
+
+# 音量
+hwrun audio volume
+hwrun audio volume up
+hwrun audio volume down
+hwrun audio volume set 60
+hwrun audio mute
+hwrun audio unmute
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/audio/plugin.yml
+plugin:
+  id: "audio"
+  name: "Audio Protocol"
+  version: "1.0.0"
+  type: "kernel"
+
+  description: "HWRun OS 音频协议，提供音频设备枚举、播放/录音、混音、音量控制等功能"
+
+  provides:
+    - protocol: "AUDIO"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "DRIVER"
+      version: "1.0"
+
+  params:
+    - key: "audio.device.playback"
+      type: "string"
+      default: ""
+      description: "默认播放设备"
+    - key: "audio.volume.initial"
+      type: "int"
+      default: 70
+      description: "初始音量 (0-100)"
+    - key: "audio.alert.enabled"
+      type: "bool"
+      default: true
+      description: "系统提示音开关"
+
+  files:
+    - "/usr/lib/hwrun/plugins/audio.ko"
+    - "/usr/bin/hwrun-audiod"
+
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# audio/Makefile
+
+obj-m += audio.o
+
+audio-objs := audio.o audio_pcm.o audio_control.o \
+              audio_device.o audio_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 audio.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-audiod /usr/bin/
+```
+
+8.3 安装后脚本
+
+```bash
+#!/bin/bash
+# audio/scripts/post_install.sh
+
+# 加载 AUDIO 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/audio.ko
+
+if [ $? -eq 0 ]; then
+    echo "AUDIO kernel module loaded successfully"
+
+    # 检查 ALSA 设备
+    if [ -d /dev/snd ]; then
+        echo "ALSA devices available"
+    else
+        echo "Warning: ALSA not available"
+    fi
+else
+    echo "Failed to load AUDIO kernel module"
+    exit 1
+fi
+```
+
+九、总结
+
+维度 决策
+定位 音频协议，所有音频操作的统一入口
+实现方式 Linux 内核模块 + 用户态服务 (alsa-lib / PipeWire)
+代码量 ~1500-2000 行 C
+提供协议 AUDIO (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + DRIVER
+核心接口 ALSA PCM、ALSA Control/Mixer、PipeWire(可选)
+关键功能 设备枚举、播放、录音、混音、音量控制、提示音
+
+AUDIO 是 HWRun OS 中音频管理的核心插件。它基于 Linux ALSA 音频栈（/dev/snd/*、alsa-lib），通过 AUDIO 协议向上层插件提供音频设备枚举、播放、录音、混音、音量控制、提示音等完整的音频功能，并可选用 PipeWire 作为策略音频后端。上层插件（UI、DESKTOP、NOTIFICATION、CONSOLE、RUNTIME 沙盒等）通过 AUDIO 协议进行音频操作，不直接操作 ALSA 接口。

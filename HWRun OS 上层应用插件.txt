@@ -1,0 +1,905 @@
+﻿HWRun OS 上层应用插件完整实现文档
+
+模块列表： SANDBOX, UI, SHELL, CONSOLE, DESKTOP, PKGMGR, MONITOR
+版本： 1.0.0
+状态： 设计冻结
+实现语言： C（用户态插件）
+设计原则： 协议驱动、用户态实现、TUI 优先
+
+一、插件总览
+
+这些插件都是上层应用插件，运行在用户态，通过底层协议（HAP、PMP、FSP、NP、SP、INSTANCE 等）实现功能。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HWRun OS 上层应用插件体系                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  用户交互层                                                         │   │
+│  │  ├── UI          ← 窗口/事件/渲染管理                              │   │
+│  │  ├── SHELL       ← 命令行解释器                                    │   │
+│  │  ├── CONSOLE     ← 系统控制台                                      │   │
+│  │  └── DESKTOP     ← 桌面环境（三栏布局）                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  系统管理层                                                         │   │
+│  │  ├── PKGMGR      ← 包管理                                          │   │
+│  │  └── MONITOR     ← 系统监控                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  隔离执行层                                                         │   │
+│  │  └── SANDBOX     ← 沙盒环境                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、SANDBOX 实现文档
+
+2.1 设计定位
+
+SANDBOX = 轻量级安全隔离执行环境
+
+用于运行不受信任的代码，提供进程级隔离（namespace + seccomp-bpf）。
+
+```
+SANDBOX 与 INSTANCE 的区别：
+├── INSTANCE：完整操作系统实例（容器/MicroVM/VM），重隔离，适合长期运行
+└── SANDBOX：轻量级沙盒，进程级隔离，适合短期运行不受信任的代码
+```
+
+技术方案： 基于 nsjail或 gVisor的轻量级封装。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SANDBOX 架构                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  SANDBOX 协议接口                                                    │   │
+│  │  Create / Destroy / Run / GetStatus / SetResourceLimit             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  沙盒管理器                                                         │   │
+│  │  ├── 进程隔离 (namespace)                                          │   │
+│  │  ├── 系统调用过滤 (seccomp-bpf)[reference:2]                       │   │
+│  │  ├── 资源限制 (cgroup)                                            │   │
+│  │  └── 超时控制                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (namespace / seccomp / cgroup)                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+2.2 核心数据结构
+
+```c
+// sandbox/include/sandbox.h
+
+typedef enum {
+    SANDBOX_STATE_CREATED,
+    SANDBOX_STATE_RUNNING,
+    SANDBOX_STATE_STOPPED,
+    SANDBOX_STATE_ERROR,
+} sandbox_state_t;
+
+typedef struct sandbox_config {
+    char name[64];
+    char image[256];                // 根文件系统镜像
+    char command[256];              // 要执行的命令
+    uint32_t cpu_limit;             // CPU 限制（核心数）
+    uint64_t memory_limit_mb;       // 内存限制（MB）
+    uint64_t time_limit_ms;         // 时间限制（毫秒）
+    int network_enabled;            // 是否允许网络
+    int read_only_root;             // 根文件系统是否只读
+    char **mounts;                  // 额外挂载点
+    char **env;                     // 环境变量
+} sandbox_config_t;
+
+typedef struct sandbox_info {
+    char id[64];
+    char name[64];
+    sandbox_state_t state;
+    uint32_t pid;                   // 沙盒主进程 PID
+    uint64_t created_at;
+    uint64_t started_at;
+    uint64_t cpu_usage;
+    uint64_t memory_used_mb;
+} sandbox_info_t;
+```
+
+2.3 协议定义
+
+```protobuf
+// protocols/sandbox.proto
+service Sandbox {
+    rpc Create(CreateRequest) returns (CreateResponse);
+    rpc Destroy(DestroyRequest) returns (DestroyResponse);
+    rpc Run(RunRequest) returns (RunResponse);
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+    rpc SetResourceLimit(SetResourceLimitRequest) returns (SetResourceLimitResponse);
+}
+
+message CreateRequest {
+    string name = 1;
+    string image = 2;
+    string command = 3;
+    uint32 cpu_limit = 4;
+    uint64 memory_limit_mb = 5;
+    uint64 time_limit_ms = 6;
+    bool network_enabled = 7;
+    bool read_only_root = 8;
+}
+
+message CreateResponse {
+    string sandbox_id = 1;
+    int32 error = 2;
+}
+
+message RunRequest {
+    string sandbox_id = 1;
+    repeated string args = 2;
+}
+
+message RunResponse {
+    int32 exit_code = 1;
+    string stdout = 2;
+    string stderr = 3;
+    int32 error = 4;
+}
+```
+
+2.4 核心实现
+
+```c
+// sandbox/src/sandbox.c
+
+/* 创建沙盒 */
+int sandbox_create(sandbox_config_t *config, char *out_id) {
+    // 1. 生成沙盒 ID
+    // 2. 创建隔离环境
+    //    - 创建新的 namespace (pid, net, mount, ipc, uts)[reference:3]
+    //    - 配置 seccomp-bpf 系统调用过滤[reference:4]
+    //    - 设置资源限制 (cgroup)
+    // 3. 准备根文件系统 (overlay + tmpfs)
+    // 4. 启动沙盒进程
+    // 5. 返回沙盒 ID
+    return 0;
+}
+
+/* 在沙盒中运行命令 */
+int sandbox_run(const char *id, char **args, int *exit_code) {
+    // 1. 查找沙盒
+    // 2. 在沙盒中执行命令
+    // 3. 等待执行完成
+    // 4. 返回退出码
+    return 0;
+}
+```
+
+2.5 插件描述文件
+
+```yaml
+# plugins/sandbox/plugin.yml
+plugin:
+  id: "sandbox"
+  name: "Sandbox Environment"
+  version: "1.0.0"
+  type: "application"
+  description: "轻量级安全隔离执行环境"
+  provides:
+    - protocol: "SANDBOX"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "PMP"
+    - protocol: "FSP"
+  params:
+    - key: "sandbox.default_cpu_limit"
+      default: 1
+    - key: "sandbox.default_memory_limit"
+      default: "256MB"
+    - key: "sandbox.default_time_limit"
+      default: 5000
+```
+
+三、UI 实现文档
+
+3.1 设计定位
+
+UI = 用户界面协议（User Interface Protocol）
+
+提供窗口管理、事件处理、渲染等用户界面功能。
+
+```
+UI 架构：
+├── 窗口管理：创建/销毁/移动/调整大小/聚焦
+├── 事件处理：键盘/鼠标/触摸/窗口事件
+├── 渲染：字符/图形渲染
+└── 协议：基于 Wayland 协议[reference:5]
+```
+
+3.2 核心数据结构
+
+```c
+// ui/include/ui.h
+
+typedef enum {
+    UI_WINDOW_NORMAL,
+    UI_WINDOW_DIALOG,
+    UI_WINDOW_POPUP,
+    UI_WINDOW_FULLSCREEN,
+} ui_window_type_t;
+
+typedef struct ui_window {
+    uint64_t id;
+    char title[256];
+    ui_window_type_t type;
+    int x, y, width, height;
+    int visible;
+    int focused;
+    void *surface;                  // 渲染表面
+    struct ui_window *next;
+} ui_window_t;
+
+typedef struct ui_event {
+    uint32_t type;                  // KEYBOARD / MOUSE / WINDOW / RESIZE
+    uint32_t key;
+    uint32_t mouse_x, mouse_y;
+    uint32_t mouse_button;
+    uint64_t window_id;
+    uint64_t timestamp;
+} ui_event_t;
+```
+
+3.3 协议定义
+
+```protobuf
+// protocols/ui.proto
+service UserInterface {
+    rpc CreateWindow(WindowRequest) returns (WindowResponse);
+    rpc CloseWindow(WindowRequest) returns (WindowResponse);
+    rpc ResizeWindow(ResizeRequest) returns (ResizeResponse);
+    rpc FocusWindow(WindowRequest) returns (WindowResponse);
+    rpc Render(RenderRequest) returns (RenderResponse);
+    rpc GetEvent(Empty) returns (EventResponse);
+}
+
+message WindowRequest {
+    string title = 1;
+    uint32 type = 2;
+    int32 x = 3; int32 y = 4;
+    int32 width = 5; int32 height = 6;
+}
+
+message RenderRequest {
+    uint64 window_id = 1;
+    bytes content = 2;              // 渲染内容
+    string format = 3;              // text / html / json
+}
+```
+
+3.4 插件描述文件
+
+```yaml
+# plugins/ui/plugin.yml
+plugin:
+  id: "ui"
+  name: "User Interface"
+  version: "1.0.0"
+  type: "application"
+  description: "用户界面协议，提供窗口/事件/渲染管理"
+  provides:
+    - protocol: "UI"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "INPUT"
+    - protocol: "DISPLAY"
+```
+
+四、SHELL 实现文档
+
+4.1 设计定位
+
+SHELL = 命令行解释器
+
+接收用户命令并执行。
+
+```
+SHELL 工作流程[reference:7]：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  无限循环: 读取 → 解析 → 执行 → 反馈                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1. 读取: 显示提示符，读取用户输入                                          │
+│  2. 解析: 解析命令和参数                                                   │
+│  3. 执行: fork() → exec() 执行命令[reference:8]                                │
+│  4. 反馈: 等待子进程结束，显示结果                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+4.2 核心数据结构
+
+```c
+// shell/include/shell.h
+
+typedef struct shell_command {
+    char name[64];
+    int (*builtin)(int argc, char **argv);  // 内建命令
+    char *(*completion)(const char *prefix); // 自动补全
+    struct shell_command *next;
+} shell_command_t;
+
+typedef struct shell_context {
+    char cwd[256];                  // 当前工作目录
+    char prompt[128];               // 提示符
+    char history[1024][256];        // 命令历史
+    int history_count;
+    shell_command_t *builtins;      // 内建命令列表
+    uint64_t shell_task_id;
+} shell_context_t;
+```
+
+4.3 协议定义
+
+```protobuf
+// protocols/shell.proto
+service Shell {
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    rpc GetEnv(GetEnvRequest) returns (GetEnvResponse);
+    rpc SetEnv(SetEnvRequest) returns (SetEnvResponse);
+    rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
+    rpc GetAlias(GetAliasRequest) returns (GetAliasResponse);
+    rpc SetAlias(SetAliasRequest) returns (SetAliasResponse);
+}
+
+message ExecuteRequest {
+    string command = 1;
+    repeated string args = 2;
+}
+
+message ExecuteResponse {
+    int32 exit_code = 1;
+    string stdout = 2;
+    string stderr = 3;
+    int32 error = 4;
+}
+```
+
+4.4 核心实现
+
+```c
+// shell/src/shell.c
+
+/* SHELL 主循环 */
+void shell_main_loop(void) {
+    char line[1024];
+    
+    while (1) {
+        // 1. 显示提示符
+        shell_print_prompt();
+        
+        // 2. 读取输入
+        if (!shell_read_line(line, sizeof(line))) {
+            continue;
+        }
+        
+        // 3. 解析命令
+        char *args[64];
+        int argc = shell_parse(line, args);
+        
+        if (argc == 0) continue;
+        
+        // 4. 执行命令
+        if (shell_is_builtin(args[0])) {
+            shell_execute_builtin(argc, args);
+        } else {
+            shell_execute_external(argc, args);
+        }
+        
+        // 5. 记录历史
+        shell_add_history(line);
+    }
+}
+
+/* 执行外部命令 */
+int shell_execute_external(int argc, char **argv) {
+    pid_t pid = fork();
+    
+    if (pid == 0) {
+        // 子进程：执行命令[reference:9]
+        execvp(argv[0], argv);
+        exit(1);
+    } else {
+        // 父进程：等待子进程结束[reference:10]
+        int status;
+        waitpid(pid, &status, 0);
+        return WEXITSTATUS(status);
+    }
+}
+```
+
+4.5 插件描述文件
+
+```yaml
+# plugins/shell/plugin.yml
+plugin:
+  id: "shell"
+  name: "Shell Interpreter"
+  version: "1.0.0"
+  type: "application"
+  description: "命令行解释器"
+  provides:
+    - protocol: "SHELL"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "PMP"
+    - protocol: "FSP"
+    - protocol: "LOADER"
+  params:
+    - key: "shell.prompt"
+      default: "hwrun$ "
+    - key: "shell.history_size"
+      default: 1024
+```
+
+五、CONSOLE 实现文档
+
+5.1 设计定位
+
+CONSOLE = 系统控制台
+
+提供系统控制台输入输出，是内核与用户交互的最基础接口。
+
+```
+CONSOLE 层次[reference:11]：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  /dev/console → /dev/tty0 → /dev/ttyN (虚拟终端)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  console.c: 绘制字符到屏幕[reference:12]                                         │
+│  vt.c: 管理虚拟终端[reference:13]                                               │
+│  输入: 键盘 → console.c → 缓冲区[reference:14]                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+5.2 核心数据结构
+
+```c
+// console/include/console.h
+
+typedef struct console_device {
+    char name[32];                  // "tty0", "ttyS0"
+    int fd;
+    int rows, cols;                 // 终端尺寸
+    uint32_t flags;
+    void (*write)(const char *data, size_t len);
+    int (*read)(char *buf, size_t len);
+    struct console_device *next;
+} console_device_t;
+
+typedef struct console_context {
+    console_device_t *devices;
+    console_device_t *active;
+    char input_buffer[1024];
+    int input_pos;
+} console_context_t;
+```
+
+5.3 协议定义
+
+```protobuf
+// protocols/console.proto
+service Console {
+    rpc Write(WriteRequest) returns (WriteResponse);
+    rpc Read(ReadRequest) returns (ReadResponse);
+    rpc SetEcho(SetEchoRequest) returns (SetEchoResponse);
+    rpc Clear(Empty) returns (ClearResponse);
+    rpc SetColor(SetColorRequest) returns (SetColorResponse);
+    rpc GetSize(Empty) returns (GetSizeResponse);
+}
+```
+
+5.4 插件描述文件
+
+```yaml
+# plugins/console/plugin.yml
+plugin:
+  id: "console"
+  name: "System Console"
+  version: "1.0.0"
+  type: "application"
+  description: "系统控制台"
+  provides:
+    - protocol: "CONSOLE"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "INPUT"
+    - protocol: "DISPLAY"
+```
+
+六、DESKTOP 实现文档
+
+6.1 设计定位
+
+DESKTOP = 桌面环境
+
+基于 UI 协议，提供三栏布局桌面环境。
+
+```
+DESKTOP 布局：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  左栏: 目录树 (文件系统导航)   中栏: 文件列表   右栏: 工具目录             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  [~]                            [D] src/         [L] 硬件探测              │
+│  ├─ projects                    [D] docs/        [L] 调度状态              │
+│  │  ├─ src                      [F] main.c       [L] 实例管理              │
+│  │  ├─ docs                     [M] README.md    [L] 集群状态              │
+│  │  └─ config                   [C] hwrun.conf   [L] 系统日志              │
+│  └─ Downloads                   [I] logo.png     [L] 系统设置              │
+│                                 [Z] archive.tar  [L] 权限管理              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+6.2 核心数据结构
+
+```c
+// desktop/include/desktop.h
+
+typedef struct desktop_panel {
+    char id[64];
+    char title[128];
+    int x, y, width, height;
+    int visible;
+    void *content;                  // 面板内容
+    struct desktop_panel *next;
+} desktop_panel_t;
+
+typedef struct desktop_icon {
+    char name[64];
+    char path[256];
+    char command[256];
+    int x, y;
+    int size;
+    struct desktop_icon *next;
+} desktop_icon_t;
+
+typedef struct desktop_context {
+    desktop_panel_t *panels;        // 三栏面板
+    desktop_icon_t *icons;          // 桌面图标
+    char wallpaper_path[256];
+    uint64_t desktop_task_id;
+} desktop_context_t;
+```
+
+6.3 协议定义
+
+```protobuf
+// protocols/desktop.proto
+service Desktop {
+    rpc GetInfo(Empty) returns (GetInfoResponse);
+    rpc SetWallpaper(SetWallpaperRequest) returns (SetWallpaperResponse);
+    rpc GetWallpaper(Empty) returns (GetWallpaperResponse);
+    rpc AddIcon(AddIconRequest) returns (AddIconResponse);
+    rpc RemoveIcon(RemoveIconRequest) returns (RemoveIconResponse);
+    rpc ListIcons(Empty) returns (ListIconsResponse);
+    rpc GetPanels(Empty) returns (GetPanelsResponse);
+    rpc SetPanel(SetPanelRequest) returns (SetPanelResponse);
+    rpc SetLayout(SetLayoutRequest) returns (SetLayoutResponse);
+}
+
+message PanelInfo {
+    string id = 1;
+    string title = 2;
+    string content = 3;             // 面板内容描述
+    int32 x = 4; int32 y = 5;
+    int32 width = 6; int32 height = 7;
+    bool visible = 8;
+}
+
+message SetLayoutRequest {
+    string layout = 1;              // "default", "minimal", "custom"
+    repeated PanelInfo panels = 2;
+}
+```
+
+6.4 插件描述文件
+
+```yaml
+# plugins/desktop/plugin.yml
+plugin:
+  id: "desktop"
+  name: "Desktop Environment"
+  version: "1.0.0"
+  type: "application"
+  description: "桌面环境"
+  provides:
+    - protocol: "DESKTOP"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "UI"
+    - protocol: "FSP"
+    - protocol: "SHELL"
+  params:
+    - key: "desktop.layout"
+      default: "default"
+    - key: "desktop.default_path"
+      default: "/home/hwrun"
+    - key: "desktop.tools_path"
+      default: "~/.hwrun/tools"
+```
+
+七、PKGMGR 实现文档
+
+7.1 设计定位
+
+PKGMGR = 包管理器
+
+提供软件包的安装、更新、删除、查询功能。
+
+```
+PKGMGR 架构：
+├── 元数据管理: 本地缓存包索引[reference:17]
+├── 依赖解析: 自动处理依赖关系[reference:18]
+├── 包安装: 下载 → 验证 → 解压 → 安装
+└── 包查询: 搜索/列表/信息
+```
+
+7.2 核心数据结构
+
+```c
+// pkgmgr/include/pkgmgr.h
+
+typedef enum {
+    PKG_STATE_INSTALLED,
+    PKG_STATE_AVAILABLE,
+    PKG_STATE_UPDATING,
+    PKG_STATE_REMOVING,
+} pkg_state_t;
+
+typedef struct package {
+    char id[64];
+    char name[128];
+    char version[32];
+    char description[256];
+    char maintainer[128];
+    char url[256];
+    pkg_state_t state;
+    uint64_t installed_size;
+    uint64_t installed_at;
+    char **dependencies;
+    int dep_count;
+    struct package *next;
+} package_t;
+
+typedef struct pkg_repository {
+    char name[64];
+    char url[256];
+    int enabled;
+    uint64_t last_sync;
+    struct pkg_repository *next;
+} pkg_repository_t;
+```
+
+7.3 协议定义
+
+```protobuf
+// protocols/pkgmgr.proto
+service PackageManager {
+    rpc Install(InstallRequest) returns (InstallResponse);
+    rpc Remove(RemoveRequest) returns (RemoveResponse);
+    rpc Update(UpdateRequest) returns (UpdateResponse);
+    rpc Upgrade(UpgradeRequest) returns (UpgradeResponse);
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Info(InfoRequest) returns (InfoResponse);
+    rpc Search(SearchRequest) returns (SearchResponse);
+    rpc Clean(CleanRequest) returns (CleanResponse);
+    rpc AddRepo(AddRepoRequest) returns (AddRepoResponse);
+    rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoResponse);
+}
+
+message InstallRequest {
+    string pkg_id = 1;
+    string version = 2;             // 可选
+}
+
+message ListResponse {
+    repeated PackageInfo packages = 1;
+    uint32 total = 2;
+}
+
+message PackageInfo {
+    string id = 1;
+    string name = 2;
+    string version = 3;
+    string description = 4;
+    string state = 5;
+    uint64 installed_size = 6;
+    repeated string dependencies = 7;
+}
+```
+
+7.4 插件描述文件
+
+```yaml
+# plugins/pkgmgr/plugin.yml
+plugin:
+  id: "pkgmgr"
+  name: "Package Manager"
+  version: "1.0.0"
+  type: "application"
+  description: "包管理器"
+  provides:
+    - protocol: "PKGMGR"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "FSP"
+    - protocol: "NP"
+    - protocol: "GIT"
+    - protocol: "LOADER"
+  params:
+    - key: "pkgmgr.repo_url"
+      default: "https://hwrun.org/repo/"
+    - key: "pkgmgr.cache_dir"
+      default: "/var/lib/hwrun/pkgmgr/cache/"
+```
+
+八、MONITOR 实现文档
+
+8.1 设计定位
+
+MONITOR = 系统监控
+
+提供系统指标采集、告警、历史查询功能。
+
+8.2 核心数据结构
+
+```c
+// monitor/include/monitor.h
+
+typedef struct metric_sample {
+    uint64_t timestamp;
+    double value;
+    struct metric_sample *next;
+} metric_sample_t;
+
+typedef struct metric {
+    char name[64];
+    char unit[16];
+    char type[32];                  // gauge / counter / histogram
+    metric_sample_t *samples;
+    int sample_count;
+    double min, max, avg;
+    struct metric *next;
+} metric_t;
+
+typedef struct alert_rule {
+    char id[64];
+    char metric[64];
+    char operator[8];               // ">", "<", "=="
+    double threshold;
+    int duration;                   // 持续时间（秒）
+    char severity[16];              // info / warn / error / critical
+    int enabled;
+    struct alert_rule *next;
+} alert_rule_t;
+```
+
+8.3 协议定义
+
+```protobuf
+// protocols/monitor.proto
+service Monitor {
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+    rpc GetAlerts(GetAlertsRequest) returns (GetAlertsResponse);
+    rpc SetAlert(SetAlertRequest) returns (SetAlertResponse);
+    rpc ClearAlert(ClearAlertRequest) returns (ClearAlertResponse);
+    rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
+    rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+    rpc GetThresholds(Empty) returns (GetThresholdsResponse);
+}
+
+message Metric {
+    string name = 1;
+    string unit = 2;
+    string type = 3;
+    double value = 4;
+    uint64 timestamp = 5;
+}
+
+message Alert {
+    string id = 1;
+    string metric = 2;
+    string message = 3;
+    string severity = 4;
+    uint64 triggered_at = 5;
+    bool acknowledged = 6;
+}
+
+message GetMetricsResponse {
+    repeated Metric metrics = 1;
+    int32 error = 2;
+}
+```
+
+8.4 插件描述文件
+
+```yaml
+# plugins/monitor/plugin.yml
+plugin:
+  id: "monitor"
+  name: "System Monitor"
+  version: "1.0.0"
+  type: "application"
+  description: "系统监控"
+  provides:
+    - protocol: "MONITOR"
+      version: "1.0"
+  requires:
+    - protocol: "LOG"
+    - protocol: "PARAM"
+    - protocol: "HAP"
+    - protocol: "PMP"
+    - protocol: "FSP"
+    - protocol: "NP"
+    - protocol: "CLUSTER"
+  params:
+    - key: "monitor.interval"
+      default: 5                     # 采集间隔（秒）
+    - key: "monitor.retention_days"
+      default: 7                     # 数据保留天数
+    - key: "monitor.max_samples"
+      default: 10000                 # 最大采样数
+```
+
+8.5 采集指标
+
+指标 来源 单位
+cpu.usage HAP %
+cpu.temperature HAP °C
+cpu.frequency HAP MHz
+memory.used HAP MB
+memory.free HAP MB
+gpu.usage HAP %
+gpu.temperature HAP °C
+gpu.vram_used HAP MB
+network.rx_bytes NP bytes
+network.tx_bytes NP bytes
+disk.used FSP GB
+disk.free FSP GB
+process.count PMP count
+cluster.nodes CLUSTER count
+instance.count INSTANCE count
+load.avg1 PMP -
+load.avg5 PMP -
+load.avg15 PMP -
+
+九、总结
+
+插件 定位 依赖 代码量
+SANDBOX 轻量级安全隔离 PMP, FSP, SP ~800 行
+UI 用户界面 INPUT, DISPLAY ~1200 行
+SHELL 命令行解释器 PMP, FSP, LOADER ~1000 行
+CONSOLE 系统控制台 INPUT, DISPLAY ~600 行
+DESKTOP 桌面环境 UI, FSP, SHELL ~1500 行
+PKGMGR 包管理 FSP, NP, GIT, LOADER ~1200 行
+MONITOR 系统监控 HAP, PMP, FSP, NP, CLUSTER ~1000 行
+
+这七个上层应用插件共同构成了 HWRun OS 的用户可见功能层。它们通过底层协议（HAP、PMP、FSP、NP、SP、INSTANCE、CLUSTER 等）访问系统资源，通过上层协议（UI、SHELL、DESKTOP 等）提供用户交互，形成一个完整的、可用的操作系统用户体验。

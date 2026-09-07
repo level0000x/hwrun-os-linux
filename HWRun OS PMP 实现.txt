@@ -1,0 +1,1316 @@
+﻿HWRun OS PMP 实现文档
+
+模块名称： PMP (Process Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 进程管理协议，提供对进程、线程、调度、信号等操作系统核心功能的管理
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）
+提供协议： PMP
+
+一、设计哲学
+
+1.1 核心定位
+
+PMP 是 HWRun OS 的进程管理核心——所有与进程、线程、调度、信号相关的操作都通过 PMP 协议进行。
+
+```
+PMP = 进程管理协议 = 所有进程相关操作 (HAP) 的统一入口
+
+上层插件 (SCHED, SHELL, CLUSTER, SANDBOX, ...)
+    │
+    │  通过 PMP 协议管理进程
+    ▼
+PMP 插件 (内核模块)
+    │
+    │  直接操作内核 task_struct
+    ▼
+Linux 内核 (进程调度器)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有进程操作通过 PMP 协议进行
+2. 内核实现：PMP 插件运行在内核态，直接操作 task_struct
+3. 进程/线程统一：Linux 内核中进程和线程都是 task_struct
+4. 标准接口：暴露 fork/clone/exec/wait/kill/signal 等标准 POSIX 接口
+5. 调度抽象：提供调度策略和优先级设置接口
+
+1.3 PMP 插件的本质
+
+PMP 插件 = Linux 内核进程管理接口的 HWRun 协议封装
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PMP 插件架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PMP 协议接口 (通过 IPC 调用)                                       │   │
+│  │  Fork / Exec / Wait / Kill / Signal / SchedSet / GetProcessList   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层 (将 PMP 协议调用转换为内核操作)                          │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 权限检查                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核功能封装 (直接操作 Linux 内核)                                   │   │
+│  │  ├── fork: kernel_clone() 封装                                      │   │
+│  │  ├── exec: kernel_execve() 封装                                     │   │
+│  │  ├── wait: wait4() 封装                                             │   │
+│  │  ├── signal: send_signal() / kill_pid() 封装                       │   │
+│  │  ├── sched: sched_setscheduler() 封装                              │   │
+│  │  └── process list: for_each_process() 遍历                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (task_struct / 调度器 / 信号处理)                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 PMP 插件的组成
+
+```
+PMP 插件 (pmp.ko)
+├── 协议处理层
+│   ├── pmp_ipc_handler()       ← IPC 消息分发
+│   ├── pmp_fork()              ← 创建进程
+│   ├── pmp_exec()              ← 执行程序
+│   ├── pmp_wait()              ← 等待进程
+│   ├── pmp_kill()              ← 终止进程
+│   ├── pmp_signal()            ← 发送信号
+│   ├── pmp_sched_set()         ← 设置调度策略
+│   ├── pmp_sched_get()         ← 获取调度策略
+│   ├── pmp_get_process_list()  ← 获取进程列表
+│   ├── pmp_get_process_info()  ← 获取进程信息
+│   └── pmp_set_affinity()      ← 设置 CPU 亲和性
+│
+├── 进程管理
+│   ├── pmp_fork.c              ← fork/clone 实现
+│   ├── pmp_exec.c              ← exec 实现
+│   ├── pmp_wait.c              ← wait 实现
+│   └── pmp_kill.c              ← kill 实现
+│
+├── 信号管理
+│   └── pmp_signal.c            ← 信号发送/处理
+│
+├── 调度管理
+│   └── pmp_sched.c             ← 调度策略管理
+│
+└── 初始化/清理
+    ├── pmp_init()              ← 模块加载
+    └── pmp_exit()              ← 模块卸载
+```
+
+2.2 PMP 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → 其他插件
+                                                                                    ↑
+                                                                           PMP 在这里加载
+```
+
+PMP 是第二个加载的硬件相关插件。在它之后，依赖进程管理的插件（SCHED、SHELL、CLUSTER 等）才能正常工作。
+
+2.3 PMP 的上层消费者
+
+上层插件 需要 PMP 提供什么
+SCHED (调度器) 获取进程列表、设置调度策略和优先级
+SHELL fork/exec 执行命令、wait 等待命令完成
+CLUSTER 远程进程创建和管理
+SANDBOX 进程隔离、权限控制
+CONTAINER 容器内进程管理
+MONITOR 获取进程列表和状态信息
+
+2.4 关键内核概念
+
+Linux 内核中，进程和线程都由 task_struct 结构体描述：
+
+概念 内核表示 说明
+进程 task_struct 每个进程一个 task_struct
+线程 task_struct 线程也是 task_struct，共享 mm_struct
+进程组 task_struct->tgid 线程组 ID
+父进程 task_struct->parent 父进程指针
+
+进程状态：
+
+· TASK_RUNNING (0)：可运行
+· TASK_INTERRUPTIBLE (1)：可中断睡眠
+· TASK_UNINTERRUPTIBLE (2)：不可中断睡眠
+
+三、核心数据结构
+
+```c
+// pmp/include/pmp.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   进程状态 (对应 Linux 的 task_state)
+   ============================================================ */
+typedef enum {
+    PMP_TASK_RUNNING = 0,           // 可运行
+    PMP_TASK_INTERRUPTIBLE = 1,     // 可中断睡眠
+    PMP_TASK_UNINTERRUPTIBLE = 2,   // 不可中断睡眠
+    PMP_TASK_ZOMBIE = 3,            // 僵尸进程
+    PMP_TASK_STOPPED = 4,           // 已停止
+    PMP_TASK_DEAD = 5,              // 已死亡
+} pmp_task_state_t;
+
+/* ============================================================
+   调度策略 (对应 Linux 的 sched policy)
+   ============================================================ */
+typedef enum {
+    PMP_SCHED_OTHER = 0,            // 普通分时调度
+    PMP_SCHED_FIFO = 1,             // 实时 FIFO
+    PMP_SCHED_RR = 2,               // 实时轮转
+    PMP_SCHED_BATCH = 3,            // 批处理调度
+    PMP_SCHED_IDLE = 4,             // 空闲调度
+    PMP_SCHED_DEADLINE = 5,         // 截止时间调度
+} pmp_sched_policy_t;
+
+/* ============================================================
+   进程信息
+   ============================================================ */
+typedef struct pmp_process_info {
+    uint32_t pid;                   // 进程 ID
+    uint32_t ppid;                  // 父进程 ID
+    uint32_t tgid;                  // 线程组 ID
+    char comm[64];                  // 进程名称
+    pmp_task_state_t state;         // 进程状态
+    uint32_t priority;              // 静态优先级
+    int nice;                       // Nice 值 (-20 ~ 19)
+    pmp_sched_policy_t policy;      // 调度策略
+    uint64_t cpu_time_user;         // 用户态 CPU 时间 (ns)
+    uint64_t cpu_time_system;       // 内核态 CPU 时间 (ns)
+    uint32_t cpu_affinity;          // CPU 亲和性掩码
+    uint64_t memory_rss;            // RSS 内存 (KB)
+    uint64_t memory_virtual;        // 虚拟内存 (KB)
+    uint32_t numa_node;             // 绑定的 NUMA 节点
+    uint64_t start_time;            // 启动时间
+} pmp_process_info_t;
+
+/* ============================================================
+   Clone 标志 (对应 Linux CLONE_*)
+   ============================================================ */
+#define PMP_CLONE_VM        0x00000100  // 共享内存空间
+#define PMP_CLONE_FS        0x00000200  // 共享文件系统信息
+#define PMP_CLONE_FILES     0x00000400  // 共享文件描述符表
+#define PMP_CLONE_SIGHAND   0x00000800  // 共享信号处理表
+#define PMP_CLONE_PIDFD     0x00001000  // 创建 PID fd
+#define PMP_CLONE_PTRACE    0x00002000  // 允许 ptrace
+#define PMP_CLONE_VFORK     0x00004000  // vfork 语义 (父进程等待)
+#define PMP_CLONE_PARENT    0x00008000  // 与父进程共享
+#define PMP_CLONE_THREAD    0x00010000  // 创建线程 (同一线程组)
+#define PMP_CLONE_NEWNS     0x00020000  // 新 mount 命名空间
+#define PMP_CLONE_SYSVSEM   0x00040000  // 共享 System V sem
+#define PMP_CLONE_SETTLS    0x00080000  // 设置 TLS
+#define PMP_CLONE_PARENT_SETTID  0x00100000
+#define PMP_CLONE_CHILD_CLEARTID 0x00200000
+#define PMP_CLONE_DETACHED  0x00400000
+#define PMP_CLONE_UNTRACED  0x00800000
+#define PMP_CLONE_CHILD_SETTID   0x01000000
+#define PMP_CLONE_NEWCGROUP 0x02000000
+#define PMP_CLONE_NEWUTS    0x04000000
+#define PMP_CLONE_NEWIPC    0x08000000
+#define PMP_CLONE_NEWUSER   0x10000000
+#define PMP_CLONE_NEWPID    0x20000000
+#define PMP_CLONE_NEWNET    0x40000000
+#define PMP_CLONE_IO        0x80000000
+
+/* ============================================================
+   Fork 请求
+   ============================================================ */
+typedef struct pmp_fork_req {
+    uint32_t flags;                 // CLONE_* 标志
+    void *child_stack;              // 子进程栈 (用于 clone)
+    void *ptid;                     // 父进程 PID 指针
+    void *ctid;                     // 子进程 PID 指针
+    void *newtls;                   // 新 TLS
+} pmp_fork_req_t;
+
+/* ============================================================
+   Fork 响应
+   ============================================================ */
+typedef struct pmp_fork_resp {
+    int32_t pid;                    // 子进程 PID (-1 表示失败)
+    int32_t error;                  // 错误码
+} pmp_fork_resp_t;
+
+/* ============================================================
+   Exec 请求
+   ============================================================ */
+typedef struct pmp_exec_req {
+    char path[256];                 // 可执行文件路径
+    char **argv;                    // 参数列表
+    char **envp;                    // 环境变量列表
+} pmp_exec_req_t;
+
+/* ============================================================
+   Wait 请求
+   ============================================================ */
+typedef struct pmp_wait_req {
+    int32_t pid;                    // 等待的进程 PID (-1 表示任意)
+    int32_t options;                // WNOHANG, WUNTRACED, WCONTINUED
+} pmp_wait_req_t;
+
+/* ============================================================
+   Wait 响应
+   ============================================================ */
+typedef struct pmp_wait_resp {
+    int32_t pid;                    // 返回的进程 PID
+    int32_t status;                 // 退出状态
+    int32_t error;                  // 错误码
+} pmp_wait_resp_t;
+
+/* ============================================================
+   Signal 请求
+   ============================================================ */
+typedef struct pmp_signal_req {
+    int32_t pid;                    // 目标进程 PID
+    int32_t sig;                    // 信号编号
+} pmp_signal_req_t;
+
+/* ============================================================
+   调度设置请求
+   ============================================================ */
+typedef struct pmp_sched_set_req {
+    int32_t pid;                    // 目标进程 PID (0 表示当前)
+    pmp_sched_policy_t policy;      // 调度策略
+    int32_t priority;               // 优先级 (实时调度使用)
+    int32_t nice;                   // Nice 值 (-20 ~ 19)
+} pmp_sched_set_req_t;
+
+/* ============================================================
+   PMP 上下文
+   ============================================================ */
+typedef struct pmp_context {
+    int initialized;
+    uint64_t pmp_task_id;           // PMP 自身的任务 ID
+    void *lock;
+} pmp_context_t;
+```
+
+四、PMP 协议定义
+
+```protobuf
+// protocols/pmp.proto
+syntax = "proto3";
+
+package hwrun.pmp;
+
+service ProcessManager {
+    // === 进程创建 ===
+    rpc Fork(ForkRequest) returns (ForkResponse);
+    rpc Clone(CloneRequest) returns (CloneResponse);
+    rpc Exec(ExecRequest) returns (ExecResponse);
+    
+    // === 进程控制 ===
+    rpc Wait(WaitRequest) returns (WaitResponse);
+    rpc Kill(KillRequest) returns (KillResponse);
+    rpc Signal(SignalRequest) returns (SignalResponse);
+    
+    // === 进程查询 ===
+    rpc GetProcessList(Empty) returns (ProcessListResponse);
+    rpc GetProcessInfo(GetProcessInfoRequest) returns (ProcessInfoResponse);
+    rpc GetCurrentPid(Empty) returns (GetCurrentPidResponse);
+    
+    // === 调度 ===
+    rpc SchedSet(SchedSetRequest) returns (SchedSetResponse);
+    rpc SchedGet(SchedGetRequest) returns (SchedGetResponse);
+    rpc SchedYield(Empty) returns (SchedYieldResponse);
+    
+    // === 亲和性 ===
+    rpc SetAffinity(SetAffinityRequest) returns (SetAffinityResponse);
+    rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);
+}
+
+message Empty {}
+
+// ============ Fork/Clone ============
+
+message ForkRequest {
+    uint32 flags = 1;
+    bytes child_stack = 2;
+    bytes ptid = 3;
+    bytes ctid = 4;
+    bytes newtls = 5;
+}
+
+message ForkResponse {
+    int32 pid = 1;
+    int32 error = 2;
+}
+
+message CloneRequest {
+    uint32 flags = 1;
+    bytes child_stack = 2;
+    bytes ptid = 3;
+    bytes ctid = 4;
+    bytes newtls = 5;
+}
+
+message CloneResponse {
+    int32 pid = 1;
+    int32 error = 2;
+}
+
+// ============ Exec ============
+
+message ExecRequest {
+    string path = 1;
+    repeated string argv = 2;
+    repeated string envp = 3;
+}
+
+message ExecResponse {
+    int32 error = 1;
+}
+
+// ============ Wait ============
+
+message WaitRequest {
+    int32 pid = 1;
+    int32 options = 2;
+}
+
+message WaitResponse {
+    int32 pid = 1;
+    int32 status = 2;
+    int32 error = 3;
+}
+
+// ============ Kill/Signal ============
+
+message KillRequest {
+    int32 pid = 1;
+    int32 sig = 2;
+}
+
+message KillResponse {
+    int32 error = 1;
+}
+
+message SignalRequest {
+    int32 pid = 1;
+    int32 sig = 2;
+}
+
+message SignalResponse {
+    int32 error = 1;
+}
+
+// ============ 进程查询 ============
+
+message ProcessInfo {
+    uint32 pid = 1;
+    uint32 ppid = 2;
+    uint32 tgid = 3;
+    string comm = 4;
+    uint32 state = 5;
+    uint32 priority = 6;
+    int32 nice = 7;
+    uint32 policy = 8;
+    uint64 cpu_time_user = 9;
+    uint64 cpu_time_system = 10;
+    uint32 cpu_affinity = 11;
+    uint64 memory_rss = 12;
+    uint64 memory_virtual = 13;
+    uint32 numa_node = 14;
+    uint64 start_time = 15;
+}
+
+message GetProcessInfoRequest {
+    int32 pid = 1;
+}
+
+message ProcessInfoResponse {
+    ProcessInfo info = 1;
+    int32 error = 2;
+}
+
+message ProcessListResponse {
+    repeated ProcessInfo processes = 1;
+    int32 total = 2;
+}
+
+message GetCurrentPidResponse {
+    int32 pid = 1;
+}
+
+// ============ 调度 ============
+
+message SchedSetRequest {
+    int32 pid = 1;
+    uint32 policy = 2;
+    int32 priority = 3;
+    int32 nice = 4;
+}
+
+message SchedSetResponse {
+    int32 error = 1;
+}
+
+message SchedGetRequest {
+    int32 pid = 1;
+}
+
+message SchedGetResponse {
+    uint32 policy = 1;
+    int32 priority = 2;
+    int32 nice = 3;
+    int32 error = 4;
+}
+
+message SchedYieldResponse {
+    int32 error = 1;
+}
+
+// ============ 亲和性 ============
+
+message SetAffinityRequest {
+    int32 pid = 1;
+    uint32 cpu_mask = 2;
+}
+
+message SetAffinityResponse {
+    int32 error = 1;
+}
+
+message GetAffinityRequest {
+    int32 pid = 1;
+}
+
+message GetAffinityResponse {
+    uint32 cpu_mask = 1;
+    int32 error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// pmp/src/pmp.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/sched/signal.h>
+#include <linux/kthread.h>
+#include <linux/slab.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+#include "pmp_fork.h"
+#include "pmp_exec.h"
+#include "pmp_wait.h"
+#include "pmp_kill.h"
+#include "pmp_signal.h"
+#include "pmp_sched.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Process Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static pmp_context_t g_pmp_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init pmp_init(void) {
+    printk(KERN_INFO "HWRun PMP: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_pmp_ctx, 0, sizeof(pmp_context_t));
+    
+    // 2. 注册 IPC 消息处理器
+    int ret = pmp_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun PMP: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 3. 注册 PMP 协议（通过 METAPROTO - 通过 IPC）
+    pmp_register_protocol();
+    
+    g_pmp_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun PMP: Initialized successfully\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit pmp_exit(void) {
+    printk(KERN_INFO "HWRun PMP: Exiting...\n");
+    
+    pmp_ipc_unregister();
+    
+    g_pmp_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun PMP: Exited\n");
+}
+
+module_init(pmp_init);
+module_exit(pmp_exit);
+```
+
+5.2 进程创建 (Fork/Clone)
+
+```c
+// pmp/src/pmp_fork.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/sched/signal.h>
+#include <linux/slab.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   Fork 系统调用封装
+   ============================================================ */
+int pmp_fork(uint32_t flags, void *child_stack, void *ptid, void *ctid, void *newtls,
+             int32_t *out_pid) {
+    struct task_struct *child;
+    pid_t pid;
+    long ret;
+    
+    // 使用 kernel_clone 创建进程[reference:4]
+    // kernel_clone 是 Linux 内核中所有 fork/clone/vfork 的统一入口
+    // 不同调用通过 flags 参数区分功能[reference:5]
+    ret = kernel_clone((unsigned long)flags, (unsigned long)child_stack,
+                       (unsigned long)ptid, (unsigned long)ctid,
+                       (unsigned long)newtls);
+    
+    if (ret < 0) {
+        *out_pid = -1;
+        return ret;
+    }
+    
+    *out_pid = ret;
+    return 0;
+}
+
+/* ============================================================
+   Clone 系统调用封装 (与 fork 相同，但语义不同)
+   ============================================================ */
+int pmp_clone(uint32_t flags, void *child_stack, void *ptid, void *ctid, void *newtls,
+              int32_t *out_pid) {
+    // clone 与 fork 在底层都是调用 kernel_clone
+    // 区别在于 flags 参数[reference:6]
+    return pmp_fork(flags, child_stack, ptid, ctid, newtls, out_pid);
+}
+
+/* ============================================================
+   Fork IPC 处理器
+   ============================================================ */
+void pmp_ipc_fork_handler(uint64_t from_task, void *data, size_t len) {
+    pmp_fork_req_t *req = (pmp_fork_req_t *)data;
+    pmp_fork_resp_t resp;
+    int ret;
+    
+    ret = pmp_fork(req->flags, req->child_stack, req->ptid, req->ctid, req->newtls,
+                   &resp.pid);
+    
+    resp.error = ret;
+    ipc_reply(from_task, &resp, sizeof(resp));
+}
+```
+
+5.3 程序执行 (Exec)
+
+```c
+// pmp/src/pmp_exec.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   Exec 系统调用封装
+   ============================================================ */
+int pmp_exec(const char *path, char **argv, char **envp) {
+    struct file *file;
+    struct linux_binprm *bprm;
+    int ret;
+    
+    // 1. 打开可执行文件
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        return PTR_ERR(file);
+    }
+    
+    // 2. 分配 bprm 结构
+    bprm = kzalloc(sizeof(struct linux_binprm), GFP_KERNEL);
+    if (!bprm) {
+        filp_close(file, NULL);
+        return -ENOMEM;
+    }
+    
+    // 3. 初始化 bprm
+    bprm->file = file;
+    bprm->filename = (char *)path;
+    bprm->interp = (char *)path;
+    bprm->argc = 0;
+    bprm->envc = 0;
+    
+    // 4. 设置参数和环境变量 (简化版)
+    if (argv) {
+        while (argv[bprm->argc]) bprm->argc++;
+    }
+    if (envp) {
+        while (envp[bprm->envc]) bprm->envc++;
+    }
+    
+    // 5. 执行程序
+    ret = bprm_execve(bprm);
+    
+    // 6. 清理 (如果 exec 失败)
+    if (ret < 0) {
+        kfree(bprm);
+        filp_close(file, NULL);
+    }
+    
+    return ret;
+}
+
+/* ============================================================
+   Exec IPC 处理器
+   ============================================================ */
+void pmp_ipc_exec_handler(uint64_t from_task, void *data, size_t len) {
+    pmp_exec_req_t *req = (pmp_exec_req_t *)data;
+    int ret;
+    
+    ret = pmp_exec(req->path, req->argv, req->envp);
+    ipc_reply(from_task, &ret, sizeof(ret));
+}
+```
+
+5.4 进程等待 (Wait)
+
+```c
+// pmp/src/pmp_wait.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/wait.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   Wait 系统调用封装
+   ============================================================ */
+int pmp_wait(int32_t pid, int32_t options, int32_t *out_status) {
+    struct task_struct *p;
+    int status;
+    long ret;
+    
+    // 查找目标进程
+    if (pid > 0) {
+        p = find_task_by_vpid(pid);
+        if (!p) {
+            *out_status = 0;
+            return -ECHILD;
+        }
+    } else {
+        p = current->parent;
+        // 实际实现中需要遍历所有子进程
+    }
+    
+    // 等待进程状态变化
+    // 实际实现使用 wait4 系统调用
+    ret = kernel_wait4(pid, &status, options, NULL);
+    
+    if (ret < 0) {
+        *out_status = 0;
+        return ret;
+    }
+    
+    *out_status = status;
+    return ret;
+}
+
+/* ============================================================
+   Wait IPC 处理器
+   ============================================================ */
+void pmp_ipc_wait_handler(uint64_t from_task, void *data, size_t len) {
+    pmp_wait_req_t *req = (pmp_wait_req_t *)data;
+    pmp_wait_resp_t resp;
+    int ret;
+    
+    ret = pmp_wait(req->pid, req->options, &resp.status);
+    resp.pid = ret;
+    resp.error = (ret < 0) ? ret : 0;
+    
+    ipc_reply(from_task, &resp, sizeof(resp));
+}
+```
+
+5.5 进程终止和信号
+
+```c
+// pmp/src/pmp_kill.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/signal.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   Kill 系统调用封装
+   ============================================================ */
+int pmp_kill(int32_t pid, int32_t sig) {
+    struct pid *p;
+    struct task_struct *task;
+    int ret;
+    
+    if (pid > 0) {
+        // 查找目标进程
+        task = find_task_by_vpid(pid);
+        if (!task) {
+            return -ESRCH;
+        }
+        
+        // 发送信号[reference:7]
+        ret = send_signal(sig, task, 0);
+    } else if (pid == 0) {
+        // 发送给当前进程组的所有进程
+        ret = kill_pgrp(task_pgrp(current), sig, 1);
+    } else if (pid == -1) {
+        // 发送给所有进程
+        ret = kill_pid(find_vpid(1), sig, 1);
+    } else {
+        // 发送给指定进程组
+        ret = kill_pgrp(find_vpid(-pid), sig, 1);
+    }
+    
+    return ret;
+}
+
+/* ============================================================
+   Kill IPC 处理器
+   ============================================================ */
+void pmp_ipc_kill_handler(uint64_t from_task, void *data, size_t len) {
+    pmp_signal_req_t *req = (pmp_signal_req_t *)data;
+    int ret;
+    
+    ret = pmp_kill(req->pid, req->sig);
+    ipc_reply(from_task, &ret, sizeof(ret));
+}
+```
+
+5.6 进程列表和进程信息
+
+```c
+// pmp/src/pmp_list.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   获取进程列表
+   ============================================================ */
+int pmp_get_process_list(pmp_process_info_t **out_list, uint32_t *out_count) {
+    struct task_struct *p;
+    pmp_process_info_t *list;
+    uint32_t count = 0;
+    
+    // 先计数
+    rcu_read_lock();
+    for_each_process(p) {
+        count++;
+    }
+    rcu_read_unlock();
+    
+    if (count == 0) {
+        *out_list = NULL;
+        *out_count = 0;
+        return 0;
+    }
+    
+    // 分配内存
+    list = kmalloc(count * sizeof(pmp_process_info_t), GFP_KERNEL);
+    if (!list) {
+        return -ENOMEM;
+    }
+    
+    // 填充信息
+    uint32_t idx = 0;
+    rcu_read_lock();
+    for_each_process(p) {
+        pmp_process_info_t *info = &list[idx];
+        
+        info->pid = task_pid_nr(p);
+        info->ppid = task_ppid_nr(p);
+        info->tgid = task_tgid_nr(p);
+        strncpy(info->comm, p->comm, sizeof(info->comm) - 1);
+        info->state = p->__state;
+        info->priority = p->prio;
+        info->nice = task_nice(p);
+        info->policy = p->policy;
+        
+        info->cpu_time_user = p->utime;
+        info->cpu_time_system = p->stime;
+        
+        // CPU 亲和性
+        info->cpu_affinity = 0;
+        if (p->cpus_ptr) {
+            // 简化版：只取第一个 CPU
+            info->cpu_affinity = cpumask_first(p->cpus_ptr);
+        }
+        
+        // 内存信息
+        if (p->mm) {
+            info->memory_rss = get_mm_rss(p->mm) * PAGE_SIZE / 1024;
+            info->memory_virtual = p->mm->total_vm * PAGE_SIZE / 1024;
+        } else {
+            info->memory_rss = 0;
+            info->memory_virtual = 0;
+        }
+        
+        info->numa_node = 0;  // 简化版
+        info->start_time = p->start_time;
+        
+        idx++;
+    }
+    rcu_read_unlock();
+    
+    *out_list = list;
+    *out_count = count;
+    return 0;
+}
+
+/* ============================================================
+   获取单个进程信息
+   ============================================================ */
+int pmp_get_process_info(int32_t pid, pmp_process_info_t *out_info) {
+    struct task_struct *p;
+    
+    if (pid <= 0) {
+        return -EINVAL;
+    }
+    
+    rcu_read_lock();
+    p = find_task_by_vpid(pid);
+    if (!p) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    
+    out_info->pid = task_pid_nr(p);
+    out_info->ppid = task_ppid_nr(p);
+    out_info->tgid = task_tgid_nr(p);
+    strncpy(out_info->comm, p->comm, sizeof(out_info->comm) - 1);
+    out_info->state = p->__state;
+    out_info->priority = p->prio;
+    out_info->nice = task_nice(p);
+    out_info->policy = p->policy;
+    out_info->cpu_time_user = p->utime;
+    out_info->cpu_time_system = p->stime;
+    
+    out_info->cpu_affinity = 0;
+    if (p->cpus_ptr) {
+        out_info->cpu_affinity = cpumask_first(p->cpus_ptr);
+    }
+    
+    if (p->mm) {
+        out_info->memory_rss = get_mm_rss(p->mm) * PAGE_SIZE / 1024;
+        out_info->memory_virtual = p->mm->total_vm * PAGE_SIZE / 1024;
+    } else {
+        out_info->memory_rss = 0;
+        out_info->memory_virtual = 0;
+    }
+    
+    out_info->numa_node = 0;
+    out_info->start_time = p->start_time;
+    
+    rcu_read_unlock();
+    return 0;
+}
+```
+
+5.7 调度管理
+
+```c
+// pmp/src/pmp_sched.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/rt.h>
+#include <linux/sched/deadline.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   设置调度策略和参数
+   ============================================================ */
+int pmp_sched_set(int32_t pid, pmp_sched_policy_t policy, int32_t priority, int32_t nice) {
+    struct task_struct *p;
+    struct sched_param param;
+    int ret;
+    
+    if (pid == 0) {
+        p = current;
+    } else {
+        p = find_task_by_vpid(pid);
+        if (!p) {
+            return -ESRCH;
+        }
+    }
+    
+    // 设置调度策略[reference:8]
+    // 不同的调度策略需要不同的参数[reference:9]
+    param.sched_priority = priority;
+    
+    ret = sched_setscheduler(p, (int)policy, &param);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 设置 nice 值
+    if (nice >= -20 && nice <= 19) {
+        set_user_nice(p, nice);
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   获取调度策略和参数
+   ============================================================ */
+int pmp_sched_get(int32_t pid, pmp_sched_policy_t *out_policy,
+                  int32_t *out_priority, int32_t *out_nice) {
+    struct task_struct *p;
+    
+    if (pid == 0) {
+        p = current;
+    } else {
+        p = find_task_by_vpid(pid);
+        if (!p) {
+            return -ESRCH;
+        }
+    }
+    
+    *out_policy = p->policy;
+    *out_priority = p->rt_priority;
+    *out_nice = task_nice(p);
+    
+    return 0;
+}
+
+/* ============================================================
+   主动让出 CPU
+   ============================================================ */
+int pmp_sched_yield(void) {
+    yield();
+    return 0;
+}
+```
+
+5.8 亲和性管理
+
+```c
+// pmp/src/pmp_affinity.c
+
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/rt.h>
+#include <linux/cpumask.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   设置 CPU 亲和性
+   ============================================================ */
+int pmp_set_affinity(int32_t pid, uint32_t cpu_mask) {
+    struct task_struct *p;
+    cpumask_t new_mask;
+    
+    if (pid == 0) {
+        p = current;
+    } else {
+        p = find_task_by_vpid(pid);
+        if (!p) {
+            return -ESRCH;
+        }
+    }
+    
+    // 构建 CPU 掩码
+    cpumask_clear(&new_mask);
+    for (int cpu = 0; cpu < NR_CPUS; cpu++) {
+        if (cpu_mask & (1 << cpu)) {
+            cpumask_set_cpu(cpu, &new_mask);
+        }
+    }
+    
+    // 设置亲和性
+    return sched_setaffinity(p->pid, &new_mask);
+}
+
+/* ============================================================
+   获取 CPU 亲和性
+   ============================================================ */
+int pmp_get_affinity(int32_t pid, uint32_t *out_cpu_mask) {
+    struct task_struct *p;
+    cpumask_t mask;
+    uint32_t cpu_mask = 0;
+    
+    if (pid == 0) {
+        p = current;
+    } else {
+        p = find_task_by_vpid(pid);
+        if (!p) {
+            return -ESRCH;
+        }
+    }
+    
+    // 获取亲和性
+    sched_getaffinity(p->pid, &mask);
+    
+    for (int cpu = 0; cpu < NR_CPUS; cpu++) {
+        if (cpumask_test_cpu(cpu, &mask)) {
+            cpu_mask |= (1 << cpu);
+        }
+    }
+    
+    *out_cpu_mask = cpu_mask;
+    return 0;
+}
+```
+
+5.9 IPC 消息处理
+
+```c
+// pmp/src/pmp_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "pmp.h"
+#include "pmp_ipc.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void pmp_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case PMP_MSG_FORK:
+            pmp_ipc_fork_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_EXEC:
+            pmp_ipc_exec_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_WAIT:
+            pmp_ipc_wait_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_KILL:
+            pmp_ipc_kill_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_SIGNAL:
+            pmp_ipc_signal_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_SCHED_SET:
+            pmp_ipc_sched_set_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_SCHED_GET:
+            pmp_ipc_sched_get_handler(from_task, data, len);
+            break;
+            
+        case PMP_MSG_GET_PROCESS_LIST: {
+            pmp_process_info_t *list;
+            uint32_t count;
+            int ret = pmp_get_process_list(&list, &count);
+            if (ret == 0) {
+                ipc_reply(from_task, list, count * sizeof(pmp_process_info_t));
+                if (list) kfree(list);
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        case PMP_MSG_GET_PROCESS_INFO: {
+            int32_t pid = *(int32_t *)data;
+            pmp_process_info_t info;
+            int ret = pmp_get_process_info(pid, &info);
+            if (ret == 0) {
+                ipc_reply(from_task, &info, sizeof(info));
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        case PMP_MSG_SET_AFFINITY: {
+            // 处理亲和性设置
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun PMP: Unknown IPC message type: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/pmp/plugin.yml
+plugin:
+  id: "pmp"
+  name: "Process Management Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 进程管理协议，提供进程创建、控制、调度、信号等核心功能"
+  
+  provides:
+    - protocol: "PMP"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+  
+  params:
+    - key: "pmp.max_processes"
+      type: "int"
+      default: 32768
+      description: "最大进程数"
+    - key: "pmp.default_sched_policy"
+      type: "string"
+      default: "other"
+      description: "默认调度策略"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/pmp.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# pmp/Makefile
+
+obj-m += pmp.o
+
+pmp-objs := pmp.o pmp_fork.o pmp_exec.o pmp_wait.o pmp_kill.o \
+            pmp_signal.o pmp_sched.o pmp_list.o pmp_affinity.o pmp_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 pmp.ko /usr/lib/hwrun/plugins/
+```
+
+七、命令行接口
+
+```bash
+# 进程列表
+hwrun pmp ps
+hwrun pmp ps --all
+
+# 进程信息
+hwrun pmp info <pid>
+
+# 创建进程
+hwrun pmp fork
+hwrun pmp clone --flags CLONE_VM|CLONE_FILES
+
+# 执行程序
+hwrun pmp exec /bin/ls -- -la
+
+# 等待进程
+hwrun pmp wait <pid>
+
+# 终止进程
+hwrun pmp kill <pid>
+hwrun pmp kill <pid> --signal 9
+
+# 发送信号
+hwrun pmp signal <pid> SIGTERM
+
+# 调度策略
+hwrun pmp sched get <pid>
+hwrun pmp sched set <pid> --policy rr --priority 10
+hwrun pmp sched set <pid> --nice -5
+
+# CPU 亲和性
+hwrun pmp affinity get <pid>
+hwrun pmp affinity set <pid> --cpus 0,2,4
+```
+
+八、总结
+
+维度 决策
+定位 进程管理协议，所有进程相关操作的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~1500-2000 行 C
+提供协议 PMP (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP
+加载时机 在 SCHED、SHELL、CLUSTER 等依赖进程管理的插件之前
+关键功能 fork/clone/exec/wait/kill/signal/sched_set/亲和性
+
+PMP 是 HWRun OS 中第二个加载的硬件相关插件（HAP → PMP）。它作为内核模块运行，直接操作 Linux 内核的 task_struct，通过 PMP 协议向上层插件提供进程创建、控制、调度、信号等完整的进程管理功能。上层插件（SCHED、SHELL、CLUSTER、SANDBOX 等）通过 PMP 协议管理进程，不直接操作内核进程管理接口。

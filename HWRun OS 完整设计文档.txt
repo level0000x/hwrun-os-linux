@@ -1,0 +1,1914 @@
+HWRun OS 完整设计文档
+
+项目名称： HWRun OS
+版本： 7.0.0
+状态： 架构设计冻结
+设计哲学： 一切皆插件，一切皆参数
+项目性质： 分布式操作系统插件容器
+开发语言： C（微内核 + 组件总线）
+软件格式： 插件（无专有格式）
+版本控制： Git 原生（自动历史管理）
+
+目录
+
+1. 项目定位
+2. 设计哲学
+3. 整体架构
+4. 微内核
+5. 组件总线
+6. 参数系统
+7. 标准化协议层
+8. 插件体系
+9. Git 原生系统
+10. Git 历史自动管理
+11. 可运行格式支持
+12. 异构集群
+13. 分布式原生
+14. 实例与拆分
+15. 权限与安全
+16. 视角体系
+17. 跨地域组网
+18. 节点归属与转移
+19. 用户界面
+20. 构建与分发
+21. 项目目录结构
+22. 代码量估算
+23. 开发路线图
+24. 总结
+
+一、项目定位
+
+1.1 核心定义
+
+HWRun OS 是一个操作系统插件容器。 它本身不实现任何具体功能，只提供微内核 + 组件总线 + 参数系统 + 协议定义 + Git 版本控制。所有功能——内核、libc、init、文件系统、网络、工具、应用格式——都是插件，用户按需安装、任意替换、随时卸载。所有行为由参数决定。软件没有专有格式，只有协议和插件。系统本身由 Git 管理，一切操作都是 Git 操作，历史自动管理。
+
+"HWRun OS = 微内核 + 组件总线 + 参数系统 + Git。插件提供能力，参数决定行为，Git 管理一切。"
+
+1.2 核心公式
+
+```
+HWRun OS = 微内核 + 组件总线 + 参数系统 + Git
+
+微内核: 最小核心 (进程/内存/中断/插件加载器/协议路由)
+组件总线: 插件管理器 (发现/加载/替换/生命周期/跨节点)
+参数系统: 所有配置是参数 (参数驱动一切)
+Git: 版本控制 (存储/同步/日志/版本/备份/认证)
+
+插件 (What):
+├── 提供能力
+├── 实现协议
+└── 可以被替换
+
+参数 (How):
+├── 决定用哪个插件
+├── 决定插件怎么工作
+├── 决定系统怎么运行
+└── 可以被修改
+
+Git (History):
+├── 存储所有状态
+├── 记录所有变更
+├── 同步所有节点
+├── 可回滚到任意状态
+└── 历史自动管理
+
+软件格式 (Plugin):
+├── 没有专有格式
+├── 只有 plugin.yml + 协议实现
+├── 安装 = 安装插件
+└── 运行 = 调用协议
+```
+
+1.3 关键特性
+
+特性 说明
+一切皆插件 从内核到 UI，所有功能都是可插拔插件
+一切皆参数 所有配置、行为、选择都由参数决定
+Git 原生 系统本身是 Git 仓库，所有操作是 Git 操作
+历史自动管理 Git 历史自动合并压缩，tag 永久保留
+协议驱动 插件间只通过标准化协议通信
+内核可换 Linux 内核可以换成 FreeBSD 内核、自研内核
+格式可换 可运行 ELF / PE / Mach-O / APK / EXE / DMG / WASM / JAR
+分布式原生 整个集群就是一个操作系统
+异构节点 集群内不同节点可运行不同插件组合
+热插拔 运行时安装/卸载/替换插件
+可撤销副作用 卸载插件时完全清理所有影响
+无专有格式 软件格式就是插件格式
+
+二、设计哲学
+
+2.1 一切皆插件
+
+```
+传统系统: 固定功能，用户只能在外围加东西
+
+HWRun OS: 所有功能都是插件，从内核到 UI 全部可换
+
+插件层级:
+├── 内核插件 (Linux / FreeBSD / 自研)
+├── libc 插件 (glibc / musl / 自研)
+├── init 插件 (systemd / openrc / runit / 自研)
+├── 文件系统插件 (ext4 / btrfs / zfs / 自研)
+├── 网络插件 (tcpip / zerotier / 自研)
+├── 安全插件 (apparmor / selinux / 自研)
+├── 存储插件 (local / ceph / 自研)
+├── 日志插件 (journald / syslog-ng / 自研)
+├── 工具插件 (coreutils / busybox / 自研)
+├── 调度插件 (cfs / hwrun-sched / 自研)
+├── 格式加载器插件 (ELF / PE / Mach-O / APK / EXE / DMG)
+├── Git 插件 (storage / sync / log / version / auth / backup)
+├── UI 插件 (cli / tui / gui / web)
+└── 任意外部项目 → 直接封装成插件
+```
+
+2.2 一切皆参数
+
+```
+插件是 What 的抽象，参数是 How 的抽象。
+
+插件 (What):
+├── 提供能力
+├── 实现协议
+└── 可以被替换
+
+参数 (How):
+├── 决定用哪个插件
+├── 决定插件怎么工作
+├── 决定系统怎么运行
+└── 可以被修改
+
+参数驱动:
+├── 系统启动: 读取参数 → 加载对应插件
+├── 插件选择: 参数决定用哪个插件
+├── 插件配置: 参数决定插件行为
+├── 格式选择: 参数决定用哪个加载器
+├── Git 操作: 参数决定同步策略/历史管理
+└── 运行时: 参数改变时动态调整
+```
+
+2.3 Git 原生
+
+```
+系统本身是 Git 仓库:
+
+/ = Git 仓库
+├── .hwrun/          → Git 仓库
+├── 插件 = 子模块
+├── 配置 = 文件
+├── 快照 = commit
+├── 版本 = tag
+├── 配置方案 = branch
+└── 集群 = clone + sync
+
+所有操作 = Git 操作:
+├── 安装插件 = git submodule add
+├── 更新插件 = git pull
+├── 切换插件 = git checkout
+├── 保存状态 = git commit
+├── 回滚系统 = git reset
+├── 集群同步 = git push/pull
+└── 查看历史 = git log
+```
+
+2.4 协议驱动，实现无关
+
+```
+插件之间不直接调用，通过标准化协议通信
+
+协议定义 (Protocol):
+├── 不依赖具体实现
+├── 版本管理
+├── 向后兼容
+└── 跨格式支持
+
+插件 (Plugin):
+├── 实现协议接口
+├── 可独立替换
+└── 替换时其他插件无感知
+```
+
+2.5 无专有格式
+
+```
+HWRun OS 的软件格式 = 插件格式
+
+没有:
+├── .hwrun
+├── .hwpkg
+├── .app
+└── 任何专有格式
+
+只有:
+├── plugin.yml (描述)
+├── 协议实现 (代码)
+├── 参数配置 (行为)
+└── Git 仓库 (存储)
+
+第三方软件:
+├── 提供 plugin.yml
+├── 实现协议适配层
+├── 原程序不变
+└── 适配层桥接协议
+```
+
+2.6 可撤销副作用
+
+```
+安装插件时记录所有操作:
+├── 复制文件 → 记录路径
+├── 加载内核模块 → 记录模块名
+├── 创建配置 → 记录路径
+├── 启动服务 → 记录服务名
+├── 挂载文件系统 → 记录挂载点
+└── 修改系统状态 → 记录修改
+
+卸载时逆向执行:
+├── 停止服务
+├── 卸载文件系统
+├── 删除配置
+├── 卸载内核模块
+├── 删除文件
+└── 系统回到安装前状态
+```
+
+2.7 插件来源
+
+```
+插件来源不限:
+├── HWRun 官方仓库 (Git)
+├── 第三方开发者 (Git)
+├── 其他开源项目 (直接封装)
+├── 商业软件 (封装后分发)
+└── 用户自己写的
+```
+
+三、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HWRun OS 完整架构                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  插件层 (所有功能都是插件)                                          │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐│   │
+│  │  │ 内核插件 │ │ libc插件 │ │ init插件 │ │ 文件系统 │ │ 网络插件 ││   │
+│  │  │ Linux    │ │ glibc    │ │ systemd  │ │ ext4     │ │ tcpip    ││   │
+│  │  │ FreeBSD  │ │ musl     │ │ openrc   │ │ btrfs    │ │ zerotier ││   │
+│  │  │ 自研     │ │ 自研     │ │ runit    │ │ 自研     │ │ 自研     ││   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘│   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐│   │
+│  │  │ Git插件  │ │ 加载器   │ │ 安全插件 │ │ 存储插件 │ │ 日志插件 ││   │
+│  │  │ storage  │ │ ELF      │ │ apparmor │ │ local    │ │ journald ││   │
+│  │  │ sync     │ │ PE/EXE   │ │ selinux  │ │ ceph     │ │ syslog   ││   │
+│  │  │ log      │ │ Mach-O   │ │ 自研     │ │ 自研     │ │ 自研     ││   │
+│  │  │ version  │ │ APK/DMG  │ └──────────┘ └──────────┘ └──────────┘│   │
+│  │  │ auth     │ │ WASM     │  ┌──────────┐ ┌──────────┐            │   │
+│  │  │ backup   │ │ 自研     │  │ UI插件   │ │ 工具插件 │            │   │
+│  │  └──────────┘ └──────────┘  │ cli/tui  │ │ coreutils│            │   │
+│  │                             │ gui/web  │ │ busybox  │            │   │
+│  │                             └──────────┘ └──────────┘            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  组件总线 (插件管理器)                                              │   │
+│  │  ├── 插件发现: 扫描 Git 仓库中的插件                                │   │
+│  │  ├── 参数匹配: 根据参数选择插件                                      │   │
+│  │  ├── 协议匹配: 插件间协议发现与路由                                  │   │
+│  │  ├── 格式匹配: 文件格式 → 加载器路由                                 │   │
+│  │  ├── 依赖管理: 协议版本兼容性检查                                    │   │
+│  │  ├── 生命周期: 安装/启动/停止/卸载                                   │   │
+│  │  ├── 可撤销副作用: 卸载时完全清理                                    │   │
+│  │  ├── Git 集成: 所有操作自动 commit                                   │   │
+│  │  ├── 热插拔: 运行时安装/卸载/替换插件                                │   │
+│  │  └── 跨节点路由: 集群内插件发现与路由                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  参数系统 (所有配置都是参数)                                        │   │
+│  │  ├── 硬件参数: 由硬件探测插件提供                                    │   │
+│  │  ├── 系统参数: 由系统自动生成                                        │   │
+│  │  ├── 用户参数: 用户配置                                             │   │
+│  │  ├── 插件参数: 插件自己的配置                                        │   │
+│  │  ├── 运行时参数: 运行时动态改变                                      │   │
+│  │  ├── Git 参数: 同步策略/仓库地址/历史管理                            │   │
+│  │  ├── 格式参数: 各加载器的配置                                        │   │
+│  │  ├── 参数驱动: 参数决定插件加载和行为                                │   │
+│  │  └── 动态修改: 运行时修改参数自动生效                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  标准化协议层 (所有插件遵守)                                        │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐│   │
+│  │  │ HAP协议  │ │ FSP协议  │ │ PMP协议  │ │ NP协议   │ │ SP协议   ││   │
+│  │  │硬件抽象  │ │文件系统  │ │进程管理  │ │网络     │ │安全     ││   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘│   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐             │   │
+│  │  │ LOADER   │ │ UI协议   │ │ FORMAT   │ │ APP协议  │             │   │
+│  │  │格式加载器│ │用户界面  │ │文件格式  │ │应用接口  │             │   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Git 层 (版本控制)                                                  │   │
+│  │  ├── git-storage: 存储系统状态                                      │   │
+│  │  ├── git-sync: 集群同步                                            │   │
+│  │  ├── git-log: 审计日志                                             │   │
+│  │  ├── git-version: 版本管理                                         │   │
+│  │  ├── git-auth: 认证/权限                                           │   │
+│  │  ├── git-backup: 备份/恢复                                         │   │
+│  │  └── git-compact: 历史自动管理                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  微内核 (最小核心)                                                  │   │
+│  │  ├── 进程调度接口                                                  │   │
+│  │  ├── 内存管理接口                                                  │   │
+│  │  ├── 中断处理                                                      │   │
+│  │  ├── 插件加载器                                                    │   │
+│  │  ├── 组件总线接口                                                  │   │
+│  │  ├── 参数系统接口                                                  │   │
+│  │  ├── Git 接口                                                      │   │
+│  │  ├── 最小 IPC                                                      │   │
+│  │  └── 协议路由表                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  硬件层 (x86/ARM/RISC-V)                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+四、微内核
+
+4.1 设计原则
+
+```
+微内核只包含:
+├── 进程调度接口 (最小接口)
+├── 内存管理接口 (最小接口)
+├── 中断处理
+├── 插件加载器
+├── 组件总线接口
+├── 参数系统接口
+├── Git 接口
+├── 最小 IPC
+└── 协议路由表
+
+微内核不包含:
+├── 具体调度算法 (由调度插件提供)
+├── 具体文件系统 (由文件系统插件提供)
+├── 具体网络栈 (由网络插件提供)
+├── 具体安全策略 (由安全插件提供)
+├── 具体格式加载 (由加载器插件提供)
+├── Git 具体操作 (由 Git 插件提供)
+├── 用户管理 (由权限插件提供)
+├── 集群管理 (由集群插件提供)
+└── UI (由 UI 插件提供)
+```
+
+4.2 微内核接口
+
+```c
+/* microkernel/hwrun.h */
+
+/* 进程调度接口 (由调度插件实现) */
+struct hwrun_sched_ops {
+    int (*init)(void);
+    int (*submit)(struct task *t);
+    int (*cancel)(uint64_t task_id);
+    int (*yield)(void);
+    int (*set_affinity)(pid_t pid, int *cpus, int n_cpus);
+    int (*set_policy)(const char *policy);
+    struct task_info *(*get_info)(uint64_t task_id);
+};
+
+/* 内存管理接口 (由内存插件实现) */
+struct hwrun_mem_ops {
+    void *(*alloc)(size_t size, enum hwrun_device_hint hint);
+    void (*free)(void *ptr);
+    int (*migrate)(void *ptr, size_t size, enum hwrun_device_hint target);
+};
+
+/* 参数接口 (由参数系统管理) */
+struct hwrun_param {
+    char *key;
+    char *value;
+    char *type;
+    int (*set)(struct hwrun_param *self, const char *value);
+    char *(*get)(struct hwrun_param *self);
+};
+
+/* Git 接口 (由 Git 插件实现) */
+struct hwrun_git_ops {
+    int (*init)(const char *path);
+    int (*commit)(const char *message);
+    int (*push)(void);
+    int (*pull)(void);
+    int (*clone)(const char *remote, const char *path);
+    int (*tag)(const char *name);
+    int (*checkout)(const char *ref);
+    int (*reset)(const char *ref);
+    int (*log)(char *output, size_t size);
+    int (*blame)(const char *path, char *output, size_t size);
+    int (*size)(uint64_t *size);
+    int (*compact)(int level);
+};
+
+/* 插件接口 (由组件总线管理) */
+struct hwrun_plugin {
+    char *id;
+    char *name;
+    char *version;
+    char *protocol;
+    int (*init)(struct hwrun_plugin *self);
+    int (*start)(struct hwrun_plugin *self);
+    int (*stop)(struct hwrun_plugin *self);
+    int (*destroy)(struct hwrun_plugin *self);
+    void *(*get_interface)(const char *protocol);
+    int (*configure)(struct hwrun_plugin *self, struct hwrun_param *params);
+};
+
+/* 协议路由 (由微内核管理) */
+struct hwrun_protocol_route {
+    char *name;
+    char *version;
+    char *plugin_id;
+    void *implementation;
+};
+```
+
+4.3 微内核大小
+
+```
+微内核目标:
+├── 源码: ~5000 行 C
+├── 编译后: ~200KB
+├── 运行时内存: ~10MB
+└── 不包含: 任何具体实现
+```
+
+五、组件总线
+
+5.1 设计原则
+
+```
+组件总线 = 系统的"插件管理器"
+
+功能:
+├── 插件发现: 扫描 Git 仓库中的插件
+├── 参数匹配: 根据参数选择插件
+├── 协议匹配: 插件间协议发现与路由
+├── 格式匹配: 文件格式 → 加载器路由
+├── 依赖管理: 协议版本兼容性检查
+├── 生命周期: 安装 → 加载 → 启动 → 运行 → 停止 → 卸载
+├── 可撤销副作用: 卸载时完全清理
+├── Git 集成: 所有操作自动 commit
+├── 热插拔: 运行时安装/卸载/替换
+└── 跨节点路由: 集群内插件发现与路由
+```
+
+5.2 插件定义格式
+
+```yaml
+# plugins/loader-apk/plugin.yml
+plugin:
+  id: "loader-apk"
+  name: "APK 应用加载器"
+  version: "1.0.0"
+  description: "Android APK 应用加载器"
+  
+  type: "loader"
+  
+  git:
+    repo: "https://hwrun.org/plugins/loader-apk.git"
+    branch: "main"
+  
+  provides:
+    - protocol: "LOADER-APK"
+      version: "1.0"
+  
+  requires:
+    - protocol: "PMP"
+    - protocol: "FSP"
+    - protocol: "NP"
+    - protocol: "SP"
+  
+  formats:
+    - name: "APK"
+      magic: ["50 4b 03 04"]
+      extensions: [".apk", ".aab"]
+  
+  params:
+    - key: "apk.data_dir"
+      type: "string"
+      default: "/var/lib/hwrun/apk"
+    - key: "apk.sandbox"
+      type: "bool"
+      default: true
+    - key: "apk.max_memory"
+      type: "string"
+      default: "1GB"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/loader-apk.so"
+  
+  size: "2MB"
+  
+  license: "MIT"
+  
+  author: "HWRun Team"
+```
+
+5.3 插件生命周期
+
+```
+插件状态机:
+
+[未安装] → [已安装] → [已加载] → [运行中]
+              │           │          │
+              │           ├──────────┤
+              │           │          │
+              ▼           ▼          ▼
+           [可切换]   [可暂停]   [可替换]
+              │           │          │
+              └───────────┴──────────┘
+                      │
+                      ▼
+                 [已卸载/清理]
+```
+
+5.4 插件替换流程
+
+```
+替换流程 (运行时):
+
+1. 用户修改参数:
+   hwrun params set kernel.type freebsd
+
+2. 组件总线:
+   ├── 检测参数变化: kernel.type → freebsd
+   ├── 查找对应插件: freebsd-kernel
+   ├── 检查协议兼容性: 是否实现 HAP
+   ├── git-storage 自动 commit: "切换内核: linux → freebsd"
+   ├── 通知所有使用 HAP 的插件: "协议将切换"
+   ├── 卸载 linux-kernel (保留状态)
+   ├── 加载 freebsd-kernel
+   ├── 注册 freebsd-kernel 到 HAP 协议路由
+   └── 通知所有插件: "协议已切换"
+
+3. 完成: 用户无感知，系统现在运行在 FreeBSD 内核上
+```
+
+5.5 用户操作
+
+```bash
+# 查看所有插件
+hwrun plugins list
+
+# 查看协议
+hwrun plugins protocol HAP
+
+# 安装插件 (git clone)
+hwrun plugins install linux-kernel
+
+# 卸载插件
+hwrun plugins remove linux-kernel
+
+# 替换插件 (运行时)
+hwrun plugins replace linux-kernel --with freebsd-kernel
+
+# 查看插件 Git 状态
+hwrun plugins status
+```
+
+六、参数系统
+
+6.1 设计原则
+
+```
+参数系统 = 所有配置都是参数
+
+参数驱动一切:
+├── 系统启动: 读取参数 → 加载对应插件
+├── 插件选择: 参数决定用哪个插件
+├── 插件配置: 参数决定插件行为
+├── 格式选择: 参数决定用哪个加载器
+├── Git 配置: 参数决定同步策略/仓库地址/历史管理
+├── 系统运行: 参数改变时动态调整
+├── 集群管理: 参数决定节点角色
+└── 权限控制: 参数决定权限分配
+```
+
+6.2 参数层级
+
+```
+参数层级 (从低到高):
+
+├── 硬件参数 (由硬件探测插件提供)
+│   └── cpu_cores, memory_size, gpu_count, ...
+│
+├── 系统参数 (由系统自动生成)
+│   └── hostname, timezone, locale, ...
+│
+├── 用户参数 (用户配置)
+│   └── scheduler_policy, network_config, ...
+│
+├── 插件参数 (插件自己的配置)
+│   └── cfs_quantum, ext4_options, ...
+│
+├── Git 参数 (Git 插件配置)
+│   └── remote_url, sync_interval, auto_commit, max_size, ...
+│
+├── 格式参数 (加载器的配置)
+│   └── apk.sandbox, exe.wine_prefix, ...
+│
+└── 运行时参数 (运行时动态改变)
+    └── load_avg, temperature, power_limit, ...
+```
+
+6.3 参数定义
+
+```yaml
+# params/system.yml
+system:
+  hostname: "hwrun-node-01"
+  timezone: "UTC"
+  locale: "en_US.UTF-8"
+
+# params/git.yml
+git:
+  remote: "https://hwrun.org/system.git"
+  branch: "main"
+  auto_commit: true
+  sync_interval: 60
+  
+  storage:
+    root: "/var/lib/hwrun/git"
+  
+  sync:
+    auto: true
+    interval: 60
+  
+  history:
+    max_size: "1GB"
+    auto_compact: true
+    
+    granularity:
+      - days: 1
+        level: "hour"
+      - days: 7
+        level: "day"
+      - days: 30
+        level: "week"
+      - days: 90
+        level: "month"
+      - days: 365
+        level: "year"
+      - days: 0
+        level: "all"
+    
+    preserve:
+      - "tags/*"
+      - "system-version-*"
+      - "kernel-upgrade-*"
+      - "security-*"
+
+# params/kernel.yml
+kernel:
+  type: "linux"
+  version: "6.1.0"
+
+# params/scheduler.yml
+scheduler:
+  type: "hwrun-sched"
+  policy: "performance"
+  weights:
+    performance: 0.4
+    power: 0.3
+    temperature: 0.3
+
+# params/loader.yml
+loader:
+  default: "auto"
+  auto_detect: true
+  
+  apk:
+    data_dir: "/var/lib/hwrun/apk"
+    sandbox: true
+    max_memory: "1GB"
+```
+
+6.4 用户操作
+
+```bash
+# 查看所有参数
+hwrun params list
+
+# 查看参数
+hwrun params get scheduler.policy
+
+# 设置参数 (自动 git commit)
+hwrun params set scheduler.policy performance
+# 输出: 参数已修改，commit: a1b2c3d "修改调度策略为 performance"
+
+# 参数自动触发插件重新配置
+hwrun params set kernel.type freebsd
+# 输出: 切换内核: linux → freebsd，commit: d4e5f6g
+
+# 导出参数
+hwrun params export system-config.yml
+
+# 导入参数
+hwrun params import system-config.yml
+```
+
+七、标准化协议层
+
+7.1 协议定义
+
+```
+HWRun OS 标准化协议
+
+协议层 1: 硬件抽象协议 (HAP)
+├── 定义: CPU/内存/存储/网络/GPU 的标准接口
+├── 实现: 各硬件厂商提供驱动插件
+└── 关键接口: cpu_info, mem_alloc, pcie_scan, irq_handle
+
+协议层 2: 文件系统协议 (FSP)
+├── 定义: 文件/目录/权限/挂载的标准接口
+├── 实现: ext4 / btrfs / zfs 插件
+└── 关键接口: open, close, read, write, stat, mkdir
+
+协议层 3: 进程管理协议 (PMP)
+├── 定义: 进程/线程/调度的标准接口
+├── 实现: cfs / hwrun-sched 插件
+└── 关键接口: fork, exec, wait, signal, scheduler
+
+协议层 4: 网络协议 (NP)
+├── 定义: socket/连接/数据包的标准接口
+├── 实现: tcpip / zerotier 插件
+└── 关键接口: socket, connect, send, recv, bind
+
+协议层 5: 安全协议 (SP)
+├── 定义: 认证/授权/加密的标准接口
+├── 实现: apparmor / selinux 插件
+└── 关键接口: authenticate, authorize, encrypt, decrypt
+
+协议层 6: 格式加载协议 (LOADER)
+├── 定义: 可执行文件格式加载的标准接口
+├── 实现: ELF / PE / Mach-O / APK / EXE / DMG 加载器插件
+└── 关键接口: detect_format, load, run, unload
+
+协议层 7: Git 协议 (GIT)
+├── 定义: 版本控制的标准接口
+├── 实现: git-storage / git-sync / git-log / git-version 插件
+└── 关键接口: commit, push, pull, clone, tag, checkout, log, compact
+
+协议层 8: 用户界面协议 (UI)
+├── 定义: 界面显示/交互的标准接口
+├── 实现: cli / tui / gui / web 插件
+└── 关键接口: render, input, event
+
+协议层 9: 插件间通信协议 (ICP)
+├── 定义: 插件之间收发消息的标准格式
+├── 格式: Protocol Buffers
+└── 关键接口: send, recv, reply, broadcast
+```
+
+八、插件体系
+
+8.1 插件分类
+
+```
+HWRun OS 插件分类
+
+系统类:
+├── 内核插件 (linux / freebsd / hwrun-micro)
+├── libc 插件 (glibc / musl / hwrun-libc)
+├── init 插件 (systemd / openrc / runit / minimal)
+├── 调度插件 (cfs / hwrun-sched / rt)
+├── 包管理插件 (apt / pacman / apk / none)
+
+存储类:
+├── 文件系统插件 (ext4 / btrfs / zfs / xfs)
+├── 存储后端插件 (local / iscsi / ceph / glusterfs)
+├── 日志插件 (journald / syslog-ng / rsyslog)
+
+网络类:
+├── 网络协议栈插件 (tcpip / zerotier / wireguard)
+├── 网络驱动插件 (eth / infiniband / wifi)
+
+Git 类:
+├── git-storage: 存储系统状态
+├── git-sync: 集群同步
+├── git-log: 审计日志
+├── git-version: 版本管理
+├── git-auth: 认证/权限
+├── git-backup: 备份/恢复
+└── git-compact: 历史自动管理
+
+格式加载器类:
+├── ELF 加载器 (Linux 可执行文件)
+├── PE/EXE 加载器 (Windows 可执行文件)
+├── Mach-O 加载器 (macOS 可执行文件)
+├── APK 加载器 (Android 应用)
+├── DMG 加载器 (macOS 磁盘镜像)
+├── WASM 加载器 (WebAssembly)
+├── JAR 加载器 (Java 应用)
+└── 自定义加载器 (用户自研)
+
+安全类:
+├── 安全模块插件 (apparmor / selinux / smack)
+├── 加密插件 (openssl / libsodium)
+
+工具类:
+├── 核心工具插件 (coreutils / busybox / toybox)
+├── Shell 插件 (bash / zsh / fish / dash)
+
+UI 类:
+├── CLI 插件 (hwrun-cli)
+├── TUI 插件 (hwrun-tui)
+├── GUI 插件 (hwrun-gui)
+├── Web 插件 (web-dashboard)
+
+管理类:
+├── 权限插件 (hwrun-permissions)
+├── 集群插件 (hwrun-cluster)
+├── 监控插件 (prometheus / hwrun-tui)
+```
+
+8.2 默认插件
+
+```
+HWRun OS 默认插件 (极小化)
+
+必选 (微内核自带):
+├── 进程调度接口
+├── 内存管理接口
+├── 中断处理
+├── 插件加载器
+├── 组件总线
+├── 参数系统
+└── IPC + 协议路由
+
+默认插件 (开箱即用, 全部可换):
+├── 内核: linux-kernel (精简版)
+├── libc: glibc-minimal
+├── init: minimal-init (简化版)
+├── 文件系统: ext4-minimal
+├── 网络: tcpip-minimal
+├── 安全: apparmor-minimal
+├── 存储: local
+├── 日志: journald-minimal
+├── 调度: cfs
+├── 工具: busybox
+├── 加载器: elf-loader (基础)
+├── Git: git-storage (基础)
+└── UI: hwrun-cli + hwrun-tui
+```
+
+8.3 可选插件 (用户按需安装)
+
+```
+用户按需安装:
+
+系统类:
+├── 完整 Linux 内核
+├── FreeBSD 内核
+├── glibc (完整)
+├── musl
+├── systemd (完整)
+├── openrc
+└── runit
+
+Git 类:
+├── git-sync (集群同步)
+├── git-log (审计日志)
+├── git-version (版本管理)
+├── git-auth (认证/权限)
+├── git-backup (备份/恢复)
+└── git-compact (历史自动管理)
+
+格式加载器类:
+├── pe-loader (Windows EXE/DLL/MSI)
+├── macho-loader (macOS 程序)
+├── apk-loader (Android APK)
+├── dmg-loader (macOS DMG)
+├── wasm-loader (WebAssembly)
+├── jar-loader (Java)
+
+网络类:
+├── ZeroTier
+├── WireGuard
+├── InfiniBand
+└── 自定义网络栈
+
+存储类:
+├── btrfs
+├── zfs
+├── ceph
+├── glusterfs
+└── 自定义文件系统
+
+安全类:
+├── SELinux
+├── SMACK
+└── 自定义安全模块
+
+工具类:
+├── GNU coreutils
+├── 自定义工具集
+└── 自研工具
+
+UI类:
+├── hwrun-gui (GTK)
+├── web-dashboard
+└── 自定义UI
+```
+
+8.4 插件安装 (Git 方式)
+
+```bash
+# 安装插件 (git clone)
+hwrun plugins install linux-kernel
+# 实际执行: git clone https://hwrun.org/plugins/linux-kernel.git
+
+hwrun plugins install systemd
+hwrun plugins install apk-loader
+hwrun plugins install git-sync
+hwrun plugins install git-log
+
+# 更新插件 (git pull)
+hwrun plugins update linux-kernel
+# 实际执行: git pull
+
+# 切换插件版本 (git checkout)
+hwrun plugins switch linux-kernel v6.2.0
+# 实际执行: git checkout v6.2.0
+```
+
+九、Git 原生系统
+
+9.1 设计原则
+
+```
+HWRun OS 本身是 Git 仓库
+
+系统根目录 / = Git 仓库
+├── .hwrun/          → Git 仓库
+├── 插件 = 子模块
+├── 配置 = 文件
+├── 快照 = commit
+├── 版本 = tag
+├── 配置方案 = branch
+└── 集群 = clone + sync
+
+所有操作 = Git 操作:
+├── 安装插件 = git submodule add
+├── 更新插件 = git pull
+├── 切换插件 = git checkout
+├── 保存状态 = git commit
+├── 回滚系统 = git reset
+├── 集群同步 = git push/pull
+└── 查看历史 = git log
+```
+
+9.2 Git 插件体系
+
+```
+Git 插件拆分:
+
+git-storage (底层存储)
+├── 封装: git add / commit / push / pull / clone
+├── 存储系统所有状态
+├── 所有数据在 Git 仓库里
+└── 提供 commit / push / pull / clone
+
+git-sync (同步)
+├── 封装: git push / pull / merge
+├── 集群节点同步
+├── 配置分发
+├── 插件分发
+└── 操作: sync / push / pull / merge
+
+git-log (日志/审计)
+├── 封装: git log / blame / diff
+├── 系统操作日志
+├── 配置变更记录
+├── 插件安装记录
+└── 操作: log / blame / diff
+
+git-version (版本管理)
+├── 封装: git tag / checkout / reset / revert
+├── 系统版本管理
+├── 插件版本管理
+├── 回滚/升级
+└── 操作: tag / checkout / reset / revert
+
+git-auth (认证/权限)
+├── 封装: git ssh-key / verify
+├── 基于 SSH 密钥认证
+├── 基于 Git 仓库的权限
+└── 操作: ssh-key / verify / authorize
+
+git-backup (备份/恢复)
+├── 封装: git bundle / clone
+├── 系统配置备份
+├── 插件数据备份
+└── 操作: bundle / clone / restore
+
+git-compact (历史管理)
+├── 封装: git rebase / reflog
+├── 历史自动合并压缩
+├── tag 永久保留
+└── 操作: compact / size / restore-history
+```
+
+9.3 共享 Git 仓库
+
+```
+所有 Git 插件共用同一个仓库:
+
+/var/lib/hwrun/git/
+├── .git/
+├── params/          → 参数系统配置
+├── protocols/       → 协议定义
+├── plugins/         → 插件 (子模块)
+│   ├── linux-kernel/
+│   ├── glibc/
+│   └── systemd/
+├── system/          → 系统状态
+├── logs/            → 审计日志
+└── README.md
+```
+
+9.4 用户操作 (Git 风格)
+
+```bash
+# 查看系统状态
+hwrun git status
+
+# 提交系统更改
+hwrun git commit -m "升级内核到 v6.1.0"
+
+# 查看系统历史
+hwrun git log
+# 输出:
+# commit a1b2c3d... 2026-09-07 升级内核到 v6.1.0
+# commit d4e5f6g... 2026-09-06 安装 systemd 插件
+
+# 查看特定文件历史
+hwrun git blame /etc/hwrun/params/scheduler.yml
+
+# 创建系统版本
+hwrun git tag v1.0.0
+
+# 查看系统版本
+hwrun git describe
+
+# 回滚系统
+hwrun git rollback v0.9.0
+
+# 集群同步
+hwrun git sync
+# 实际执行: git push && git pull
+```
+
+9.5 Git 参数
+
+```yaml
+# params/git.yml
+git:
+  remote: "https://hwrun.org/system.git"
+  branch: "main"
+  auto_commit: true
+  sync_interval: 60
+  
+  storage:
+    root: "/var/lib/hwrun/git"
+  
+  sync:
+    auto: true
+    interval: 60
+  
+  log:
+    retention: "90d"
+    audit: true
+```
+
+十、Git 历史自动管理
+
+10.1 设计原则
+
+```
+Git 历史自动管理策略
+
+核心原则: 自动合并历史，保留有意义的差异
+驱动方式: 时间 + 大小阈值
+触发条件: Git 仓库大小 > 用户预设值
+合并策略: 越近越细，越远越粗
+Tag 保护: 有 tag 的提交永久保留
+```
+
+10.2 时间线合并粒度
+
+```
+时间轴: 过去 ←─────────────────────────────────────→ 现在
+
+合并粒度曲线:
+
+现在 ─────────────────────────────────────────────── 过去
+   │                                                    │
+   │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐│
+   │  │  小时  │  │  天   │  │  周   │  │  月   │  │  年   ││
+   │  │  粒度  │  │  粒度  │  │  粒度  │  │  粒度  │  │  粒度  ││
+   │  │ (细)  │  │       │  │       │  │       │  │ (粗)  ││
+   │  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘│
+   │  最近 24h   7天内     30天内    90天内    更久    │
+   │                                                    │
+   └─────────────────────────────────────────────────────┘
+
+粒度定义:
+├── 小时粒度: 每个 commit 保留 (最细)
+├── 天粒度: 合并成 1 天 1 个 commit
+├── 周粒度: 合并成 1 周 1 个 commit
+├── 月粒度: 合并成 1 月 1 个 commit
+└── 年粒度: 合并成 1 年 1 个 commit (最粗)
+```
+
+10.3 Tag 保护规则
+
+```
+Git 历史保护规则
+
+核心规则:
+├── 有 tag 的 commit → 永久保留，永不合并
+├── 系统版本 tag → 永久保留
+├── 关键版本 tag → 永久保留
+└── 用户自定义 tag → 永久保留
+
+合并策略:
+├── 只合并没有 tag 的 commit
+├── tag 之间的 commit → 合并成 1 个 (保留前后的 tag)
+└── tag 本身 → 不动
+
+示例:
+v1.0.0 (tag) ←→ (合并) ←→ v1.0.1 (tag) ←→ (合并) ←→ v1.1.0 (tag)
+     │              │              │              │              │
+     ▼              ▼              ▼              ▼              ▼
+   永久保留      合并成1个      永久保留      合并成1个      永久保留
+```
+
+10.4 自动触发机制
+
+```
+触发条件:
+├── 触发阈值: Git 仓库大小 > 用户预设值 (默认 1GB)
+├── 检查周期: 每次 commit 后检查
+└── 触发动作: 自动执行历史合并
+
+用户预设值:
+├── 默认: 1GB
+├── 可调: hwrun params set git.history.max_size 2GB
+└── 可调: hwrun params set git.history.max_size 500MB
+```
+
+10.5 合并算法
+
+```
+历史合并算法:
+
+1. 检查当前 Git 仓库大小
+2. 如果大小 > 预设阈值:
+   ├── 按时间线分段
+   │   ├── 最近 24h: 不合并 (保留所有 commit)
+   │   ├── 7天内: 按天合并 (保留每天最后一个 commit)
+   │   ├── 30天内: 按周合并 (保留每周最后一个 commit)
+   │   ├── 90天内: 按月合并 (保留每月最后一个 commit)
+   │   └── 更久: 按年合并 (保留每年最后一个 commit)
+   │
+   ├── 执行合并 (git rebase -i)
+   │   └── 合并相邻 commit 成 1 个
+   │
+   └── 保留关键 commit (带有 tag 的永远不合并)
+       └── 系统版本 tag 永久保留
+
+3. 合并后检查:
+   ├── 如果大小仍然 > 阈值 → 提高合并粒度 (周→月→年)
+   └── 直到大小 < 阈值
+```
+
+10.6 合并粒度曲线
+
+```
+合并粒度曲线 (按时间距离)
+
+粒度等级:
+0: 不合并 (保留全部)
+1: 按小时合并 (合并 1 小时内的 commit)
+2: 按天合并 (合并 1 天内的 commit)
+3: 按周合并 (合并 1 周内的 commit)
+4: 按月合并 (合并 1 月内的 commit)
+5: 按年合并 (合并 1 年内的 commit)
+6: 全部合并 (只保留最新的 commit)
+
+时间衰减公式:
+粒度 = floor(log2(距离天数 + 1))
+
+距离 0 天 → 粒度 0 (不合并)
+距离 1 天 → 粒度 1 (小时)
+距离 3 天 → 粒度 2 (天)
+距离 7 天 → 粒度 3 (周)
+距离 15 天 → 粒度 4 (月)
+距离 31 天 → 粒度 5 (年)
+距离 > 365 天 → 粒度 6 (全部合并)
+```
+
+10.7 用户配置
+
+```yaml
+# params/git.yml
+git:
+  history:
+    max_size: "1GB"
+    auto_compact: true
+    
+    granularity:
+      - days: 1
+        level: "hour"      # 1天内: 小时粒度
+      - days: 7
+        level: "day"       # 7天内: 天粒度
+      - days: 30
+        level: "week"      # 30天内: 周粒度
+      - days: 90
+        level: "month"     # 90天内: 月粒度
+      - days: 365
+        level: "year"      # 365天内: 年粒度
+      - days: 0
+        level: "all"       # >365天: 全部合并
+    
+    preserve:
+      - "tags/*"           # 所有 tag 永久保留
+      - "system-version-*" # 系统版本 tag
+      - "kernel-upgrade-*" # 内核升级 tag
+      - "security-*"       # 安全更新 tag
+```
+
+10.8 备份机制
+
+```
+详细历史备份:
+├── 合并前: 将详细 commit 打包备份
+├── 备份位置: /var/lib/hwrun/git-backup/
+├── 保留策略: 最近 3 个月的备份
+└── 用户可以手动恢复: hwrun git restore-history --date 2026-09-01
+```
+
+10.9 用户操作
+
+```bash
+# 查看 Git 仓库大小
+hwrun git size
+# 输出: 1.2GB (阈值: 1GB)
+
+# 手动触发历史合并
+hwrun git compact
+# 输出: 合并历史... 完成! 大小: 1.2GB → 450MB
+
+# 查看合并后的历史
+hwrun git log --oneline
+# 输出:
+# a1b2c3d 系统状态 (2026-09-07) ← 合并后保留的 commit
+# d4e5f6g 内核升级 v6.1.0 (2026-09-06) ← 有 tag 保留
+# g7h8i9j 系统初始 (2026-08-01) ← 年粒度合并
+
+# 查看被合并的详细历史 (可以查)
+hwrun git log --detail 2026-09-07
+# 输出: 该日期内的所有详细 commit (存储在备份中)
+
+# 恢复被合并的历史
+hwrun git restore-history --date 2026-09-01
+```
+
+十一、可运行格式支持
+
+11.1 设计理念
+
+```
+HWRun OS 可运行任何主流格式
+
+支持的格式:
+├── ELF (Linux)
+├── PE/EXE (Windows)
+├── Mach-O (macOS)
+├── APK (Android)
+├── DMG (macOS 磁盘镜像)
+├── WASM (WebAssembly)
+├── JAR (Java)
+└── 任意自定义格式 (插件)
+
+实现方式:
+├── 每种格式是一个加载器插件
+├── 格式检测器自动识别并路由
+├── 系统调用统一映射到协议层
+└── 一个系统运行所有格式
+```
+
+11.2 加载器插件定义
+
+```yaml
+# plugins/loader-apk/plugin.yml
+plugin:
+  id: "loader-apk"
+  name: "APK 应用加载器"
+  version: "1.0.0"
+  type: "loader"
+  
+  git:
+    repo: "https://hwrun.org/plugins/loader-apk.git"
+  
+  provides:
+    - protocol: "LOADER-APK"
+  
+  requires:
+    - protocol: "PMP"
+    - protocol: "FSP"
+    - protocol: "NP"
+    - protocol: "SP"
+  
+  formats:
+    - name: "APK"
+      magic: ["50 4b 03 04"]
+      extensions: [".apk", ".aab"]
+  
+  params:
+    - key: "apk.data_dir"
+      default: "/var/lib/hwrun/apk"
+    - key: "apk.sandbox"
+      type: "bool"
+      default: true
+```
+
+11.3 用户操作
+
+```bash
+# 直接运行任何格式
+./app.elf      # ELF → elf-loader
+./app.exe      # EXE → pe-loader
+./app.apk      # APK → apk-loader
+./app.dmg      # DMG → dmg-loader
+./app.wasm     # WASM → wasm-loader
+./app.jar      # JAR → jar-loader
+
+# 强制指定加载器
+hwrun run --loader elf ./app
+hwrun run --loader exe ./app.exe
+
+# 查看已安装的加载器
+hwrun formats list
+
+# 安装新的格式加载器
+hwrun plugins install loader-apk
+hwrun plugins install loader-pe
+```
+
+十二、异构集群
+
+12.1 设计理念
+
+```
+集群内每个节点可以是不同的插件组合
+
+节点 1: Linux 内核 + glibc + systemd + ext4
+节点 2: FreeBSD 内核 + musl + openrc + zfs
+节点 3: 自研内核 + 自研libc + 自研init + 自研fs
+节点 4: Linux 内核 + musl + runit + btrfs
+
+所有节点实现相同的标准化协议 → 组成统一集群
+```
+
+12.2 节点插件声明
+
+```yaml
+node_manifest:
+  node_id: "node-02"
+  
+  plugins:
+    kernel:
+      id: "freebsd-kernel"
+      protocol: "HAP"
+    libc:
+      id: "musl-libc"
+      protocol: "LIBC"
+    init:
+      id: "openrc"
+      protocol: "PMP"
+    fs:
+      id: "zfs"
+      protocol: "FSP"
+  
+  git:
+    remote: "https://hwrun.org/system.git"
+    branch: "main"
+```
+
+12.3 集群统一视图
+
+```
+用户在任何节点执行 hwrun status，看到相同的集群状态。
+
+用户看不到底层差异，只看到统一集群。
+```
+
+12.4 异构调度
+
+```
+调度器根据任务类型和节点能力动态分配:
+
+├── CPU密集型 → 高性能 Linux 节点
+├── 存储密集型 → ZFS 节点
+├── 安全要求高 → FreeBSD 节点 (jail)
+└── 一般任务 → 任意节点
+```
+
+十三、分布式原生
+
+13.1 设计理念
+
+```
+HWRun OS = 一个操作系统运行在多个节点上
+
+不是:
+├── 节点 1: 运行 HWRun OS
+├── 节点 2: 运行 HWRun OS
+└── 集群管理工具管理这些独立 OS
+
+而是:
+└── HWRun OS (一个系统)
+    ├── 节点 1: 系统的一部分
+    ├── 节点 2: 系统的一部分
+    └── 所有节点共同组成一个完整的操作系统
+```
+
+13.2 统一资源池
+
+```
+所有节点的资源组成统一的资源池。
+
+用户提交任务，调度器自动选择最优节点。
+用户不关心任务跑在哪台机器上。
+```
+
+13.3 节点加入 (Git 方式)
+
+```yaml
+# /etc/hwrun/cluster.yml
+cluster:
+  mode: "node"
+  git:
+    remote: "https://hwrun.org/system.git"
+    branch: "main"
+    auto_sync: true
+```
+
+```bash
+# 节点加入集群
+hwrun cluster join https://hwrun.org/system.git
+# 实际执行: git clone https://hwrun.org/system.git /var/lib/hwrun/git
+
+# 节点同步
+hwrun cluster sync
+# 实际执行: git pull
+```
+
+十四、实例与拆分
+
+14.1 设计理念
+
+```
+一个系统可以拆成任意数量的实例。
+用户决定拆不拆、拆成几个、怎么拆。
+
+每个实例看到不同的世界。
+```
+
+14.2 拆分维度
+
+```
+用户可以决定拆分的每一个维度:
+
+├── 文件系统: 共享 / 部分隔离 / 完全隔离
+├── 进程空间: 全局可见 / 部分可见 / 完全隔离
+├── 网络: 共享 / 虚拟 / 完全隔离
+├── 资源: 共享池 / 固定分配 / 动态分配
+├── Git: 共享仓库 / 独立仓库 / 子模块
+└── 用户: 全局用户 / 实例独立
+```
+
+14.3 用户操作
+
+```bash
+hwrun system topology
+hwrun system split --partition "计算分区" --node node-06
+hwrun system merge --partition "计算分区" --with "存储分区"
+hwrun system rebalance --partition "计算分区" --cpu 50%
+```
+
+十五、权限与安全
+
+15.1 设计理念
+
+```
+权限系统 = 原子权限 + 预设身份 + 自定义角色 + 双权限模型
+```
+
+15.2 原子权限
+
+```
+文件系统权限:
+├── fs.list, fs.read, fs.write, fs.create, fs.delete, fs.rename
+
+任务权限:
+├── task.submit, task.cancel, task.pause, task.resume, task.view
+
+数据权限:
+├── data.upload, data.download, data.delete, data.verify, data.list
+
+节点权限:
+├── node.view, node.status, node.config, node.config_modify, node.transfer
+
+Git 权限:
+├── git.commit, git.push, git.pull, git.tag, git.checkout, git.log
+├── git.compact, git.size, git.restore
+
+资源权限:
+├── resource.cpu, resource.memory, resource.gpu, resource.storage
+
+系统权限:
+├── sys.log, sys.audit, sys.snapshot, sys.restore
+```
+
+15.3 预设身份
+
+```
+完全控制: 所有权限
+资源分配: 文件读 + 任务管理 + 资源使用
+只读: 文件读 + 任务查看
+上行单项: 任务提交 + 数据上传
+下行单项: 文件读 + 数据下载
+```
+
+15.4 双权限模型
+
+```
+物理机权限 (硬件层面):
+├── 拥有者 → 管理员 → 用户
+
+集群权限 (软件层面):
+├── 完全控制 → 资源分配 → 任务执行 → 只读
+```
+
+十六、视角体系
+
+16.1 设计理念
+
+```
+用户视角是集群视角的过滤视图
+```
+
+16.2 视角层次
+
+```
+集群视角 (完整) → 管理员视角 (过滤) → 用户视角 (过滤)
+
+用户视角只看到自己有权限的内容。
+```
+
+16.3 用户操作
+
+```bash
+hwrun nodes list           # 看所有 (管理员)
+hwrun nodes list --mine    # 只看自己的 (用户)
+```
+
+十七、跨地域组网
+
+17.1 连接策略
+
+```
+连接优先级:
+├── 1. 直连 (公网IP或局域网)
+├── 2. NAT穿透 (STUN/UPnP)
+├── 3. 中继转发 (TURN/云端中继)
+└── 4. 协议降级 (TCP长连接)
+```
+
+17.2 中继拓扑
+
+```
+节点可以通过其他节点中继连接控制平面。
+
+控制平面 ←→ 节点 A ←→ 节点 B (中继)
+```
+
+17.3 中继配置
+
+```yaml
+cluster:
+  git:
+    remote: "https://hwrun.org/system.git"
+  relay: ["hwrun-node-08"]
+```
+
+十八、节点归属与转移
+
+18.1 归属模型
+
+```
+节点归属 = 物理机权限 + 集群权限
+```
+
+18.2 转移流程
+
+```
+节点从一个集群转移到另一个集群:
+
+1. 发起转移请求
+2. 验证权限
+3. 确认转移
+4. 节点退出当前集群 (git remote remove)
+5. 节点加入目标集群 (git remote add)
+6. 确认转移完成
+```
+
+十九、用户界面
+
+19.1 UI 插件
+
+```
+默认 UI:
+├── hwrun-cli: 命令行界面
+├── hwrun-tui: TUI 仪表板
+└── hwrun-fm: 文件管理器
+
+可选 UI:
+├── hwrun-gui: GTK GUI
+├── web-dashboard: Web 界面
+└── 自定义 UI
+```
+
+19.2 桌面设计
+
+```
+三栏布局 + 无壁纸
+
+┌─────────────┬───────────────┬─────────────────────────────┐
+│  文件系统   │  文件列表     │  工具目录                   │
+│  (目录树)   │  (当前目录)   │  (~/.hwrun/tools)          │
+└─────────────┴───────────────┴─────────────────────────────┘
+```
+
+二十、构建与分发
+
+20.1 构建产物
+
+产物 说明 大小
+hwrun-microkernel.deb 微内核 200KB
+hwrun-bus.deb 组件总线 100KB
+hwrun-params.deb 参数系统 50KB
+hwrun-git.deb Git 插件 50KB
+hwrun-protocols.deb 协议定义 50KB
+hwrun-plugins-*.deb 默认插件 50MB
+hwrun-iso.iso 安装镜像 50-500MB
+
+20.2 ISO 大小
+
+```
+最小 ISO: ~50MB (微内核 + 总线 + 参数系统 + Git + 最小组件)
+标准 ISO: ~200MB (微内核 + 总线 + 参数系统 + Git + 默认插件)
+完整 ISO: ~500MB (所有插件)
+
+安装后系统大小:
+├── 最小配置: ~20MB
+├── 标准配置: ~100MB
+└── 完整配置: ~300MB
+```
+
+二十一、项目目录结构
+
+```
+hwrun-os/
+├── README.md
+├── LICENSE
+├── VERSION
+├── Makefile
+│
+├── microkernel/                              # 微内核
+│   ├── src/
+│   │   ├── sched.c
+│   │   ├── memory.c
+│   │   ├── interrupt.c
+│   │   ├── loader.c
+│   │   ├── bus.c
+│   │   ├── params.c
+│   │   ├── git.c
+│   │   └── ipc.c
+│   └── include/
+│
+├── params/                                   # 参数系统
+│   ├── src/
+│   │   ├── params.c
+│   │   ├── loader.c
+│   │   └── watcher.c
+│   └── include/
+│
+├── protocols/                                # 协议定义
+│   ├── hap.proto
+│   ├── fsp.proto
+│   ├── pmp.proto
+│   ├── np.proto
+│   ├── sp.proto
+│   ├── loader.proto
+│   ├── git.proto
+│   └── ui.proto
+│
+├── plugins/                                  # 插件仓库
+│   ├── kernel/
+│   │   ├── linux/
+│   │   ├── freebsd/
+│   │   └── hwrun-micro/
+│   ├── libc/
+│   │   ├── glibc/
+│   │   └── musl/
+│   ├── init/
+│   │   ├── systemd/
+│   │   ├── openrc/
+│   │   └── runit/
+│   ├── git/                                 # Git 插件
+│   │   ├── storage/
+│   │   ├── sync/
+│   │   ├── log/
+│   │   ├── version/
+│   │   ├── auth/
+│   │   ├── backup/
+│   │   └── compact/
+│   ├── loader/                              # 格式加载器
+│   │   ├── elf/
+│   │   ├── pe/
+│   │   ├── macho/
+│   │   ├── apk/
+│   │   ├── dmg/
+│   │   ├── wasm/
+│   │   └── jar/
+│   ├── fs/
+│   ├── network/
+│   ├── security/
+│   ├── scheduler/
+│   ├── tools/
+│   └── ui/
+│
+├── iso/                                      # ISO 构建
+└── docs/                                     # 文档
+```
+
+二十二、代码量估算
+
+```
+微内核:         ~5000 行
+参数系统:       ~2000 行
+协议定义:       ~2500 行
+Git 插件:       ~4000 行
+默认插件:       ~50000 行
+格式加载器:     ~10000 行 (可选)
+UI:             ~15000 行
+构建/文档:      ~5000 行
+─────────────────────────
+总计:           ~95000+ 行 (不含可选插件)
+```
+
+二十三、开发路线图
+
+阶段 周期 交付物
+Phase 0: 微内核 + 参数系统 3 个月 微内核 + 参数系统 + 组件总线
+Phase 1: Git 基础 2 个月 git-storage + git-log
+Phase 2: 协议定义 2 个月 所有标准协议
+Phase 3: 基础插件 6 个月 Linux 内核 + glibc + systemd
+Phase 4: Git 扩展 3 个月 git-sync + git-version + git-auth + git-compact
+Phase 5: 格式加载器 6 个月 ELF + PE + Mach-O + APK + WASM
+Phase 6: 扩展插件 6 个月 文件系统 + 网络 + 安全
+Phase 7: 分布式 6 个月 集群管理 + 跨地域
+Phase 8: 异构支持 6 个月 FreeBSD + musl + openrc
+Phase 9: UI 6 个月 CLI + TUI + 文件管理器
+Phase 10: 测试 持续 全链路测试
+总计 约 46 个月 
+
+二十四、总结
+
+24.1 设计维度
+
+维度 决策
+项目性质 操作系统插件容器
+设计哲学 一切皆插件，一切皆参数
+版本控制 Git 原生，历史自动管理
+微内核 ~5000 行 C，~200KB
+插件粒度 超细粒度 (每个 .c 文件可独立)
+通信方式 标准化协议
+内核可换 Linux → FreeBSD → 自研
+格式可换 ELF → PE → Mach-O → APK → EXE → DMG → WASM → JAR
+软件格式 无专有格式，只有 plugin.yml + 协议
+异构集群 不同节点不同插件组合
+分布式 单一系统，所有节点共同组成
+权限 原子权限 + 预设身份 + 自定义角色
+跨地域 直连/NAT穿透/中继转发
+总代码量 ~95000+ 行 (不含可选)
+ISO 大小 50MB - 500MB
+
+24.2 最终定义
+
+```
+HWRun OS = 微内核 + 组件总线 + 参数系统 + Git + 协议定义 + 插件仓库
+
+微内核:
+├── 最小核心
+├── 插件加载器
+├── 组件总线接口
+├── 参数系统接口
+├── Git 接口
+└── 协议路由表
+
+组件总线:
+├── 插件发现 (Git 仓库)
+├── 参数匹配
+├── 协议匹配
+├── 格式匹配
+├── 生命周期管理
+├── Git 集成 (自动 commit)
+├── 可撤销副作用
+└── 热插拔
+
+参数系统:
+├── 所有配置是参数
+├── 参数决定插件
+├── 参数决定插件行为
+├── 参数运行时修改
+└── 修改自动生效 (git commit)
+
+Git:
+├── 系统本身是 Git 仓库
+├── git-storage: 存储系统状态
+├── git-sync: 集群同步
+├── git-log: 审计日志
+├── git-version: 版本管理
+├── git-auth: 认证/权限
+├── git-backup: 备份/恢复
+├── git-compact: 历史自动管理
+├── 所有操作自动 commit
+├── Tag 提交永久保留
+└── 历史自动合并压缩 (大小可控)
+
+协议层:
+├── 硬件抽象协议 (HAP)
+├── 文件系统协议 (FSP)
+├── 进程管理协议 (PMP)
+├── 网络协议 (NP)
+├── 安全协议 (SP)
+├── 格式加载协议 (LOADER)
+├── Git 协议 (GIT)
+├── 用户界面协议 (UI)
+└── 插件间通信协议 (ICP)
+
+插件:
+├── 所有功能都是插件
+├── 内核 / libc / init / 文件系统 / 网络
+├── Git 插件 (storage / sync / log / version / auth / backup / compact)
+├── 格式加载器 (ELF / PE / Mach-O / APK / EXE / DMG / WASM / JAR)
+├── 可独立安装/卸载/替换
+├── 运行时热插拔
+├── 参数驱动行为
+└── 用户自己写插件
+
+软件格式:
+├── 没有专有格式
+├── 只有 plugin.yml + 协议实现
+├── 安装 = 安装插件 (git clone)
+└── 运行 = 调用协议
+
+异构集群:
+├── 每个节点不同插件组合
+├── 通过相同协议通信
+├── 统一集群管理 (Git 同步)
+└── 用户看到单一系统
+
+Git 历史管理:
+├── 触发条件: Git 大小 > 用户预设值 (默认 1GB)
+├── 合并策略: 按时间线自动调整粒度
+├── 粒度曲线: 越近越细，越远越粗
+├── Tag 保护: 有 tag 的提交永久保留
+└── 备份机制: 详细历史打包备份可恢复
+```
+
+24.3 一句话总结
+
+HWRun OS = 微内核 + 组件总线 + 参数系统 + Git。插件提供能力，参数决定行为，Git 管理一切。改变参数就改变系统，替换插件就替换能力，所有操作自动 commit，可回滚到任意历史状态。Git 历史自动管理，大小永远可控，Tag 提交永久保留。所有功能都是插件，所有配置都是参数，所有历史都是 Git。软件没有专有格式，只有协议和插件。同一个系统可以运行 ELF、EXE、APK、DMG、WASM、JAR。集群内不同节点可以运行不同的插件组合，只要实现相同的标准化协议，就能组成一个统一的集群。系统本身就是 Git 仓库，一切操作都是 Git 操作。

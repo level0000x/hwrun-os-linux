@@ -1,0 +1,1120 @@
+﻿HWRun OS NODE_DISCOVERY 实现文档
+
+模块名称： NODE_DISCOVERY (Node Discovery Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 节点发现协议，提供局域网/广域网上节点的自动发现、服务注册、健康检查等功能
+实现语言： C（用户态服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、NP（网络协议）、CLUSTER（集群管理）
+提供协议： NODE_DISCOVERY
+
+一、设计哲学
+
+1.1 核心定位
+
+NODE_DISCOVERY 是 HWRun OS 的节点发现核心——让节点能够在网络中自动发现彼此，无需手动配置 IP 地址。
+
+```
+NODE_DISCOVERY = 节点发现协议 = 自动发现网络中的其他 HWRun OS 节点
+
+节点 A (启动)
+    │
+    │  1. 加入组播组 (224.0.0.251:5353)
+    │  2. 发送 Probe 消息
+    ▼
+网络中的其他节点
+    │
+    │  收到 Probe → 回复 Announce
+    ▼
+节点 A
+    │
+    │  收到 Announce → 更新节点列表
+    │  建立连接 → 加入集群
+    ▼
+集群就绪
+```
+
+1.2 设计原则
+
+1. 零配置：节点启动后自动发现其他节点，无需手动配置
+2. 多协议支持：支持 mDNS、SSDP、gRPC 等多种发现协议
+3. 服务注册：节点可以注册自己提供的服务（如计算、存储、调度）
+4. 健康检查：定期检测节点是否存活，自动移除离线节点
+5. 多网络支持：支持局域网、跨网段、公网等多种网络环境
+6. 去中心化：无中心服务器，所有节点对等发现
+
+1.3 发现协议对比
+
+协议 端口 传输 适用场景 HWRun OS 支持
+mDNS 5353 UDP 组播 局域网 (零配置) ✅ 默认
+SSDP 1900 UDP 组播 UPnP 设备发现 ✅ 可选
+gRPC 自定义 TCP 跨网段、公网 ✅ 可选
+Consul 8500 TCP/UDP 数据中心集群 ✅ 可选
+etcd 2379 TCP 分布式配置 ✅ 可选
+
+1.4 NODE_DISCOVERY 插件的本质
+
+NODE_DISCOVERY 插件 = mDNS 协议实现 + SSDP 支持 + gRPC 发现
+
+Linux 内核本身不提供 mDNS 功能，需要在用户态实现。HWRun OS 的 NODE_DISCOVERY 是基于 Avahi（mDNS/DNS-SD 的参考实现）或自研轻量级实现的封装。
+
+二、整体架构
+
+2.1 NODE_DISCOVERY 插件的组成
+
+```
+NODE_DISCOVERY 插件 (用户态服务)
+├── 协议处理层
+│   ├── discovery_ipc_handler()   ← IPC 消息分发
+│   ├── discovery_register()      ← 注册服务
+│   ├── discovery_unregister()    ← 注销服务
+│   ├── discovery_lookup()        ← 查找服务
+│   ├── discovery_list_nodes()    ← 列出节点
+│   └── discovery_get_node_info() ← 获取节点信息
+│
+├── mDNS 引擎
+│   ├── discovery_mdns.c          ← mDNS 协议实现
+│   ├── discovery_mdns_socket.c   ← 组播 socket 管理
+│   ├── discovery_mdns_cache.c    ← DNS 缓存
+│   └── discovery_mdns_responder.c← 响应查询
+│
+├── SSDP 引擎 (可选)
+│   └── discovery_ssdp.c          ← SSDP 协议实现
+│
+├── gRPC 发现引擎 (可选)
+│   └── discovery_grpc.c          ← gRPC 服务发现
+│
+├── 节点管理器
+│   ├── discovery_node.c          ← 节点信息管理
+│   ├── discovery_health.c        ← 健康检查
+│   └── discovery_persist.c       ← 持久化存储
+│
+└── 初始化/清理
+    ├── discovery_init()          ← 服务启动
+    └── discovery_exit()          ← 服务停止
+```
+
+2.2 NODE_DISCOVERY 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → 其他插件
+                                                                                                                                    ↑
+                                                                                                                          NODE_DISCOVERY 在这里加载
+```
+
+NODE_DISCOVERY 插件在 STORAGE 之后加载，为系统提供节点发现能力，是 CLUSTER 插件的重要补充。
+
+2.3 NODE_DISCOVERY 的上层消费者
+
+上层插件 需要 NODE_DISCOVERY 提供什么
+CLUSTER (集群管理) 自动发现新节点、获取节点列表
+CONSENSUS (共识协议) 发现其他共识节点
+CROSS_REGION (跨地域) 发现跨地域中继节点
+MONITOR (监控) 发现集群中所有节点
+
+三、核心数据结构
+
+```c
+// discovery/include/discovery.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+#include <netinet/in.h>
+
+/* ============================================================
+   节点状态
+   ============================================================ */
+typedef enum {
+    NODE_STATUS_ONLINE = 0,         // 在线
+    NODE_STATUS_OFFLINE,            // 离线
+    NODE_STATUS_SUSPECT,            // 疑似离线 (待确认)
+    NODE_STATUS_LEFT,               // 主动离开
+} node_status_t;
+
+/* ============================================================
+   节点角色
+   ============================================================ */
+typedef enum {
+    NODE_ROLE_COMPUTE = 1 << 0,     // 计算节点
+    NODE_ROLE_STORAGE = 1 << 1,     // 存储节点
+    NODE_ROLE_CONTROL = 1 << 2,     // 控制节点
+    NODE_ROLE_EDGE = 1 << 3,        // 边缘节点
+    NODE_ROLE_GATEWAY = 1 << 4,     // 网关节点
+} node_role_t;
+
+/* ============================================================
+   节点信息
+   ============================================================ */
+typedef struct discovery_node {
+    char node_id[64];               // 节点 ID (UUID)
+    char hostname[128];             // 主机名
+    char ipv4[16];                  // IPv4 地址
+    char ipv6[64];                  // IPv6 地址
+    uint16_t port;                  // 通信端口
+    uint32_t roles;                 // 节点角色 (位掩码)
+    node_status_t status;           // 节点状态
+    uint64_t last_seen;             // 最后发现时间 (秒)
+    uint64_t registered_at;         // 注册时间
+    uint64_t heartbeat_interval;    // 心跳间隔 (秒)
+    char version[32];               // 软件版本
+    char cluster_name[64];          // 集群名称
+    uint8_t capabilities[32];       // 能力位掩码
+    struct discovery_node *next;
+} discovery_node_t;
+
+/* ============================================================
+   服务信息 (用于 DNS-SD)
+   ============================================================ */
+typedef struct discovery_service {
+    char name[128];                 // 服务名称
+    char type[64];                  // 服务类型 (_hwrun._tcp)
+    char domain[64];                // 域名 (local.)
+    uint16_t port;                  // 服务端口
+    char **txt_records;             // TXT 记录
+    int txt_count;
+    struct discovery_service *next;
+} discovery_service_t;
+
+/* ============================================================
+   发现配置
+   ============================================================ */
+typedef struct discovery_config {
+    char cluster_name[64];          // 集群名称
+    int mdns_enabled;               // 是否启用 mDNS
+    int ssdp_enabled;               // 是否启用 SSDP
+    int grpc_enabled;               // 是否启用 gRPC 发现
+    int heartbeat_interval;         // 心跳间隔 (秒)
+    int offline_timeout;            // 离线超时 (秒)
+    int cache_ttl;                  // 缓存 TTL (秒)
+    char iface[32];                 // 网络接口 (eth0)
+    uint16_t port;                  // 服务端口
+} discovery_config_t;
+
+/* ============================================================
+   发现上下文
+   ============================================================ */
+typedef struct discovery_context {
+    int initialized;
+    uint64_t discovery_task_id;     // NODE_DISCOVERY 自身的任务 ID
+    
+    discovery_config_t config;
+    discovery_node_t *nodes;        // 发现的节点列表
+    uint32_t node_count;
+    discovery_service_t *services;  // 注册的服务列表
+    
+    // mDNS socket
+    int mdns_socket;
+    int mdns_fd;
+    
+    // 健康检查定时器
+    uint64_t health_timer;
+    
+    void *lock;
+} discovery_context_t;
+```
+
+四、NODE_DISCOVERY 协议定义
+
+```protobuf
+// protocols/node_discovery.proto
+syntax = "proto3";
+
+package hwrun.nodediscovery;
+
+service NodeDiscovery {
+    // === 服务注册 ===
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+    rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+    
+    // === 服务发现 ===
+    rpc Lookup(LookupRequest) returns (LookupResponse);
+    rpc ListNodes(Empty) returns (ListNodesResponse);
+    rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+    
+    // === 节点管理 ===
+    rpc Resolve(ResolveRequest) returns (ResolveResponse);
+    rpc GetPeers(Empty) returns (GetPeersResponse);
+}
+
+message Empty {}
+
+// ============ 服务注册 ============
+
+message RegisterRequest {
+    string service_name = 1;        // 服务名称
+    string service_type = 2;        // 服务类型
+    uint32 port = 3;                // 服务端口
+    map<string, string> txt = 4;    // TXT 记录
+}
+
+message RegisterResponse {
+    bool success = 1;
+    string service_id = 2;
+    int32 error = 3;
+}
+
+message UnregisterRequest {
+    string service_id = 1;
+}
+
+message UnregisterResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 服务发现 ============
+
+message LookupRequest {
+    string service_type = 1;        // 要查找的服务类型
+    int32 timeout_ms = 2;           // 超时时间
+}
+
+message LookupResponse {
+    repeated ServiceInfo services = 1;
+    int32 error = 2;
+}
+
+message ServiceInfo {
+    string name = 1;
+    string type = 2;
+    string host = 3;
+    uint32 port = 4;
+    map<string, string> txt = 5;
+    uint64 ttl = 6;
+}
+
+message NodeInfo {
+    string node_id = 1;
+    string hostname = 2;
+    string ipv4 = 3;
+    string ipv6 = 4;
+    uint32 port = 5;
+    uint32 roles = 6;
+    string status = 7;              // "online", "offline", "suspect"
+    uint64 last_seen = 8;
+    string version = 9;
+}
+
+message ListNodesResponse {
+    repeated NodeInfo nodes = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetNodeInfoRequest {
+    string node_id = 1;
+}
+
+message GetNodeInfoResponse {
+    NodeInfo node = 1;
+    int32 error = 2;
+}
+
+// ============ 节点管理 ============
+
+message ResolveRequest {
+    string hostname = 1;
+}
+
+message ResolveResponse {
+    string ipv4 = 1;
+    string ipv6 = 2;
+    int32 error = 3;
+}
+
+message GetPeersResponse {
+    repeated PeerInfo peers = 1;
+    int32 error = 2;
+}
+
+message PeerInfo {
+    string node_id = 1;
+    string address = 2;
+    uint32 port = 3;
+    uint64 latency_ms = 4;
+    string status = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 服务初始化和启动
+
+```c
+// discovery/src/discovery.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "discovery.h"
+#include "discovery_ipc.h"
+#include "discovery_mdns.h"
+#include "discovery_node.h"
+#include "discovery_health.h"
+
+/* 全局发现上下文 */
+static discovery_context_t g_disc_ctx = {0};
+
+/* ============================================================
+   服务初始化
+   ============================================================ */
+int discovery_init(void) {
+    int ret;
+    
+    log_info("NODE_DISCOVERY: Initializing...");
+    
+    // 1. 初始化上下文
+    memset(&g_disc_ctx, 0, sizeof(discovery_context_t));
+    
+    // 2. 加载配置
+    discovery_load_config(&g_disc_ctx.config);
+    
+    // 3. 初始化 mDNS
+    if (g_disc_ctx.config.mdns_enabled) {
+        ret = discovery_mdns_init(&g_disc_ctx);
+        if (ret < 0) {
+            log_warn("NODE_DISCOVERY: mDNS init failed, continuing without it");
+        } else {
+            log_info("NODE_DISCOVERY: mDNS initialized");
+        }
+    }
+    
+    // 4. 初始化 SSDP (可选)
+    if (g_disc_ctx.config.ssdp_enabled) {
+        ret = discovery_ssdp_init(&g_disc_ctx);
+        if (ret < 0) {
+            log_warn("NODE_DISCOVERY: SSDP init failed");
+        }
+    }
+    
+    // 5. 注册自身节点
+    discovery_register_self(&g_disc_ctx);
+    
+    // 6. 注册本节点服务
+    discovery_register_service(&g_disc_ctx, "_hwrun._tcp", 
+                                g_disc_ctx.config.port, NULL);
+    
+    // 7. 注册 IPC 消息处理器
+    ret = discovery_ipc_register();
+    if (ret < 0) {
+        log_error("NODE_DISCOVERY: Failed to register IPC handler");
+        return ret;
+    }
+    
+    // 8. 注册 NODE_DISCOVERY 协议
+    discovery_register_protocol();
+    
+    // 9. 启动健康检查线程
+    discovery_health_start(&g_disc_ctx);
+    
+    g_disc_ctx.initialized = 1;
+    log_info("NODE_DISCOVERY: Initialized successfully");
+    log_info("  mDNS: %s, SSDP: %s",
+             g_disc_ctx.config.mdns_enabled ? "enabled" : "disabled",
+             g_disc_ctx.config.ssdp_enabled ? "enabled" : "disabled");
+    
+    return 0;
+}
+```
+
+5.2 mDNS 协议实现
+
+mDNS (Multicast DNS) 是零配置网络服务发现的核心协议，使用 UDP 组播（224.0.0.251:5353 或 FF02::FB:5353）。其核心机制包括：
+
+· 组播查询：节点加入组播组，发送查询消息
+· 响应机制：持有服务的节点直接单播响应，或组播响应
+· 缓存管理：维护 DNS 缓存，减少网络流量
+· 探针机制：启动时发送探针，检测名称冲突
+
+```c
+// discovery/src/discovery_mdns.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <errno.h>
+#include <time.h>
+
+#include "discovery.h"
+#include "discovery_mdns.h"
+
+#define MDNS_PORT 5353
+#define MDNS_MULTICAST_IP "224.0.0.251"
+#define MDNS_GROUP_IPV6 "FF02::FB"
+
+/* ============================================================
+   mDNS 消息结构
+   ============================================================ */
+typedef struct mdns_header {
+    uint16_t id;                    // 事务 ID
+    uint16_t flags;                 // 标志位
+    uint16_t qdcount;               // 问题数
+    uint16_t ancount;               // 回答数
+    uint16_t nscount;               // 权威数
+    uint16_t arcount;               // 附加数
+} __attribute__((packed)) mdns_header_t;
+
+typedef struct mdns_query {
+    char *name;                     // 查询名称
+    uint16_t qtype;                 // 查询类型 (A, AAAA, PTR, SRV, TXT)
+    uint16_t qclass;                // 查询类 (IN)
+} mdns_query_t;
+
+/* ============================================================
+   初始化 mDNS socket
+   ============================================================ */
+int discovery_mdns_init(discovery_context_t *ctx) {
+    int fd;
+    int ret;
+    struct sockaddr_in addr;
+    struct ip_mreq mreq;
+    int reuse = 1;
+    
+    // 1. 创建 UDP socket
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    
+    // 2. 设置 SO_REUSEADDR
+    ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (ret < 0) {
+        close(fd);
+        return -1;
+    }
+    
+    // 3. 绑定到 5353 端口
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(MDNS_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    
+    ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        close(fd);
+        return -1;
+    }
+    
+    // 4. 加入组播组 (224.0.0.251)
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.imr_multiaddr.s_addr = inet_addr(MDNS_MULTICAST_IP);
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    
+    ret = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    if (ret < 0) {
+        close(fd);
+        return -1;
+    }
+    
+    ctx->mdns_socket = fd;
+    ctx->mdns_fd = fd;
+    
+    // 5. 启动 mDNS 接收线程
+    pthread_t thread;
+    pthread_create(&thread, NULL, discovery_mdns_recv_thread, ctx);
+    pthread_detach(thread);
+    
+    return 0;
+}
+
+/* ============================================================
+   mDNS 接收线程
+   ============================================================ */
+void *discovery_mdns_recv_thread(void *arg) {
+    discovery_context_t *ctx = (discovery_context_t *)arg;
+    char buffer[4096];
+    struct sockaddr_in src_addr;
+    socklen_t addr_len = sizeof(src_addr);
+    ssize_t n;
+    
+    while (ctx->initialized) {
+        n = recvfrom(ctx->mdns_socket, buffer, sizeof(buffer), 0,
+                     (struct sockaddr *)&src_addr, &addr_len);
+        if (n < 0) {
+            continue;
+        }
+        
+        // 解析 mDNS 消息
+        discovery_mdns_parse(ctx, buffer, n, &src_addr);
+    }
+    
+    return NULL;
+}
+
+/* ============================================================
+   解析 mDNS 消息
+   ============================================================ */
+void discovery_mdns_parse(discovery_context_t *ctx, const char *data,
+                           size_t len, struct sockaddr_in *src) {
+    mdns_header_t *header = (mdns_header_t *)data;
+    const char *ptr = data + sizeof(mdns_header_t);
+    char name[256];
+    int i;
+    
+    // 检查是否是查询 (QR=0)
+    if ((ntohs(header->flags) & 0x8000) == 0) {
+        // 查询消息 - 需要回复
+        discovery_mdns_handle_query(ctx, data, len, src);
+        return;
+    }
+    
+    // 响应消息 - 更新节点列表
+    // 解析回答部分
+    for (i = 0; i < ntohs(header->ancount); i++) {
+        // 解析 DNS 记录
+        discovery_mdns_parse_record(ctx, ptr, &ptr, src);
+    }
+}
+
+/* ============================================================
+   处理 mDNS 查询
+   ============================================================ */
+void discovery_mdns_handle_query(discovery_context_t *ctx,
+                                  const char *data, size_t len,
+                                  struct sockaddr_in *src) {
+    mdns_header_t *header = (mdns_header_t *)data;
+    const char *ptr = data + sizeof(mdns_header_t);
+    char name[256];
+    uint16_t qtype, qclass;
+    int i;
+    
+    // 解析问题部分
+    for (i = 0; i < ntohs(header->qdcount); i++) {
+        ptr = discovery_mdns_parse_name(ptr, name, sizeof(name));
+        qtype = ntohs(*(uint16_t *)ptr);
+        ptr += 2;
+        qclass = ntohs(*(uint16_t *)ptr);
+        ptr += 2;
+        
+        // 检查是否是查询本节点
+        if (strstr(name, "_hwrun._tcp.local") != NULL) {
+            // 回复本节点信息
+            discovery_mdns_send_response(ctx, src, name, qtype);
+        }
+    }
+}
+```
+
+5.3 节点管理
+
+```c
+// discovery/src/discovery_node.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+#include "discovery.h"
+#include "discovery_node.h"
+
+/* ============================================================
+   注册自身节点
+   ============================================================ */
+int discovery_register_self(discovery_context_t *ctx) {
+    discovery_node_t *self;
+    char hostname[128];
+    
+    // 1. 获取主机名
+    gethostname(hostname, sizeof(hostname));
+    
+    // 2. 创建节点信息
+    self = calloc(1, sizeof(discovery_node_t));
+    if (!self) {
+        return -1;
+    }
+    
+    // 3. 生成节点 ID
+    discovery_generate_node_id(self->node_id, sizeof(self->node_id));
+    strncpy(self->hostname, hostname, sizeof(self->hostname) - 1);
+    self->port = ctx->config.port;
+    self->roles = NODE_ROLE_COMPUTE | NODE_ROLE_CONTROL;
+    self->status = NODE_STATUS_ONLINE;
+    self->last_seen = time(NULL);
+    self->registered_at = time(NULL);
+    self->heartbeat_interval = ctx->config.heartbeat_interval;
+    
+    // 4. 获取本机 IP
+    discovery_get_local_ip(self->ipv4, sizeof(self->ipv4));
+    
+    // 5. 添加到节点列表
+    self->next = ctx->nodes;
+    ctx->nodes = self;
+    ctx->node_count++;
+    
+    // 6. 通过 mDNS 广播
+    discovery_mdns_announce(ctx, self);
+    
+    return 0;
+}
+
+/* ============================================================
+   添加发现的节点
+   ============================================================ */
+int discovery_add_node(discovery_context_t *ctx, discovery_node_t *node) {
+    discovery_node_t *existing;
+    
+    // 1. 检查是否已存在
+    existing = discovery_find_node(ctx, node->node_id);
+    if (existing) {
+        // 更新现有节点信息
+        existing->last_seen = time(NULL);
+        existing->status = NODE_STATUS_ONLINE;
+        strncpy(existing->ipv4, node->ipv4, sizeof(existing->ipv4) - 1);
+        existing->port = node->port;
+        return 0;
+    }
+    
+    // 2. 添加新节点
+    node->next = ctx->nodes;
+    ctx->nodes = node;
+    ctx->node_count++;
+    
+    // 3. 通知集群管理器
+    discovery_notify_cluster(ctx, node, 1);  // 1 = added
+    
+    return 0;
+}
+
+/* ============================================================
+   查找节点
+   ============================================================ */
+discovery_node_t *discovery_find_node(discovery_context_t *ctx,
+                                       const char *node_id) {
+    discovery_node_t *node = ctx->nodes;
+    
+    while (node) {
+        if (strcmp(node->node_id, node_id) == 0) {
+            return node;
+        }
+        node = node->next;
+    }
+    
+    return NULL;
+}
+
+/* ============================================================
+   列出所有节点
+   ============================================================ */
+int discovery_list_nodes(discovery_context_t *ctx,
+                          discovery_node_t **out, uint32_t *out_count) {
+    *out = ctx->nodes;
+    *out_count = ctx->node_count;
+    return 0;
+}
+```
+
+5.4 健康检查
+
+```c
+// discovery/src/discovery_health.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+
+#include "discovery.h"
+#include "discovery_health.h"
+#include "discovery_ipc.h"
+
+/* ============================================================
+   健康检查线程
+   ============================================================ */
+void *discovery_health_thread(void *arg) {
+    discovery_context_t *ctx = (discovery_context_t *)arg;
+    discovery_node_t *node;
+    time_t now;
+    
+    while (ctx->initialized) {
+        sleep(ctx->config.heartbeat_interval);
+        
+        now = time(NULL);
+        node = ctx->nodes;
+        
+        while (node) {
+            // 检查是否超时 (超过 3 个心跳间隔)
+            if (now - node->last_seen > ctx->config.offline_timeout) {
+                if (node->status == NODE_STATUS_ONLINE) {
+                    // 标记为疑似离线
+                    node->status = NODE_STATUS_SUSPECT;
+                    log_warn("NODE_DISCOVERY: Node %s is suspect", node->node_id);
+                    
+                    // 尝试重新探测
+                    discovery_probe_node(ctx, node);
+                } else if (node->status == NODE_STATUS_SUSPECT) {
+                    // 确认离线
+                    node->status = NODE_STATUS_OFFLINE;
+                    log_warn("NODE_DISCOVERY: Node %s is offline", node->node_id);
+                    
+                    // 通知集群管理器
+                    discovery_notify_cluster(ctx, node, 0);  // 0 = removed
+                }
+            }
+            
+            node = node->next;
+        }
+    }
+    
+    return NULL;
+}
+
+/* ============================================================
+   探测节点
+   ============================================================ */
+int discovery_probe_node(discovery_context_t *ctx, discovery_node_t *node) {
+    // 通过 mDNS 发送探测请求
+    discovery_mdns_probe(ctx, node);
+    
+    // 通过 TCP 端口探测
+    discovery_tcp_probe(ctx, node);
+    
+    return 0;
+}
+
+/* ============================================================
+   TCP 端口探测
+   ============================================================ */
+int discovery_tcp_probe(discovery_context_t *ctx, discovery_node_t *node) {
+    int sock;
+    struct sockaddr_in addr;
+    struct timeval tv;
+    
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+    
+    // 设置超时 (2 秒)
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(node->port);
+    inet_pton(AF_INET, node->ipv4, &addr.sin_addr);
+    
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    close(sock);
+    return 0;
+}
+```
+
+5.5 服务注册 (DNS-SD)
+
+DNS-SD (DNS-Based Service Discovery) 是 mDNS 的配套协议，使用 DNS 记录格式发布和发现服务。核心记录类型包括：
+
+· PTR 记录：服务类型 → 服务实例名称
+· SRV 记录：服务实例名称 → 目标主机和端口
+· TXT 记录：服务实例的键值对元数据
+· A/AAAA 记录：目标主机 → IP 地址
+
+```c
+// discovery/src/discovery_service.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "discovery.h"
+#include "discovery_service.h"
+
+/* ============================================================
+   注册服务 (DNS-SD)
+   ============================================================ */
+int discovery_register_service(discovery_context_t *ctx,
+                                const char *service_type,
+                                uint16_t port,
+                                const char **txt_records) {
+    discovery_service_t *svc;
+    char name[256];
+    
+    // 1. 创建服务记录
+    svc = calloc(1, sizeof(discovery_service_t));
+    if (!svc) {
+        return -1;
+    }
+    
+    // 2. 生成服务名称 (hostname + service type)
+    snprintf(name, sizeof(name), "%s.%s.local",
+             ctx->nodes->hostname, service_type);
+    strncpy(svc->name, name, sizeof(svc->name) - 1);
+    strncpy(svc->type, service_type, sizeof(svc->type) - 1);
+    strcpy(svc->domain, "local.");
+    svc->port = port;
+    
+    // 3. 添加 TXT 记录
+    if (txt_records) {
+        for (int i = 0; txt_records[i]; i++) {
+            svc->txt_records = realloc(svc->txt_records,
+                                        (svc->txt_count + 1) * sizeof(char *));
+            svc->txt_records[svc->txt_count] = strdup(txt_records[i]);
+            svc->txt_count++;
+        }
+    }
+    
+    // 4. 通过 mDNS 宣布服务
+    discovery_mdns_announce_service(ctx, svc);
+    
+    // 5. 添加到服务列表
+    svc->next = ctx->services;
+    ctx->services = svc;
+    
+    return 0;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// discovery/src/discovery_ipc.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "discovery.h"
+#include "discovery_ipc.h"
+#include "discovery_node.h"
+#include "discovery_mdns.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void discovery_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case DISCOVERY_MSG_REGISTER: {
+            discovery_register_req_t *req = (discovery_register_req_t *)data;
+            discovery_register_resp_t resp;
+            int ret = discovery_register_service(&g_disc_ctx,
+                                                   req->service_type,
+                                                   req->port,
+                                                   (const char **)req->txt);
+            resp.success = (ret == 0);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case DISCOVERY_MSG_LOOKUP: {
+            discovery_lookup_req_t *req = (discovery_lookup_req_t *)data;
+            discovery_lookup_resp_t resp;
+            // 查找服务
+            discovery_service_t *services;
+            uint32_t count;
+            discovery_lookup_services(&g_disc_ctx, req->service_type,
+                                       &services, &count);
+            // 发送响应
+            ipc_reply(from_task, services, count * sizeof(discovery_service_t));
+            break;
+        }
+        
+        case DISCOVERY_MSG_LIST_NODES: {
+            discovery_node_t *nodes;
+            uint32_t count;
+            discovery_list_nodes(&g_disc_ctx, &nodes, &count);
+            ipc_reply(from_task, nodes, count * sizeof(discovery_node_t));
+            break;
+        }
+        
+        case DISCOVERY_MSG_GET_NODE_INFO: {
+            char *node_id = (char *)data;
+            discovery_node_t *node = discovery_find_node(&g_disc_ctx, node_id);
+            if (node) {
+                ipc_reply(from_task, node, sizeof(discovery_node_t));
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        default:
+            log_warn("NODE_DISCOVERY: Unknown IPC message type: %u", msg_type);
+            break;
+    }
+}
+```
+
+六、配置文件
+
+```yaml
+# /etc/hwrun/params/node_discovery.yml
+node_discovery:
+  # 集群名称
+  cluster_name: "hwrun-cluster"
+  
+  # 网络接口 (eth0, wlan0, 留空则自动检测)
+  interface: ""
+  
+  # 服务端口
+  port: 8443
+  
+  # 发现协议
+  mdns:
+    enabled: true
+    ttl: 120
+  
+  ssdp:
+    enabled: false
+  
+  # 健康检查
+  heartbeat_interval: 5      # 秒
+  offline_timeout: 30        # 秒
+  
+  # 缓存
+  cache_ttl: 300             # 秒
+  
+  # 节点角色
+  roles:
+    - "compute"
+    - "storage"
+  
+  # 节点能力
+  capabilities:
+    - "gpu"
+    - "nvme"
+```
+
+七、命令行接口
+
+```bash
+# 服务注册
+hwrun discovery register --service _hwrun._tcp --port 8443
+hwrun discovery register --service _hwrun._tcp --port 8443 --txt "version=1.0" "role=compute"
+
+# 服务发现
+hwrun discovery lookup _hwrun._tcp
+hwrun discovery lookup _hwrun._tcp --timeout 5000
+
+# 节点管理
+hwrun discovery nodes
+hwrun discovery node-info node-01
+hwrun discovery resolve node-01.local
+
+# 查看自身信息
+hwrun discovery self
+```
+
+八、构建与安装
+
+8.1 插件描述文件
+
+```yaml
+# plugins/node_discovery/plugin.yml
+plugin:
+  id: "node_discovery"
+  name: "Node Discovery Protocol"
+  version: "1.0.0"
+  type: "application"
+  
+  description: "HWRun OS 节点发现协议，提供自动节点发现、服务注册、健康检查等功能"
+  
+  provides:
+    - protocol: "NODE_DISCOVERY"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "NP"
+      version: "1.0"
+    - protocol: "CLUSTER"
+      version: "1.0"
+  
+  params:
+    - key: "node_discovery.mdns.enabled"
+      type: "bool"
+      default: true
+      description: "是否启用 mDNS"
+    - key: "node_discovery.heartbeat_interval"
+      type: "int"
+      default: 5
+      description: "心跳间隔 (秒)"
+    - key: "node_discovery.offline_timeout"
+      type: "int"
+      default: 30
+      description: "离线超时 (秒)"
+    - key: "node_discovery.cache_ttl"
+      type: "int"
+      default: 300
+      description: "缓存 TTL (秒)"
+  
+  files:
+    - "/usr/bin/hwrun-discoveryd"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+8.2 构建脚本
+
+```makefile
+# node_discovery/Makefile
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -Iinclude
+LDFLAGS = -lpthread -lm
+
+TARGET = hwrun-discoveryd
+OBJS = discovery.o discovery_ipc.o discovery_mdns.o \
+       discovery_node.o discovery_health.o discovery_service.o \
+       discovery_ssdp.o discovery_config.o
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+install:
+	install -D -m 755 $(TARGET) /usr/bin/
+```
+
+九、总结
+
+维度 决策
+定位 节点发现协议，自动发现网络中的其他节点
+实现方式 用户态服务 (C)
+代码量 ~1500-2000 行 C
+提供协议 NODE_DISCOVERY (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + NP + CLUSTER
+核心协议 mDNS (默认), SSDP (可选), gRPC (可选)
+关键功能 零配置发现、服务注册 (DNS-SD)、健康检查、节点列表
+
+NODE_DISCOVERY 是 HWRun OS 中节点发现的核心插件。它基于 mDNS/DNS-SD 协议实现零配置的局域网节点发现，让节点启动后自动发现彼此，无需手动配置 IP 地址。通过服务注册功能，节点可以发布自己提供的服务类型，其他节点可以通过服务类型查找和连接。健康检查机制确保集群中的节点状态始终保持同步。NODE_DISCOVERY 是 CLUSTER 插件的重要补充，为分布式集群的自动组建提供了基础。

@@ -1,0 +1,1231 @@
+﻿HWRun OS LOADER 实现文档
+
+模块名称： LOADER (Executable Loader Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 可执行文件加载协议，负责检测、加载和运行各种格式的可执行文件
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统）、PMP（进程管理）
+提供协议： LOADER
+
+一、设计哲学
+
+1.1 核心定位
+
+LOADER 是 HWRun OS 的程序执行入口——所有可执行文件的加载和运行都通过 LOADER 协议进行。
+
+```
+LOADER = 可执行文件加载协议 = 所有程序执行 (HAP) 的统一入口
+
+上层插件 (SHELL, RUN, PKGMGR, INIT, ...)
+    │
+    │  通过 LOADER 协议执行程序
+    ▼
+LOADER 插件 (内核模块)
+    │
+    │  检测格式 → 选择加载器 → 加载到内存 → 跳转执行
+    ▼
+Linux 内核 (binfmt 框架 / ELF 加载器)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有程序执行通过 LOADER 协议进行
+2. 内核实现：LOADER 插件运行在内核态，基于 Linux 的 linux_binfmt 框架
+3. 多格式支持：支持 ELF、PE/COFF、Mach-O、APK、WASM 等多种格式
+4. 可扩展：每种格式作为一个独立的加载器子插件
+5. 格式检测：通过文件魔数（magic bytes）自动识别格式
+6. 解释器支持：支持脚本语言的 shebang 和 binfmt_misc 机制
+
+1.3 LOADER 插件的本质
+
+LOADER 插件 = Linux 内核 binfmt 框架的 HWRun 协议封装 + 多格式加载器管理
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         LOADER 插件架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  LOADER 协议接口 (通过 IPC 调用)                                    │   │
+│  │  Detect / Load / Run / Unload / GetFormats / GetInfo              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  格式路由器 (Format Router)                                         │   │
+│  │  ├── 读取文件头 (前 64 字节)                                        │   │
+│  │  ├── 匹配魔数 → 选择对应加载器                                      │   │
+│  │  └── 路由到具体的加载器子插件                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  格式加载器子插件 (可插拔)                                           │   │
+│  │  ├── elf_loader    ← ELF 格式 (Linux 原生)                         │   │
+│  │  ├── pe_loader     ← PE/COFF 格式 (Windows)                        │   │
+│  │  ├── macho_loader  ← Mach-O 格式 (macOS)                          │   │
+│  │  ├── apk_loader    ← APK 格式 (Android)                           │   │
+│  │  ├── wasm_loader   ← WASM 格式 (WebAssembly)                      │   │
+│  │  └── script_loader ← shebang 脚本                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (binfmt 框架)                                           │   │
+│  │  └── binfmt_elf.c / binfmt_misc.c / register_binfmt()             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.4 与 Linux binfmt 框架的关系
+
+Linux 内核提供了 linux_binfmt 结构体，用于注册可执行文件格式加载器：
+
+```c
+struct linux_binfmt {
+    struct module *module;
+    int (*load_binary)(struct linux_binprm *);
+    int (*load_shlib)(struct file *);
+    int (*core_dump)(struct coredump_params *);
+    unsigned long min_coredump;
+} __randomize_layout;
+```
+
+LOADER 插件本身作为一个 linux_binfmt 注册到内核，但它是一个路由器——它自己不加载任何格式，而是将加载请求路由到对应的格式加载器子插件。
+
+二、整体架构
+
+2.1 LOADER 插件的组成
+
+```
+LOADER 插件 (loader.ko)
+├── 协议处理层
+│   ├── loader_ipc_handler()    ← IPC 消息分发
+│   ├── loader_detect()         ← 格式检测
+│   ├── loader_load()           ← 加载可执行文件
+│   ├── loader_run()            ← 运行程序
+│   ├── loader_unload()         ← 卸载程序
+│   └── loader_get_formats()    ← 获取支持的格式列表
+│
+├── 格式路由器
+│   ├── loader_router.c         ← 魔数匹配和路由
+│   └── loader_magic.h          ← 各格式魔数定义
+│
+├── 格式加载器子插件
+│   ├── loader_elf.c            ← ELF 加载器
+│   ├── loader_pe.c             ← PE/COFF 加载器
+│   ├── loader_macho.c          ← Mach-O 加载器
+│   ├── loader_apk.c            ← APK 加载器
+│   ├── loader_wasm.c           ← WASM 加载器
+│   └── loader_script.c         ← shebang 脚本加载器
+│
+├── binfmt 集成
+│   └── loader_binfmt.c         ← 注册到内核 binfmt 框架
+│
+└── 初始化/清理
+    ├── loader_init()           ← 模块加载
+    └── loader_exit()           ← 模块卸载
+```
+
+2.2 LOADER 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → 其他插件
+                                                                                               ↑
+                                                                                    LOADER 在这里加载
+```
+
+LOADER 是第六个加载的硬件相关插件（HAP → PMP → FSP → NP → SP → LOADER）。在它之后，依赖程序执行的插件（SHELL、RUN 等）才能正常工作。
+
+2.3 LOADER 的上层消费者
+
+上层插件 需要 LOADER 提供什么
+SHELL 执行用户输入的命令
+RUN（运行时） 运行程序
+PKGMGR（包管理） 执行安装脚本
+INIT（初始化） 启动系统服务
+CLUSTER（集群） 在远程节点执行程序
+
+三、核心数据结构
+
+```c
+// loader/include/loader.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   可执行文件格式类型
+   ============================================================ */
+typedef enum {
+    LOADER_FORMAT_UNKNOWN = 0,
+    LOADER_FORMAT_ELF,
+    LOADER_FORMAT_PE,
+    LOADER_FORMAT_MACHO,
+    LOADER_FORMAT_APK,
+    LOADER_FORMAT_WASM,
+    LOADER_FORMAT_SCRIPT,
+    LOADER_FORMAT_JAVA,
+    LOADER_FORMAT_PYTHON,
+} loader_format_t;
+
+/* ============================================================
+   加载器句柄 (表示一个已加载的程序)
+   ============================================================ */
+typedef struct loader_handle {
+    uint64_t id;                    // 唯一句柄 ID
+    loader_format_t format;         // 文件格式
+    char path[256];                 // 文件路径
+    char interpreter[256];          // 解释器路径 (用于脚本)
+    
+    void *load_addr;                // 加载地址 (内核虚拟地址)
+    uint64_t load_size;             // 加载大小
+    uint64_t entry_point;           // 入口点地址
+    
+    uint64_t task_id;               // 运行的微内核任务 ID
+    int32_t pid;                    // 进程 PID
+    
+    uint64_t loaded_at;             // 加载时间戳
+    int ref_count;                  // 引用计数
+    
+    struct loader_handle *next;
+} loader_handle_t;
+
+/* ============================================================
+   格式信息 (用于 GetFormats)
+   ============================================================ */
+typedef struct loader_format_info {
+    loader_format_t format;
+    char name[32];                  // "ELF", "PE", "Mach-O", etc.
+    char magic[16];                 // 魔数 (十六进制字符串)
+    uint32_t magic_len;
+    char extension[8];              // 文件扩展名 ".elf", ".exe", etc.
+    int supported;
+} loader_format_info_t;
+
+/* ============================================================
+   检测请求
+   ============================================================ */
+typedef struct loader_detect_req {
+    char path[256];                 // 文件路径
+    uint8_t header[64];             // 文件头部 (前 64 字节)
+    uint32_t header_len;
+} loader_detect_req_t;
+
+/* ============================================================
+   检测响应
+   ============================================================ */
+typedef struct loader_detect_resp {
+    loader_format_t format;
+    char format_name[32];
+    int is_script;
+    char interpreter[256];          // 如果是脚本，解释器路径
+    int32_t error;
+} loader_detect_resp_t;
+
+/* ============================================================
+   加载请求
+   ============================================================ */
+typedef struct loader_load_req {
+    char path[256];                 // 文件路径
+    char **argv;                    // 参数列表
+    char **envp;                    // 环境变量列表
+    uint32_t flags;                 // 加载标志
+} loader_load_req_t;
+
+/* ============================================================
+   加载响应
+   ============================================================ */
+typedef struct loader_load_resp {
+    uint64_t handle;                // 句柄 ID
+    int32_t pid;                    // 进程 PID
+    int32_t error;
+} loader_load_resp_t;
+
+/* ============================================================
+   运行请求
+   ============================================================ */
+typedef struct loader_run_req {
+    uint64_t handle;                // 句柄 ID
+    char **args;                    // 运行参数
+} loader_run_req_t;
+
+/* ============================================================
+   运行响应
+   ============================================================ */
+typedef struct loader_run_resp {
+    int32_t exit_code;
+    int32_t error;
+} loader_run_resp_t;
+
+/* ============================================================
+   格式魔数定义
+   ============================================================ */
+#define ELF_MAGIC "\x7f\x45\x4c\x46"        // 0x7f  'E'  'L'  'F'
+#define PE_MAGIC   "\x4d\x5a"                // 'M'  'Z'
+#define MACHO_MAGIC_32 "\xfe\xed\xfa\xce"    // 0xfefacede
+#define MACHO_MAGIC_64 "\xfe\xed\xfa\xcf"    // 0xfefacfcf
+#define MACHO_MAGIC_BE  "\xce\xfa\xed\xfe"   // 大端
+#define APK_MAGIC    "\x50\x4b\x03\x04"       // ZIP
+#define WASM_MAGIC   "\x00\x61\x73\x6d"       // '\0' 'a' 's' 'm'
+
+/* ============================================================
+   LOADER 上下文
+   ============================================================ */
+typedef struct loader_context {
+    int initialized;
+    uint64_t loader_task_id;       // LOADER 自身的任务 ID
+    
+    loader_handle_t *handles;      // 已加载程序句柄列表
+    uint64_t next_handle_id;
+    
+    loader_format_info_t formats[8]; // 支持的格式列表
+    int format_count;
+    
+    void *lock;
+} loader_context_t;
+```
+
+四、LOADER 协议定义
+
+```protobuf
+// protocols/loader.proto
+syntax = "proto3";
+
+package hwrun.loader;
+
+service Loader {
+    // === 格式检测 ===
+    rpc Detect(DetectRequest) returns (DetectResponse);
+    
+    // === 加载与运行 ===
+    rpc Load(LoadRequest) returns (LoadResponse);
+    rpc Run(RunRequest) returns (RunResponse);
+    rpc Unload(UnloadRequest) returns (UnloadResponse);
+    
+    // === 查询 ===
+    rpc GetFormats(Empty) returns (GetFormatsResponse);
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+    rpc List(Empty) returns (ListResponse);
+}
+
+message Empty {}
+
+// ============ 格式检测 ============
+
+message DetectRequest {
+    string path = 1;
+    bytes header = 2;
+}
+
+message DetectResponse {
+    uint32 format = 1;              // loader_format_t
+    string format_name = 2;
+    bool is_script = 3;
+    string interpreter = 4;
+    int32 error = 5;
+}
+
+// ============ 加载与运行 ============
+
+message LoadRequest {
+    string path = 1;
+    repeated string argv = 2;
+    repeated string envp = 3;
+    uint32 flags = 4;
+}
+
+message LoadResponse {
+    uint64 handle = 1;
+    int32 pid = 2;
+    int32 error = 3;
+}
+
+message RunRequest {
+    uint64 handle = 1;
+    repeated string args = 2;
+}
+
+message RunResponse {
+    int32 exit_code = 1;
+    int32 error = 2;
+}
+
+message UnloadRequest {
+    uint64 handle = 1;
+}
+
+message UnloadResponse {
+    int32 error = 1;
+}
+
+// ============ 查询 ============
+
+message FormatInfo {
+    uint32 format = 1;
+    string name = 2;
+    string magic = 3;
+    string extension = 4;
+    bool supported = 5;
+}
+
+message GetFormatsResponse {
+    repeated FormatInfo formats = 1;
+    int32 error = 2;
+}
+
+message GetInfoRequest {
+    uint64 handle = 1;
+}
+
+message GetInfoResponse {
+    string path = 1;
+    uint32 format = 2;
+    string format_name = 3;
+    int32 pid = 4;
+    uint64 loaded_at = 5;
+    int32 error = 6;
+}
+
+message ListResponse {
+    repeated HandleInfo handles = 1;
+    int32 error = 2;
+}
+
+message HandleInfo {
+    uint64 handle = 1;
+    string path = 2;
+    uint32 format = 3;
+    int32 pid = 4;
+    uint64 loaded_at = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// loader/src/loader.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/binfmts.h>
+#include <linux/elf.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+
+#include "loader.h"
+#include "loader_ipc.h"
+#include "loader_router.h"
+#include "loader_elf.h"
+#include "loader_pe.h"
+#include "loader_macho.h"
+#include "loader_apk.h"
+#include "loader_wasm.h"
+#include "loader_script.h"
+#include "loader_binfmt.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Executable Loader Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static loader_context_t g_loader_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init loader_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun LOADER: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_loader_ctx, 0, sizeof(loader_context_t));
+    g_loader_ctx.next_handle_id = 1;
+    
+    // 2. 初始化格式列表
+    loader_init_formats();
+    
+    // 3. 注册到内核 binfmt 框架
+    ret = loader_binfmt_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun LOADER: Failed to register binfmt\n");
+        return ret;
+    }
+    
+    // 4. 注册 IPC 消息处理器
+    ret = loader_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun LOADER: Failed to register IPC handler\n");
+        loader_binfmt_unregister();
+        return ret;
+    }
+    
+    // 5. 注册 LOADER 协议（通过 METAPROTO - 通过 IPC）
+    loader_register_protocol();
+    
+    g_loader_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun LOADER: Initialized successfully\n");
+    printk(KERN_INFO "  Supported formats: ELF, PE, Mach-O, APK, WASM, Script\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit loader_exit(void) {
+    printk(KERN_INFO "HWRun LOADER: Exiting...\n");
+    
+    loader_ipc_unregister();
+    loader_binfmt_unregister();
+    
+    // 清理句柄列表
+    loader_cleanup_handles();
+    
+    g_loader_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun LOADER: Exited\n");
+}
+
+module_init(loader_init);
+module_exit(loader_exit);
+```
+
+5.2 格式魔数定义和检测
+
+```c
+// loader/src/loader_magic.h
+
+#ifndef _LOADER_MAGIC_H
+#define _LOADER_MAGIC_H
+
+#include <linux/types.h>
+
+/* ============================================================
+   各格式魔数定义
+   ============================================================ */
+
+/* ELF: 0x7F 45 4C 46 */
+#define LOADER_MAGIC_ELF     "\x7f\x45\x4c\x46"
+#define LOADER_MAGIC_ELF_LEN 4
+
+/* PE/COFF: MZ (4D 5A) */
+#define LOADER_MAGIC_PE      "\x4d\x5a"
+#define LOADER_MAGIC_PE_LEN  2
+
+/* Mach-O (32-bit): FE ED FA CE */
+#define LOADER_MAGIC_MACHO32 "\xfe\xed\xfa\xce"
+/* Mach-O (64-bit): FE ED FA CF */
+#define LOADER_MAGIC_MACHO64 "\xfe\xed\xfa\xcf"
+#define LOADER_MAGIC_MACHO_LEN 4
+
+/* APK/ZIP: PK (50 4B 03 04) */
+#define LOADER_MAGIC_APK     "\x50\x4b\x03\x04"
+#define LOADER_MAGIC_APK_LEN 4
+
+/* WASM: 00 61 73 6D */
+#define LOADER_MAGIC_WASM    "\x00\x61\x73\x6d"
+#define LOADER_MAGIC_WASM_LEN 4
+
+/* ============================================================
+   格式检测结构
+   ============================================================ */
+typedef struct loader_magic_entry {
+    loader_format_t format;
+    const char *magic;
+    uint32_t magic_len;
+    uint32_t offset;                // 魔数偏移
+    const char *name;
+    const char *extension;
+    int (*load_func)(struct linux_binprm *);
+} loader_magic_entry_t;
+
+static const loader_magic_entry_t loader_magic_table[] = {
+    {
+        .format = LOADER_FORMAT_ELF,
+        .magic = LOADER_MAGIC_ELF,
+        .magic_len = LOADER_MAGIC_ELF_LEN,
+        .offset = 0,
+        .name = "ELF",
+        .extension = "",
+        .load_func = loader_elf_load_binary,
+    },
+    {
+        .format = LOADER_FORMAT_PE,
+        .magic = LOADER_MAGIC_PE,
+        .magic_len = LOADER_MAGIC_PE_LEN,
+        .offset = 0,
+        .name = "PE/COFF",
+        .extension = ".exe",
+        .load_func = loader_pe_load_binary,
+    },
+    {
+        .format = LOADER_FORMAT_MACHO,
+        .magic = LOADER_MAGIC_MACHO64,
+        .magic_len = LOADER_MAGIC_MACHO_LEN,
+        .offset = 0,
+        .name = "Mach-O",
+        .extension = "",
+        .load_func = loader_macho_load_binary,
+    },
+    {
+        .format = LOADER_FORMAT_APK,
+        .magic = LOADER_MAGIC_APK,
+        .magic_len = LOADER_MAGIC_APK_LEN,
+        .offset = 0,
+        .name = "APK",
+        .extension = ".apk",
+        .load_func = loader_apk_load_binary,
+    },
+    {
+        .format = LOADER_FORMAT_WASM,
+        .magic = LOADER_MAGIC_WASM,
+        .magic_len = LOADER_MAGIC_WASM_LEN,
+        .offset = 0,
+        .name = "WASM",
+        .extension = ".wasm",
+        .load_func = loader_wasm_load_binary,
+    },
+};
+
+#define LOADER_MAGIC_COUNT \
+    (sizeof(loader_magic_table) / sizeof(loader_magic_entry_t))
+
+#endif /* _LOADER_MAGIC_H */
+```
+
+5.3 格式路由器
+
+```c
+// loader/src/loader_router.c
+
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/binfmts.h>
+
+#include "loader.h"
+#include "loader_magic.h"
+
+/* ============================================================
+   根据魔数检测格式
+   ============================================================ */
+loader_format_t loader_detect_format(const uint8_t *header, uint32_t len,
+                                      char *out_name, size_t name_size,
+                                      char *out_interp, size_t interp_size) {
+    // 1. 检查 shebang (脚本)
+    if (len >= 2 && header[0] == '#' && header[1] == '!') {
+        // 提取解释器路径
+        if (out_interp && interp_size > 0) {
+            const char *start = (const char *)header + 2;
+            const char *end = start;
+            while (*end && *end != '\n' && *end != ' ' &&
+                   (end - (const char *)header) < len) {
+                end++;
+            }
+            size_t interp_len = end - start;
+            if (interp_len < interp_size - 1) {
+                memcpy(out_interp, start, interp_len);
+                out_interp[interp_len] = '\0';
+            }
+        }
+        if (out_name) {
+            strncpy(out_name, "Script", name_size - 1);
+        }
+        return LOADER_FORMAT_SCRIPT;
+    }
+    
+    // 2. 检查魔数表
+    for (int i = 0; i < LOADER_MAGIC_COUNT; i++) {
+        const loader_magic_entry_t *entry = &loader_magic_table[i];
+        if (len >= entry->offset + entry->magic_len) {
+            if (memcmp(header + entry->offset, entry->magic, entry->magic_len) == 0) {
+                if (out_name) {
+                    strncpy(out_name, entry->name, name_size - 1);
+                }
+                if (out_interp && interp_size > 0) {
+                    out_interp[0] = '\0';
+                }
+                return entry->format;
+            }
+        }
+    }
+    
+    return LOADER_FORMAT_UNKNOWN;
+}
+
+/* ============================================================
+   获取格式对应的加载函数
+   ============================================================ */
+int (*loader_get_load_func(loader_format_t format))(struct linux_binprm *) {
+    for (int i = 0; i < LOADER_MAGIC_COUNT; i++) {
+        if (loader_magic_table[i].format == format) {
+            return loader_magic_table[i].load_func;
+        }
+    }
+    return NULL;
+}
+
+/* ============================================================
+   获取格式名称
+   ============================================================ */
+const char *loader_get_format_name(loader_format_t format) {
+    for (int i = 0; i < LOADER_MAGIC_COUNT; i++) {
+        if (loader_magic_table[i].format == format) {
+            return loader_magic_table[i].name;
+        }
+    }
+    return "Unknown";
+}
+```
+
+5.4 binfmt 集成（内核加载入口）
+
+```c
+// loader/src/loader_binfmt.c
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/binfmts.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+
+#include "loader.h"
+#include "loader_router.h"
+#include "loader_ipc.h"
+
+/* ============================================================
+   加载二进制文件 (内核 binfmt 回调)
+   ============================================================ */
+static int loader_load_binary(struct linux_binprm *bprm) {
+    uint8_t header[64];
+    loader_format_t format;
+    char format_name[32];
+    char interpreter[256];
+    int (*load_func)(struct linux_binprm *);
+    int ret;
+    
+    // 1. 读取文件头 (前 64 字节)
+    ret = kernel_read(bprm->file, header, sizeof(header), &bprm->buf);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 2. 检测格式
+    format = loader_detect_format(header, ret, format_name, sizeof(format_name),
+                                   interpreter, sizeof(interpreter));
+    if (format == LOADER_FORMAT_UNKNOWN) {
+        return -ENOEXEC;
+    }
+    
+    printk(KERN_DEBUG "HWRun LOADER: Detected format %s for %s\n",
+           format_name, bprm->filename);
+    
+    // 3. 获取加载函数
+    load_func = loader_get_load_func(format);
+    if (!load_func) {
+        return -ENOEXEC;
+    }
+    
+    // 4. 执行加载
+    // 如果是脚本，设置解释器
+    if (format == LOADER_FORMAT_SCRIPT) {
+        // 将解释器路径保存到 bprm 中
+        // 实际实现中需要修改 bprm->interp
+    }
+    
+    ret = load_func(bprm);
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun LOADER: Failed to load %s: %d\n",
+               bprm->filename, ret);
+        return ret;
+    }
+    
+    // 5. 通知用户态 (通过 IPC)
+    loader_ipc_notify_load(bprm->filename, format, current->pid);
+    
+    return 0;
+}
+
+/* ============================================================
+   加载共享库 (内核 binfmt 回调)
+   ============================================================ */
+static int loader_load_shlib(struct file *file) {
+    // 简化实现：只支持 ELF 共享库
+    // 实际实现中需要检测格式并调用对应的加载函数
+    return -ENOEXEC;
+}
+
+/* ============================================================
+   linux_binfmt 结构体
+   ============================================================ */
+static struct linux_binfmt loader_binfmt = {
+    .module = THIS_MODULE,
+    .load_binary = loader_load_binary,
+    .load_shlib = loader_load_shlib,
+    .core_dump = NULL,
+    .min_coredump = 0,
+};
+
+/* ============================================================
+   注册到内核
+   ============================================================ */
+int loader_binfmt_register(void) {
+    return register_binfmt(&loader_binfmt);
+}
+
+/* ============================================================
+   从内核注销
+   ============================================================ */
+void loader_binfmt_unregister(void) {
+    unregister_binfmt(&loader_binfmt);
+}
+```
+
+5.5 ELF 加载器
+
+```c
+// loader/src/loader_elf.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/binfmts.h>
+#include <linux/elf.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+
+#include "loader.h"
+
+/* ============================================================
+   ELF 加载函数 (简化版 - 实际使用内核的 load_elf_binary)
+   ============================================================ */
+int loader_elf_load_binary(struct linux_binprm *bprm) {
+    // 实际实现中，这里可以直接调用内核的 load_elf_binary
+    // 或者自己实现 ELF 加载逻辑
+    
+    // 方法 1：调用内核的 ELF 加载器 (推荐)
+    // 由于内核已经有完善的 ELF 加载器，我们可以直接使用
+    // 但需要导出 load_elf_binary 符号
+    
+    // 方法 2：自己实现简化版 ELF 加载
+    // 这里给出框架
+    
+    struct elfhdr *elf_ex;
+    int ret;
+    
+    // 读取 ELF 头
+    elf_ex = kmalloc(sizeof(struct elfhdr), GFP_KERNEL);
+    if (!elf_ex) {
+        return -ENOMEM;
+    }
+    
+    ret = kernel_read(bprm->file, elf_ex, sizeof(struct elfhdr), &bprm->buf);
+    if (ret < 0) {
+        kfree(elf_ex);
+        return ret;
+    }
+    
+    // 验证 ELF 头
+    if (elf_ex->e_ident[0] != 0x7f ||
+        elf_ex->e_ident[1] != 'E' ||
+        elf_ex->e_ident[2] != 'L' ||
+        elf_ex->e_ident[3] != 'F') {
+        kfree(elf_ex);
+        return -ENOEXEC;
+    }
+    
+    // 加载 ELF 段到内存
+    // 设置入口点
+    // 设置进程参数
+    
+    kfree(elf_ex);
+    return 0;
+}
+```
+
+5.6 PE/COFF 加载器
+
+```c
+// loader/src/loader_pe.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/binfmts.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "loader.h"
+
+/* ============================================================
+   PE/COFF 头结构 (简化版)
+   ============================================================ */
+typedef struct {
+    uint16_t e_magic;       // 'MZ'
+    uint16_t e_cblp;
+    uint16_t e_cp;
+    uint16_t e_crlc;
+    uint16_t e_cparhdr;
+    uint16_t e_minalloc;
+    uint16_t e_maxalloc;
+    uint16_t e_ss;
+    uint16_t e_sp;
+    uint16_t e_csum;
+    uint16_t e_ip;
+    uint16_t e_cs;
+    uint16_t e_lfarlc;
+    uint16_t e_ovno;
+    uint8_t e_res[8];
+    uint16_t e_oemid;
+    uint16_t e_oeminfo;
+    uint8_t e_res2[20];
+    uint32_t e_lfanew;      // 指向 PE 头的偏移
+} __attribute__((packed)) pe_dos_header_t;
+
+typedef struct {
+    uint32_t Signature;     // "PE\0\0"
+    uint16_t Machine;
+    uint16_t NumberOfSections;
+    uint32_t TimeDateStamp;
+    uint32_t PointerToSymbolTable;
+    uint32_t NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader;
+    uint16_t Characteristics;
+} __attribute__((packed)) pe_file_header_t;
+
+/* ============================================================
+   PE 加载函数
+   ============================================================ */
+int loader_pe_load_binary(struct linux_binprm *bprm) {
+    pe_dos_header_t dos_header;
+    pe_file_header_t pe_header;
+    int ret;
+    
+    // 1. 读取 DOS 头
+    ret = kernel_read(bprm->file, &dos_header, sizeof(dos_header), &bprm->buf);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 2. 验证 DOS 魔数 ('MZ')
+    if (dos_header.e_magic != 0x5a4d) {
+        return -ENOEXEC;
+    }
+    
+    // 3. 读取 PE 头
+    ret = kernel_read(bprm->file, &pe_header, sizeof(pe_header),
+                      &dos_header.e_lfanew);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 4. 验证 PE 签名
+    if (pe_header.Signature != 0x00004550) {  // "PE\0\0"
+        return -ENOEXEC;
+    }
+    
+    // 5. 解析 PE 节区，加载到内存
+    // 6. 处理导入表 (IAT)
+    // 7. 设置入口点
+    // 8. 启动进程
+    
+    printk(KERN_DEBUG "HWRun LOADER: PE file loaded: %s\n", bprm->filename);
+    
+    return 0;
+}
+```
+
+5.7 IPC 消息处理
+
+```c
+// loader/src/loader_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "loader.h"
+#include "loader_ipc.h"
+#include "loader_router.h"
+
+/* ============================================================
+   格式检测 IPC 处理器
+   ============================================================ */
+void loader_ipc_detect_handler(uint64_t from_task, void *data, size_t len) {
+    loader_detect_req_t *req = (loader_detect_req_t *)data;
+    loader_detect_resp_t resp;
+    
+    memset(&resp, 0, sizeof(resp));
+    
+    // 检测格式
+    resp.format = loader_detect_format(req->header, req->header_len,
+                                        resp.format_name, sizeof(resp.format_name),
+                                        resp.interpreter, sizeof(resp.interpreter));
+    
+    if (resp.format == LOADER_FORMAT_UNKNOWN) {
+        resp.error = -ENOEXEC;
+    } else {
+        resp.is_script = (resp.format == LOADER_FORMAT_SCRIPT);
+        resp.error = 0;
+    }
+    
+    ipc_reply(from_task, &resp, sizeof(resp));
+}
+
+/* ============================================================
+   加载 IPC 处理器
+   ============================================================ */
+void loader_ipc_load_handler(uint64_t from_task, void *data, size_t len) {
+    loader_load_req_t *req = (loader_load_req_t *)data;
+    loader_load_resp_t resp;
+    struct linux_binprm *bprm;
+    int ret;
+    
+    memset(&resp, 0, sizeof(resp));
+    
+    // 实际实现中，需要：
+    // 1. 创建 linux_binprm 结构
+    // 2. 打开文件
+    // 3. 调用内核的 execve 路径
+    
+    // 简化版本：直接使用内核的 do_execve
+    // ret = do_execve(req->path, req->argv, req->envp);
+    
+    // 如果成功，返回 PID
+    // resp.handle = loader_create_handle(...);
+    // resp.pid = current->pid;
+    
+    ipc_reply(from_task, &resp, sizeof(resp));
+}
+
+/* ============================================================
+   获取格式列表 IPC 处理器
+   ============================================================ */
+void loader_ipc_formats_handler(uint64_t from_task, void *data, size_t len) {
+    // 返回支持的格式列表
+    char buf[1024];
+    size_t pos = 0;
+    
+    for (int i = 0; i < LOADER_MAGIC_COUNT; i++) {
+        const loader_magic_entry_t *entry = &loader_magic_table[i];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s%s", entry->name,
+                        (i < LOADER_MAGIC_COUNT - 1) ? "," : "");
+    }
+    
+    ipc_reply(from_task, buf, strlen(buf) + 1);
+}
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void loader_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case LOADER_MSG_DETECT:
+            loader_ipc_detect_handler(from_task, data, len);
+            break;
+            
+        case LOADER_MSG_LOAD:
+            loader_ipc_load_handler(from_task, data, len);
+            break;
+            
+        case LOADER_MSG_GET_FORMATS:
+            loader_ipc_formats_handler(from_task, data, len);
+            break;
+            
+        default:
+            printk(KERN_WARNING "HWRun LOADER: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/loader/plugin.yml
+plugin:
+  id: "loader"
+  name: "Executable Loader Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 可执行文件加载协议，负责检测、加载和运行各种格式的可执行文件"
+  
+  provides:
+    - protocol: "LOADER"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+  
+  params:
+    - key: "loader.default_interpreter"
+      type: "string"
+      default: "/bin/sh"
+      description: "默认脚本解释器"
+    - key: "loader.allow_pe"
+      type: "bool"
+      default: true
+      description: "是否允许加载 PE 文件"
+    - key: "loader.allow_wasm"
+      type: "bool"
+      default: true
+      description: "是否允许加载 WASM 文件"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/loader.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# loader/Makefile
+
+obj-m += loader.o
+
+loader-objs := loader.o loader_router.o loader_binfmt.o \
+               loader_elf.o loader_pe.o loader_macho.o \
+               loader_apk.o loader_wasm.o loader_script.o \
+               loader_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 loader.ko /usr/lib/hwrun/plugins/
+```
+
+6.3 安装后脚本
+
+```bash
+#!/bin/bash
+# loader/scripts/post_install.sh
+
+# 加载 LOADER 内核模块
+/sbin/insmod /usr/lib/hwrun/plugins/loader.ko
+
+if [ $? -eq 0 ]; then
+    echo "LOADER kernel module loaded successfully"
+    
+    # 注册 binfmt_misc (如果内核支持)
+    # 用于支持非原生格式（如 Java、Python 脚本）
+    mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null
+    
+    # 注册 .wasm 文件格式
+    # echo ':wasm:M::\x00\x61\x73\x6d::/usr/bin/wasmtime:' > /proc/sys/fs/binfmt_misc/register
+    
+    # 注册 .apk 文件格式
+    # echo ':apk:M::PK\x03\x04::/usr/bin/apk-runner:' > /proc/sys/fs/binfmt_misc/register
+    
+    echo "binfmt_misc configured"
+else
+    echo "Failed to load LOADER kernel module"
+    exit 1
+fi
+```
+
+七、命令行接口
+
+```bash
+# 检测文件格式
+hwrun loader detect /bin/ls
+# 输出: ELF
+
+hwrun loader detect /path/to/app.exe
+# 输出: PE/COFF
+
+# 加载并运行程序
+hwrun loader load /bin/ls
+hwrun loader run <handle> --args "-la"
+
+# 查看已加载的程序
+hwrun loader list
+
+# 获取程序信息
+hwrun loader info <handle>
+
+# 卸载程序
+hwrun loader unload <handle>
+
+# 查看支持的格式
+hwrun loader formats
+# 输出: ELF, PE/COFF, Mach-O, APK, WASM, Script
+```
+
+八、上层插件调用示例
+
+```c
+// 其他插件通过 LOADER 执行程序
+#include "loader_client.h"
+
+int shell_execute(const char *cmd, char **args) {
+    // 1. 检测文件格式
+    loader_format_t fmt = loader_detect(cmd);
+    if (fmt == LOADER_FORMAT_UNKNOWN) {
+        return -ENOEXEC;
+    }
+    
+    // 2. 加载程序
+    uint64_t handle;
+    int pid;
+    int ret = loader_load(cmd, args, NULL, &handle, &pid);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 3. 运行程序
+    int exit_code;
+    ret = loader_run(handle, args, &exit_code);
+    if (ret < 0) {
+        loader_unload(handle);
+        return ret;
+    }
+    
+    // 4. 卸载程序
+    loader_unload(handle);
+    
+    return exit_code;
+}
+```
+
+九、总结
+
+维度 决策
+定位 可执行文件加载协议，所有程序执行的统一入口
+实现方式 Linux 内核模块 (.ko)，基于 binfmt 框架
+代码量 ~1500-2000 行 C
+提供协议 LOADER (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + PMP
+加载时机 在 SHELL、RUN 等依赖程序执行的插件之前
+支持的格式 ELF, PE/COFF, Mach-O, APK, WASM, Script (shebang)
+扩展方式 通过添加新的加载器子插件支持新格式
+
+LOADER 是 HWRun OS 中第六个加载的硬件相关插件（HAP → PMP → FSP → NP → SP → LOADER）。它作为内核模块运行，基于 Linux 内核的 binfmt 框架，通过 LOADER 协议向上层插件提供统一的程序加载和运行接口。LOADER 本身是一个路由器，将加载请求路由到对应的格式加载器子插件（ELF、PE、Mach-O、APK、WASM、Script 等）。上层插件（SHELL、RUN、PKGMGR、INIT、CLUSTER 等）通过 LOADER 协议执行程序，不直接操作内核的 binfmt 接口。

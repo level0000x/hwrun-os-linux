@@ -1,0 +1,809 @@
+HWRun OS COMPRESS 实现文档
+
+模块名称： COMPRESS (Compression Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 压缩协议，提供数据/文件/流的压缩、解压与格式转换的统一抽象，面向传输与存储优化
+实现语言： C（用户态服务 + 库封装，基于 zlib / libzstd / liblzma）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）
+提供协议： COMPRESS
+
+一、设计哲学
+
+1.1 核心定位
+
+COMPRESS 是 HWRun OS 的压缩服务核心——所有与数据压缩、解压、压缩格式识别相关的操作都通过 COMPRESS 协议进行，服务于日志、传输、存储与归档等场景。
+
+```
+COMPRESS = 压缩协议 = 所有压缩/解压操作的统一入口
+
+上层插件 (LOG, AUDIT, FS_TRANSFER, STORAGE, CLUSTER, PKGMGR, ...)
+    │
+    │  通过 COMPRESS 协议压缩/解压数据
+    ▼
+COMPRESS 服务 (用户态 hwrun-compressd + 库)
+    │
+    │  基于主流压缩库
+    │  ├── zlib (deflate)      → 速度/体积均衡，最通用
+    │  ├── libzstd (zstd)      → 高速度 + 高压缩率，通用优先推荐
+    │  ├── liblzma (xz)        → 最高压缩率，归档/包
+    │  └── lz4                → 极致速度，实时日志
+    │
+    ▼
+Linux 用户态 (压缩库)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有压缩操作通过 COMPRESS 协议进行
+2. 算法可配：压缩算法与级别通过配置/调用参数控制
+3. 格式识别：自动识别常见压缩格式头，透明解压
+4. 流式支持：支持大文件分块流式压缩/解压，避免整块驻留内存
+5. 与安全协同：可配合 CRYPTO 做"先加密后压缩"或"先压缩后加密"策略
+6. 统一接口：文件压缩、缓冲压缩、流压缩共用一套协议语义
+
+1.3 压缩算法选型
+
+算法 特点 典型用途 推荐级别
+deflate (zlib) 通用，兼容 gzip/zlib 通用交互、包格式 中等
+zstd (zstd) 高速度+高比率，自带词典 通用首选 默认
+xz (liblzma) 最高压缩率，慢 归档、安装包 高
+lz4 极快，低压缩率 实时日志、内存交换 低
+
+HWRun OS 默认推荐 zstd 作为通用编排压缩算法，兼顾速度与压缩率；日志实时压缩用 lz4；安装包/归档用 xz。
+
+1.4 压缩与加密的编排
+
+· 传输场景（FS_TRANSFER）：先压缩再加密（密文体积更小，压缩可能泄露模式，需配合 AEAD）
+· 存储场景（STORAGE 卷）：通常按块压缩再加密，或依赖块设备原生压缩
+· 日志场景（LOG/AUDIT）：lz4 流式压缩，必要时加 HMAC 校验完整性
+
+```
+  明文 →[COMPRESS]→ 压缩流 →[CRYPTO]→ 密文 (传输紧凑)
+  明文 →[CRYPTO]→ 密文 →[COMPRESS]→ 压缩密文 (存储)
+```
+
+二、整体架构
+
+2.1 COMPRESS 服务的组成
+
+```
+COMPRESS 服务 (hwrun-compressd + libhwrun-compress)
+├── 协议处理层
+│   ├── compress_ipc_handler()     ← IPC 消息分发
+│   ├── compress_buffer()          ← 缓冲压缩
+│   ├── compress_decompress()      ← 缓冲解压
+│   ├── compress_file()            ← 文件压缩
+│   ├── compress_detect()          ← 格式识别
+│   └── compress_list_algorithms() ← 列出可用算法
+│
+├── 算法封装层
+│   ├── compress_zlib.c            ← deflate/zlib/gzip
+│   ├── compress_zstd.c            ← zstd
+│   ├── compress_xz.c              ← lzma/xz
+│   └── compress_lz4.c             ← lz4
+│
+└── 初始化/清理
+    ├── compress_init()            ← 服务启动
+    └── compress_exit()            ← 服务停止
+```
+
+2.2 COMPRESS 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → ... → 上层应用插件 (SANDBOX/UI/SHELL/CONSOLE/DESKTOP/PKGMGR/MONITOR 等)
+                                                                                ↑
+                                                                COMPRESS 作为通用服务随上层应用层可用
+```
+
+COMPRESS 属通用工具协议，不依赖具体设备层，作为用户态服务在系统进入上层应用阶段后可用；任何需要压缩的插件可在其加载后的任意时刻调用。
+
+2.3 COMPRESS 的上层消费者
+
+上层插件 需要 COMPRESS 提供什么
+LOG (日志) 日志轮转压缩
+AUDIT (审计) 审计日志压缩与滚动
+FS_TRANSFER (文件传输) 传输前压缩减小带宽
+STORAGE (存储) 快照/备份压缩
+CLUSTER (集群) 节点间状态同步压缩
+PKGMGR (包管理) 安装包解压
+上层开发者 API 插件内数据/文件压缩
+
+三、核心数据结构
+
+```c
+// compress/include/compress.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   压缩算法
+   ============================================================ */
+typedef enum {
+    COMPRESS_ALGO_AUTO = 0,          // 自动识别(解压) / 默认(压缩)
+    COMPRESS_ALGO_ZLIB,              // deflate (zlib 格式)
+    COMPRESS_ALGO_GZIP,              // gzip 格式
+    COMPRESS_ALGO_ZSTD,              // zstd
+    COMPRESS_ALGO_XZ,                // xz
+    COMPRESS_ALGO_LZ4,               // lz4 (frame)
+    COMPRESS_ALGO_LZ4_RAW,           // lz4 block (raw)
+} compress_algo_t;
+
+/* ============================================================
+   压缩级别
+   ============================================================ */
+typedef enum {
+    COMPRESS_LEVEL_FASTEST = 0,      // 最快
+    COMPRESS_LEVEL_FAST,             // 快
+    COMPRESS_LEVEL_DEFAULT,          // 默认(平衡)
+    COMPRESS_LEVEL_MORE,             // 更高
+    COMPRESS_LEVEL_BEST,             // 最高
+} compress_level_t;
+
+/* ============================================================
+   压缩结果
+   ============================================================ */
+typedef struct compress_result {
+    uint8_t *data;                   // 压缩/解压后数据
+    uint32_t data_len;               // 数据长度
+    uint64_t orig_len;               // 原始长度 (压缩时输出)
+    uint32_t algo;                   // 实际使用的算法
+    int success;
+} compress_result_t;
+
+/* ============================================================
+   压缩上下文 (流式)
+   ============================================================ */
+typedef struct compress_stream {
+    uint32_t algo;                   // 算法
+    int level;                       // 级别
+    void *ctx;                       // 算法内部上下文 (z_stream / ZSTD_CCtx...)
+    int is_compressing;              // 方向
+    uint64_t bytes_in;               // 累计输入
+    uint64_t bytes_out;              // 累计输出
+} compress_stream_t;
+```
+
+四、COMPRESS 协议定义
+
+```protobuf
+// protocols/compress.proto
+syntax = "proto3";
+
+package hwrun.compress;
+
+service Compress {
+    // === 算法信息 ===
+    rpc ListAlgorithms(Empty) returns (ListAlgorithmsResponse);
+
+    // === 缓冲压缩/解压 ===
+    rpc Compress(CompressRequest) returns (CompressResponse);
+    rpc Decompress(DecompressRequest) returns (DecompressResponse);
+
+    // === 格式识别 ===
+    rpc Detect(DetectRequest) returns (DetectResponse);
+
+    // === 文件压缩/解压 ===
+    rpc CompressFile(CompressFileRequest) returns (CompressFileResponse);
+    rpc DecompressFile(DecompressFileRequest) returns (DecompressFileResponse);
+
+    // === 流式 ===
+    rpc StreamCompress(stream StreamRequest) returns (stream StreamResponse);
+    rpc StreamDecompress(stream StreamRequest) returns (stream StreamResponse);
+}
+
+message Empty {}
+
+// ============ 算法信息 ============
+
+message AlgorithmInfo {
+    uint32 algo = 1;                // compress_algo_t
+    string name = 2;                // "zstd"
+    string magic_hex = 3;           // 魔数 (如 0x28 0xB5 0x2F 0xFD)
+    uint32 default_ratio = 4;       // 默认压缩率 (百分比, 100=无压缩)
+}
+
+message ListAlgorithmsResponse {
+    repeated AlgorithmInfo algorithms = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+// ============ 缓冲压缩/解压 ============
+
+message CompressRequest {
+    uint32 algo = 1;                // compress_algo_t
+    uint32 level = 2;               // compress_level_t
+    bytes data = 3;
+}
+
+message CompressResponse {
+    bytes compressed = 1;
+    uint32 algo = 2;
+    uint64 orig_len = 3;
+    uint64 compressed_len = 4;
+    int32 error = 5;
+}
+
+message DecompressRequest {
+    uint32 force_algo = 1;          // 0 = 自动识别格式
+    bytes data = 2;
+}
+
+message DecompressResponse {
+    bytes decompressed = 1;
+    uint32 algo = 2;
+    uint64 orig_len = 3;
+    int32 error = 4;
+}
+
+// ============ 格式识别 ============
+
+message DetectRequest {
+    bytes data = 1;
+}
+
+message DetectResponse {
+    uint32 algo = 1;
+    bool recognized = 2;
+    string detail = 3;
+    int32 error = 4;
+}
+
+// ============ 文件压缩/解压 ============
+
+message CompressFileRequest {
+    string input_path = 1;
+    string output_path = 2;
+    uint32 algo = 3;
+    uint32 level = 4;
+    bool keep_original = 5;
+}
+
+message CompressFileResponse {
+    uint64 orig_len = 1;
+    uint64 compressed_len = 2;
+    double ratio = 3;
+    int32 error = 4;
+}
+
+message DecompressFileRequest {
+    string input_path = 1;
+    string output_path = 2;
+    uint32 force_algo = 3;          // 0 = 自动识别
+    bool keep_original = 4;
+}
+
+message DecompressFileResponse {
+    uint64 orig_len = 1;
+    uint32 algo = 2;
+    int32 error = 3;
+}
+
+// ============ 流式 ============
+
+message StreamRequest {
+    uint32 algo = 1;                // 首帧指定
+    uint32 level = 2;               // 首帧指定
+    bytes chunk = 3;
+    bool eos = 4;
+}
+
+message StreamResponse {
+    bytes chunk = 1;
+    uint64 bytes_in = 2;
+    uint64 bytes_out = 3;
+    bool finished = 4;
+    int32 error = 5;
+}
+```
+
+五、核心函数实现
+
+5.1 服务初始化和加载
+
+```c
+// compress/src/compress.c
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+#include "compress.h"
+#include "compress_ipc.h"
+#include "compress_zlib.h"
+#include "compress_zstd.h"
+#include "compress_xz.h"
+#include "compress_lz4.h"
+
+static int g_compress_ready = 0;
+static pthread_mutex_t g_compress_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ============================================================
+   服务初始化
+   ============================================================ */
+int compress_init(void) {
+    pthread_mutex_lock(&g_compress_lock);
+
+    // 1. 探测可用算法库
+    compress_probe_algorithms();
+
+    // 2. 注册 IPC 处理器
+    int ret = compress_ipc_register();
+    if (ret < 0) {
+        pthread_mutex_unlock(&g_compress_lock);
+        return ret;
+    }
+
+    // 3. 注册 COMPRESS 协议
+    compress_register_protocol();
+
+    g_compress_ready = 1;
+    pthread_mutex_unlock(&g_compress_lock);
+
+    printk("HWRun COMPRESS: Initialized successfully\n");
+    return 0;
+}
+
+/* ============================================================
+   服务清理
+   ============================================================ */
+void compress_exit(void) {
+    compress_ipc_unregister();
+    g_compress_ready = 0;
+    printk("HWRun COMPRESS: Exited\n");
+}
+```
+
+5.2 缓冲压缩 (zstd 示例)
+
+```c
+// compress/src/compress_zstd.c
+
+#include <zstd.h>
+
+#include "compress.h"
+
+/* ============================================================
+   zstd 缓冲压缩
+   ============================================================ */
+int compress_zstd(uint32_t level, const uint8_t *in,
+                  uint32_t in_len, uint8_t *out, uint32_t out_cap,
+                  uint32_t *out_len) {
+    int c_level = ZSTD_CLEVEL_DEFAULT;
+
+    switch (level) {
+        case COMPRESS_LEVEL_FASTEST: c_level = 1; break;
+        case COMPRESS_LEVEL_FAST:    c_level = 3; break;
+        case COMPRESS_LEVEL_DEFAULT: c_level = 5; break;
+        case COMPRESS_LEVEL_MORE:    c_level = 15; break;
+        case COMPRESS_LEVEL_BEST:    c_level = ZSTD_maxCLevel(); break;
+    }
+
+    size_t bound = ZSTD_compressBound(in_len);
+    if (out_cap < bound) {
+        return -1;  // 输出缓冲不足
+    }
+
+    size_t ret = ZSTD_compress(out, out_cap, in, in_len, c_level);
+    if (ZSTD_isError(ret)) {
+        return -1;
+    }
+
+    // 如果压缩后不比原数据小，返回原始数据更优
+    if (ret >= in_len) {
+        return -1;  // 调用方回退到原始存储
+    }
+
+    *out_len = (uint32_t)ret;
+    return 0;
+}
+
+/* ============================================================
+   zstd 缓冲解压
+   ============================================================ */
+int compress_zstd_decompress(const uint8_t *in, uint32_t in_len,
+                             uint64_t expected_len,
+                             uint8_t *out, uint32_t out_cap,
+                             uint32_t *out_len) {
+    if (expected_len > out_cap) {
+        return -1;
+    }
+
+    size_t ret = ZSTD_decompress(out, out_cap, in, in_len);
+    if (ZSTD_isError(ret)) {
+        return -1;
+    }
+
+    *out_len = (uint32_t)ret;
+    return 0;
+}
+```
+
+5.3 缓冲压缩 (lz4 示例，实时日志)
+
+```c
+// compress/src/compress_lz4.c
+
+#include <lz4.h>
+#include <lz4frame.h>
+
+#include "compress.h"
+
+/* ============================================================
+   lz4 block 压缩 (原始块, 用于实时日志)
+   ============================================================ */
+int compress_lz4_raw(const uint8_t *in, uint32_t in_len,
+                     uint8_t *out, uint32_t out_cap,
+                     uint32_t *out_len) {
+    int ret = LZ4_compress_default((const char *)in, (char *)out,
+                                   (int)in_len, (int)out_cap);
+    if (ret <= 0) {
+        return -1;
+    }
+    *out_len = (uint32_t)ret;
+    return 0;
+}
+
+/* ============================================================
+   lz4 block 解压
+   ============================================================ */
+int compress_lz4_raw_decompress(const uint8_t *in, uint32_t in_len,
+                                uint8_t *out, uint32_t out_cap,
+                                uint32_t expected_len,
+                                uint32_t *out_len) {
+    int ret = LZ4_decompress_safe((const char *)in, (char *)out,
+                                  (int)in_len, (int)out_cap);
+    if (ret < 0) {
+        return -1;
+    }
+    *out_len = (uint32_t)ret;
+    return 0;
+}
+```
+
+5.4 格式识别
+
+通过文件魔数识别压缩格式，实现透明解压。
+
+```c
+// compress/src/compress_detect.c
+
+#include <stdint.h>
+#include <string.h>
+
+#include "compress.h"
+
+/* ============================================================
+   常见的压缩格式魔数
+   ============================================================ */
+// gzip:   1F 8B
+// zlib:   78 01 / 78 9C / 78 DA
+// zstd:   28 B5 2F FD
+// xz:     FD 37 7A 58 5A 00
+// lz4 frame: 04 22 4D 18
+
+/* ============================================================
+   识别压缩算法
+   ============================================================ */
+compress_algo_t compress_detect(const uint8_t *data, uint32_t len) {
+    if (len < 4) {
+        return COMPRESS_ALGO_AUTO;
+    }
+
+    // zstd
+    if (data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD) {
+        return COMPRESS_ALGO_ZSTD;
+    }
+
+    // gzip
+    if (data[0] == 0x1F && data[1] == 0x8B) {
+        return COMPRESS_ALGO_GZIP;
+    }
+
+    // xz
+    if (data[0] == 0xFD && data[1] == 0x37) {
+        return COMPRESS_ALGO_XZ;
+    }
+
+    // lz4 frame
+    if (data[0] == 0x04 && data[1] == 0x22 && data[2] == 0x4D && data[3] == 0x18) {
+        return COMPRESS_ALGO_LZ4;
+    }
+
+    // zlib
+    if (data[0] == 0x78 && (data[1] == 0x01 || data[1] == 0x9C || data[1] == 0xDA)) {
+        return COMPRESS_ALGO_ZLIB;
+    }
+
+    return COMPRESS_ALGO_AUTO;
+}
+```
+
+5.5 IPC 消息处理
+
+```c
+// compress/src/compress_ipc.c
+
+#include <string.h>
+#include <stdlib.h>
+
+#include "compress.h"
+#include "compress_ipc.h"
+#include "compress_zlib.h"
+#include "compress_zstd.h"
+#include "compress_xz.h"
+#include "compress_lz4.h"
+#include "compress_detect.h"
+
+/* ============================================================
+   分派压缩调用
+   ============================================================ */
+static int compress_dispatch_compress(uint32_t algo, uint32_t level,
+                                      const uint8_t *in, uint32_t in_len,
+                                      uint8_t *out, uint32_t *out_len) {
+    switch (algo) {
+        case COMPRESS_ALGO_ZSTD:
+            return compress_zstd(level, in, in_len, out, *out_len, out_len);
+        case COMPRESS_ALGO_ZLIB:
+        case COMPRESS_ALGO_GZIP:
+            return compress_zlib(level, in, in_len, out, *out_len, out_len, algo);
+        case COMPRESS_ALGO_XZ:
+            return compress_xz(level, in, in_len, out, *out_len, out_len);
+        case COMPRESS_ALGO_LZ4:
+        case COMPRESS_ALGO_LZ4_RAW:
+            return compress_lz4_raw(in, in_len, out, *out_len, out_len);
+        default:
+            // 默认 zstd
+            return compress_zstd(level, in, in_len, out, *out_len, out_len);
+    }
+}
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void compress_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+
+    switch (msg_type) {
+        case COMPRESS_MSG_COMPRESS: {
+            compress_compress_req_t *req = (compress_compress_req_t *)data;
+            compress_compress_resp_t resp;
+            uint8_t *out;
+            uint32_t out_cap, out_len;
+
+            out_cap = req->in_len * 2 + 1024;   // 保守估算
+            out = malloc(out_cap);
+            if (!out) {
+                resp.error = -1;
+                ipc_reply(from_task, &resp, sizeof(resp));
+                break;
+            }
+
+            out_len = out_cap;
+            int ret = compress_dispatch_compress(req->algo, req->level,
+                                                 req->in, req->in_len,
+                                                 out, &out_len);
+            if (ret == 0) {
+                // 压缩后比原数据大则回退
+                if (out_len >= req->in_len) {
+                    memcpy(out, req->in, req->in_len);
+                    out_len = req->in_len;
+                }
+                memcpy(resp.compressed, out, out_len);
+                resp.compressed_len = out_len;
+                resp.orig_len = req->in_len;
+                resp.error = 0;
+            } else {
+                resp.error = ret;
+            }
+
+            free(out);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case COMPRESS_MSG_DECOMPRESS: {
+            compress_decompress_req_t *req = (compress_decompress_req_t *)data;
+            compress_decompress_resp_t resp;
+            compress_algo_t algo = compress_detect(req->in, req->in_len);
+            // ... 按 algo 分派解压
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        case COMPRESS_MSG_DETECT: {
+            compress_detect_req_t *req = (compress_detect_req_t *)data;
+            compress_detect_resp_t resp;
+            resp.algo = compress_detect(req->in, req->in_len);
+            resp.recognized = (resp.algo != COMPRESS_ALGO_AUTO);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+
+        default:
+            printk("HWRun COMPRESS: Unknown IPC message: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、常见压缩格式兼容
+
+COMPRESS 协议生成的 gzip/zlib 数据与标准实现完全兼容，可互相交换：
+
+```
+zlib  → .z          (compress/zlib 格式，常作容器)
+gzip  → .gz          (gzip 归档，兼容 gzip/tar.gz)
+zstd  → .zst         (zstd frame，自带字典支持)
+xz    → .xz          (liblzma，兼容 xz/tar.xz)
+lz4   → .lz4         (lz4 frame)
+```
+
+上层插件可直接把 COMPRESS 输出写入标准文件或经 FS_TRANSFER 传输，目标端可用任意标准工具或本协议解压。
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/compress.yml
+compress:
+  # 默认算法
+  default_algo: "zstd"
+  # 默认级别
+  default_level: "default"
+
+  # 场景默认
+  scene:
+    # 日志压缩
+    log:
+      algo: "lz4"
+      level: "fast"
+    # 传输压缩
+    transfer:
+      algo: "zstd"
+      level: "default"
+    # 归档/备份
+    archive:
+      algo: "xz"
+      level: "more"
+
+  # 行为
+  behavior:
+    # 压缩后不小于原数据时是否回退为原始存储
+    fallback_original: true
+    # 文件压缩时是否保留原文件
+    file_keep_original: true
+```
+
+八、命令行接口
+
+```bash
+# 算法列表
+hwrun compress algorithms
+
+# 缓冲压缩
+hwrun compress --algo zstd --level default --input plain.txt --output plain.zst
+hwrun compress --decompress --input plain.zst --output plain.txt
+
+# 自动识别解压
+hwrun compress -x plain.zst
+hwrun compress -x archive.tar.gz
+
+# 文件批量压缩
+hwrun compress --algo xz --level more --file data.bin
+hwrun compress --algo lz4 --fast --dir /var/log/
+
+# 压缩率
+hwrun compress --test benchmark.txt @
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+```yaml
+# plugins/compress/plugin.yml
+plugin:
+  id: "compress"
+  name: "Compression Protocol"
+  version: "1.0.0"
+  type: "userspace"
+
+  description: "HWRun OS 压缩协议，提供数据/文件/流压缩、解压与格式识别的统一抽象"
+
+  provides:
+    - protocol: "COMPRESS"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  params:
+    - key: "compress.default_algo"
+      type: "string"
+      default: "zstd"
+      description: "默认压缩算法"
+    - key: "compress.default_level"
+      type: "string"
+      default: "default"
+      description: "默认压缩级别"
+
+  files:
+    - "/usr/bin/hwrun-compressd"
+    - "/usr/lib/hwrun/libhwrun-compress.so"
+
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+9.2 构建脚本
+
+```makefile
+# compress/Makefile
+
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -fPIC
+LDLIBS := -lzstd -lz -llzma -llz4 -lpthread
+
+SRCS := src/compress.c src/compress_zlib.c src/compress_zstd.c \
+        src/compress_xz.c src/compress_lz4.c src/compress_detect.c \
+        src/compress_ipc.c
+OBJS := $(SRCS:.c=.o)
+
+all: hwrun-compressd libhwrun-compress.so
+
+hwrun-compressd: $(OBJS) src/main.o
+	$(CC) -o $@ $^ $(LDLIBS)
+
+libhwrun-compress.so: $(OBJS)
+	$(CC) -shared -o $@ $^ $(LDLIBS)
+
+%.o: %.c compress.h compress_ipc.h
+	$(CC) $(CFLAGS) -Iinclude -c $< -o $@
+
+clean:
+	rm -f $(OBJS) src/main.o hwrun-compressd libhwrun-compress.so
+
+install:
+	install -D -m 755 hwrun-compressd /usr/bin/
+	install -D -m 755 libhwrun-compress.so /usr/lib/hwrun/
+```
+
+9.3 安装后脚本
+
+```bash
+#!/bin/bash
+# compress/scripts/post_install.sh
+
+# 校验依赖库存在
+for lib in libzstd.so.1 libz.so.1 liblzma.so.5 liblz4.so.1; do
+    if ! ldconfig -p | grep -q "$lib"; then
+        echo "Warning: missing dependency $lib"
+    fi
+done
+
+echo "COMPRESS service installed successfully"
+```
+
+十、总结
+
+维度 决策
+定位 压缩协议，所有压缩/解压操作的统一入口
+实现方式 用户态服务 + 库封装 (zlib / libzstd / liblzma / lz4)
+代码量 ~1000-1500 行 C
+提供协议 COMPRESS (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG
+核心算法 zstd (默认)、deflate/gzip、xz、lz4
+关键功能 缓冲/文件/流式压缩解压、格式自动识别
+安全协同 可与 CRYPTO 组合实现"压缩+加密"或"加密+压缩"
+
+COMPRESS 是 HWRun OS 的压缩服务核心。它基于主流压缩库（zlib、libzstd、liblzma、lz4），通过 COMPRESS 协议向上层插件提供缓冲压缩、文件压缩、流式压缩、格式自动识别等完整的压缩能力，并为日志、传输、存储、归档等不同场景预设不同的算法与级别。上层插件（LOG、AUDIT、FS_TRANSFER、STORAGE、CLUSTER、PKGMGR 等）通过 COMPRESS 协议进行压缩/解压，不直接依赖具体压缩库。

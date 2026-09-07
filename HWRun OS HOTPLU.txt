@@ -1,0 +1,1102 @@
+﻿HWRun OS HOTPLUG 实现文档
+
+模块名称： HOTPLUG (Hotplug Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 热插拔协议，提供硬件设备动态插入/移除的检测、通知和管理功能
+实现语言： C（内核模块 + 用户态服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、STORAGE（存储后端）
+提供协议： HOTPLUG
+
+一、设计哲学
+
+1.1 核心定位
+
+HOTPLUG 是 HWRun OS 的热插拔管理核心——检测硬件设备的动态插入与移除，并通过标准化事件通知上层插件。
+
+```
+HOTPLUG = 热插拔协议 = 硬件动态变化事件的统一管理
+
+硬件事件 (设备插入/移除)
+    │
+    │  内核 uevent 通过 netlink 发送
+    ▼
+HOTPLUG 插件 (内核模块 + 用户态服务)
+    │
+    │  1. 接收 uevent 事件
+    │  2. 解析设备信息 (sysfs)
+    │  3. 匹配设备类型和策略
+    │  4. 触发对应的回调/通知
+    ▼
+上层插件 (STORAGE, DISPLAY, INPUT, NETWORK, ...)
+    │
+    │  根据设备类型执行相应操作
+    │  (挂载存储、配置显示、加载驱动、配置网络...)
+    ▼
+设备就绪
+```
+
+1.2 设计原则
+
+1. 事件驱动：所有热插拔操作基于内核 uevent 事件驱动
+2. 协议通知：设备变化通过 HOTPLUG 协议通知订阅者
+3. 设备分类：按设备类型（存储、显示、输入、网络等）分类处理
+4. 策略可配置：用户可通过配置文件定义不同设备的处理策略
+5. 热插拔安全：支持设备的优雅拔出（umount、关闭文件句柄等）
+
+1.3 Linux 热插拔机制
+
+HWRun OS 的 HOTPLUG 插件基于 Linux 内核的 uevent 机制实现。当设备状态发生变化时，内核会生成一个 uevent 事件，并通过 netlink 套接字发送给用户空间。
+
+uevent 事件类型：
+
+事件类型 说明
+add 设备被插入
+remove 设备被移除
+change 设备状态发生变化
+online 设备上线
+offline 设备离线
+
+uevent 事件流程：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Linux uevent 事件流程                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  硬件插入/移除                                                              │
+│      │                                                                      │
+│      ▼                                                                      │
+│  内核设备模型 (kobject)                                                     │
+│  └── kobject_uevent() 生成事件[reference:8]                                │
+│      │                                                                      │
+│      ▼                                                                      │
+│  send_uevent() 通过 netlink 发送[reference:9]                              │
+│      │                                                                      │
+│      ▼                                                                      │
+│  用户空间监听 (udevd / 自定义服务)                                           │
+│      │                                                                      │
+│      ▼                                                                      │
+│  执行 /sbin/hotplug (传统) 或 udev 规则[reference:10]                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.4 HOTPLUG 插件的本质
+
+HOTPLUG 插件 = Linux uevent 机制的 HWRun 协议封装 + 策略引擎 + 事件分发器
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HOTPLUG 插件架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  HOTPLUG 协议接口 (通过 IPC 调用)                                   │   │
+│  │  Subscribe / Unsubscribe / GetEvents / AckEvent / GetDevices       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  用户态事件管理器 (hwrun-hotplugd)                                  │   │
+│  │  ├── netlink 监听器 (接收 uevent)                                  │   │
+│  │  ├── 事件解析器 (解析 uevent 消息)                                  │   │
+│  │  ├── 设备分类器 (按类型/子系统分类)                                 │   │
+│  │  ├── 策略引擎 (匹配配置规则)                                        │   │
+│  │  ├── 事件分发器 (通知订阅者)                                        │   │
+│  │  └── 设备状态缓存                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核模块 (hotplug.ko)                                              │   │
+│  │  ├── uevent 钩子注册                                                │   │
+│  │  ├── 设备事件过滤                                                   │   │
+│  │  └── IPC 通信层                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (kobject / uevent / netlink)                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 HOTPLUG 插件的组成
+
+```
+HOTPLUG 插件
+├── 内核模块 (hotplug.ko)
+│   ├── 协议处理层
+│   │   ├── hotplug_ipc_handler()   ← IPC 消息分发
+│   │   ├── hotplug_subscribe()     ← 订阅事件
+│   │   ├── hotplug_unsubscribe()   ← 取消订阅
+│   │   └── hotplug_get_devices()   ← 获取设备列表
+│   ├── uevent 集成层
+│   │   ├── hotplug_uevent.c        ← uevent 接收
+│   │   └── hotplug_filter.c        ← 事件过滤
+│   └── 初始化/清理
+│       ├── hotplug_init()          ← 模块加载
+│       └── hotplug_exit()          ← 模块卸载
+│
+└── 用户态服务 (hwrun-hotplugd)
+    ├── netlink 监听器
+    │   └── hotplug_netlink.c       ← netlink 套接字监听
+    ├── 事件解析器
+    │   └── hotplug_parser.c        ← 解析 uevent 消息
+    ├── 设备分类器
+    │   └── hotplug_classifier.c    ← 按子系统/类型分类
+    ├── 策略引擎
+    │   └── hotplug_policy.c        ← 匹配配置规则
+    ├── 事件分发器
+    │   └── hotplug_dispatcher.c    ← 通知订阅者
+    └── 设备状态缓存
+        └── hotplug_cache.c         ← 设备信息缓存
+```
+
+2.2 HOTPLUG 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → HOTPLUG → 其他插件
+                                                                                                                              ↑
+                                                                                                                    HOTPLUG 在这里加载
+```
+
+HOTPLUG 插件在 CONSENSUS 之后加载，为系统提供热插拔事件管理能力。
+
+2.3 HOTPLUG 的上层消费者
+
+上层插件 需要 HOTPLUG 提供什么
+STORAGE (存储后端) USB 存储设备插入/移除事件
+DISPLAY (显示协议) 显示器插入/拔出事件
+INPUT (输入协议) 键盘/鼠标插入/移除事件
+NETWORK (网络协议) 网卡插入/拔出事件
+HAP (硬件抽象) 硬件设备枚举更新事件
+
+三、核心数据结构
+
+```c
+// hotplug/include/hotplug.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   热插拔事件类型 (对应内核 uevent)
+   ============================================================ */
+typedef enum {
+    HOTPLUG_EVENT_ADD = 0,          // 设备插入
+    HOTPLUG_EVENT_REMOVE,           // 设备移除
+    HOTPLUG_EVENT_CHANGE,           // 设备状态变化
+    HOTPLUG_EVENT_ONLINE,           // 设备上线
+    HOTPLUG_EVENT_OFFLINE,          // 设备离线
+    HOTPLUG_EVENT_BIND,             // 设备绑定驱动
+    HOTPLUG_EVENT_UNBIND,           // 设备解绑驱动
+} hotplug_event_type_t;
+
+/* ============================================================
+   设备子系统类型
+   ============================================================ */
+typedef enum {
+    HOTPLUG_SUBSYS_UNKNOWN = 0,
+    HOTPLUG_SUBSYS_USB,             // USB 设备
+    HOTPLUG_SUBSYS_PCI,             // PCI 设备
+    HOTPLUG_SUBSYS_SCSI,            // SCSI 设备
+    HOTPLUG_SUBSYS_NVME,            // NVMe 设备
+    HOTPLUG_SUBSYS_SATA,            // SATA 设备
+    HOTPLUG_SUBSYS_BLOCK,           // 块设备
+    HOTPLUG_SUBSYS_INPUT,           // 输入设备
+    HOTPLUG_SUBSYS_DRM,             // 显示设备
+    HOTPLUG_SUBSYS_NET,             // 网络设备
+    HOTPLUG_SUBSYS_GPIO,            // GPIO 设备
+    HOTPLUG_SUBSYS_I2C,             // I2C 设备
+    HOTPLUG_SUBSYS_SPI,             // SPI 设备
+} hotplug_subsys_t;
+
+/* ============================================================
+   设备信息
+   ============================================================ */
+typedef struct hotplug_device {
+    char path[256];                 // /sys 中的设备路径
+    char devnode[128];              // /dev 中的设备节点
+    char subsystem[64];             // 子系统名称
+    hotplug_subsys_t subsys_type;   // 子系统类型
+    char driver[64];                // 驱动名称
+    char model[128];                // 设备型号
+    char vendor[64];                // 厂商
+    char serial[64];                // 序列号
+    uint32_t vendor_id;             // 厂商 ID (USB/PCI)
+    uint32_t device_id;             // 设备 ID (USB/PCI)
+    int major;                      // 主设备号
+    int minor;                      // 次设备号
+    int online;                     // 是否在线
+    uint64_t discovered_at;         // 发现时间
+    struct hotplug_device *next;
+} hotplug_device_t;
+
+/* ============================================================
+   热插拔事件
+   ============================================================ */
+typedef struct hotplug_event {
+    uint64_t id;                    // 事件 ID
+    hotplug_event_type_t type;      // 事件类型
+    hotplug_device_t *device;       // 关联设备
+    uint64_t timestamp;             // 事件时间
+    char *envp[32];                 // 环境变量 (来自 uevent)
+    int envp_count;
+    struct hotplug_event *next;
+} hotplug_event_t;
+
+/* ============================================================
+   事件订阅
+   ============================================================ */
+typedef struct hotplug_subscription {
+    char id[64];                    // 订阅 ID
+    uint64_t task_id;               // 订阅者任务 ID
+    hotplug_subsys_t subsys_filter; // 子系统过滤器 (0=全部)
+    hotplug_event_type_t type_filter; // 事件类型过滤器 (0=全部)
+    char device_path[256];          // 设备路径过滤器 (可选)
+    int active;
+    struct hotplug_subscription *next;
+} hotplug_subscription_t;
+
+/* ============================================================
+   热插拔配置
+   ============================================================ */
+typedef struct hotplug_config {
+    int enabled;                    // 是否启用
+    int netlink_enabled;            // 是否启用 netlink 监听
+    int cache_ttl;                  // 设备缓存 TTL (秒)
+    int event_queue_size;           // 事件队列大小
+    char **ignore_subsystems;       // 忽略的子系统列表
+    int ignore_count;
+    struct {
+        char *subsystem;
+        char *action;               // 要执行的动作 (脚本/命令)
+    } rules[32];                    // 策略规则
+    int rule_count;
+} hotplug_config_t;
+
+/* ============================================================
+   HOTPLUG 上下文
+   ============================================================ */
+typedef struct hotplug_context {
+    int initialized;
+    uint64_t hotplug_task_id;       // HOTPLUG 自身的任务 ID
+    
+    hotplug_config_t config;
+    hotplug_device_t *devices;      // 设备缓存
+    uint32_t device_count;
+    hotplug_subscription_t *subscriptions;  // 订阅列表
+    hotplug_event_t *event_queue;   // 事件队列
+    
+    // netlink socket
+    int netlink_fd;
+    
+    void *lock;
+} hotplug_context_t;
+```
+
+四、HOTPLUG 协议定义
+
+```protobuf
+// protocols/hotplug.proto
+syntax = "proto3";
+
+package hwrun.hotplug;
+
+service Hotplug {
+    // === 事件订阅 ===
+    rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+    
+    // === 事件查询 ===
+    rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
+    rpc AckEvent(AckEventRequest) returns (AckEventResponse);
+    rpc WaitEvent(WaitEventRequest) returns (WaitEventResponse);
+    
+    // === 设备管理 ===
+    rpc GetDevices(GetDevicesRequest) returns (GetDevicesResponse);
+    rpc GetDeviceInfo(GetDeviceInfoRequest) returns (GetDeviceInfoResponse);
+}
+
+message Empty {}
+
+// ============ 事件订阅 ============
+
+message SubscribeRequest {
+    uint32 subsys_filter = 1;       // hotplug_subsys_t, 0=全部
+    uint32 type_filter = 2;         // hotplug_event_type_t, 0=全部
+    string device_path = 3;         // 可选，过滤特定设备
+}
+
+message SubscribeResponse {
+    string subscription_id = 1;
+    bool success = 2;
+    int32 error = 3;
+}
+
+message UnsubscribeRequest {
+    string subscription_id = 1;
+}
+
+message UnsubscribeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 事件查询 ============
+
+message GetEventsRequest {
+    string subscription_id = 1;
+    uint32 max_events = 2;
+    int32 timeout_ms = 3;           // -1 表示阻塞等待
+}
+
+message GetEventsResponse {
+    repeated HotplugEvent events = 1;
+    uint32 count = 2;
+    int32 error = 3;
+}
+
+message AckEventRequest {
+    uint64 event_id = 1;
+}
+
+message AckEventResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message WaitEventRequest {
+    string subscription_id = 1;
+    uint32 timeout_ms = 2;
+}
+
+message WaitEventResponse {
+    HotplugEvent event = 1;
+    bool has_event = 2;
+    int32 error = 3;
+}
+
+// ============ 数据结构 ============
+
+message HotplugEvent {
+    uint64 id = 1;
+    uint32 type = 2;                // hotplug_event_type_t
+    uint64 timestamp = 3;
+    HotplugDevice device = 4;
+    map<string, string> env = 5;    // uevent 环境变量
+}
+
+message HotplugDevice {
+    string path = 1;                // /sys 路径
+    string devnode = 2;             // /dev 节点
+    string subsystem = 3;
+    uint32 subsys_type = 4;         // hotplug_subsys_t
+    string driver = 5;
+    string model = 6;
+    string vendor = 7;
+    string serial = 8;
+    uint32 vendor_id = 9;
+    uint32 device_id = 10;
+    int32 major = 11;
+    int32 minor = 12;
+    bool online = 13;
+    uint64 discovered_at = 14;
+}
+
+// ============ 设备管理 ============
+
+message GetDevicesRequest {
+    uint32 subsys_filter = 1;       // 可选
+    bool online_only = 2;
+}
+
+message GetDevicesResponse {
+    repeated HotplugDevice devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetDeviceInfoRequest {
+    string devnode = 1;             // /dev/sda, /dev/input/event0
+}
+
+message GetDeviceInfoResponse {
+    HotplugDevice device = 1;
+    int32 error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 内核模块初始化和加载
+
+```c
+// hotplug/src/hotplug.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/netlink.h>
+#include <linux/socket.h>
+#include <linux/kobject.h>
+#include <linux/kobject_uevent.h>
+#include <net/sock.h>
+
+#include "hotplug.h"
+#include "hotplug_ipc.h"
+#include "hotplug_uevent.h"
+#include "hotplug_filter.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Hotplug Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static hotplug_context_t g_hotplug_ctx = {0};
+static struct sock *g_uevent_sock = NULL;
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init hotplug_init(void) {
+    int ret;
+    struct netlink_kernel_cfg cfg = {
+        .groups = 1,                // 监听 uevent 组播组
+        .flags = NL_CFG_F_NONROOT_RECV,
+    };
+    
+    printk(KERN_INFO "HWRun HOTPLUG: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_hotplug_ctx, 0, sizeof(hotplug_context_t));
+    
+    // 2. 创建 netlink 套接字监听 uevent
+    g_uevent_sock = netlink_kernel_create(&init_net, NETLINK_KOBJECT_UEVENT, &cfg);
+    if (!g_uevent_sock) {
+        printk(KERN_WARNING "HWRun HOTPLUG: Failed to create netlink socket\n");
+        // 非致命错误，继续运行
+    } else {
+        printk(KERN_INFO "HWRun HOTPLUG: Netlink socket created\n");
+    }
+    
+    // 3. 注册 IPC 消息处理器
+    ret = hotplug_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun HOTPLUG: Failed to register IPC handler\n");
+        if (g_uevent_sock) {
+            netlink_kernel_release(g_uevent_sock);
+        }
+        return ret;
+    }
+    
+    // 4. 注册 HOTPLUG 协议
+    hotplug_register_protocol();
+    
+    g_hotplug_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun HOTPLUG: Initialized successfully\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit hotplug_exit(void) {
+    printk(KERN_INFO "HWRun HOTPLUG: Exiting...\n");
+    
+    hotplug_ipc_unregister();
+    
+    if (g_uevent_sock) {
+        netlink_kernel_release(g_uevent_sock);
+    }
+    
+    g_hotplug_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun HOTPLUG: Exited\n");
+}
+
+module_init(hotplug_init);
+module_exit(hotplug_exit);
+```
+
+5.2 netlink 事件接收
+
+```c
+// hotplug/src/hotplug_uevent.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
+#include <linux/kobject_uevent.h>
+#include <net/sock.h>
+
+#include "hotplug.h"
+#include "hotplug_uevent.h"
+#include "hotplug_ipc.h"
+
+/* ============================================================
+   uevent 事件解析
+   ============================================================ */
+static int hotplug_parse_uevent(const char *buf, size_t len,
+                                 char **action, char **path,
+                                 char *envp[], int *envp_count) {
+    const char *p = buf;
+    const char *end = buf + len;
+    int count = 0;
+    char *action_str = NULL;
+    char *path_str = NULL;
+    
+    // uevent 格式: "ACTION@/sys/path"
+    // 或者: "ACTION@/sys/path\0KEY=value\0..."
+    
+    // 解析 action@path
+    while (p < end && *p != '@') {
+        p++;
+    }
+    if (p < end) {
+        // 找到 action
+        int action_len = p - buf;
+        if (action_len > 0) {
+            action_str = kmalloc(action_len + 1, GFP_KERNEL);
+            if (action_str) {
+                memcpy(action_str, buf, action_len);
+                action_str[action_len] = '\0';
+            }
+        }
+        p++; // 跳过 '@'
+        
+        // 找到 path (到 '\0' 或换行)
+        const char *path_start = p;
+        while (p < end && *p != '\0' && *p != '\n') {
+            p++;
+        }
+        if (p > path_start) {
+            int path_len = p - path_start;
+            path_str = kmalloc(path_len + 1, GFP_KERNEL);
+            if (path_str) {
+                memcpy(path_str, path_start, path_len);
+                path_str[path_len] = '\0';
+            }
+        }
+    }
+    
+    // 解析环境变量 (KEY=value)
+    while (p < end && count < 31) {
+        // 跳过 '\0'
+        while (p < end && *p == '\0') {
+            p++;
+        }
+        if (p >= end) break;
+        
+        const char *kv_start = p;
+        while (p < end && *p != '\0') {
+            p++;
+        }
+        if (p > kv_start) {
+            int kv_len = p - kv_start;
+            envp[count] = kmalloc(kv_len + 1, GFP_KERNEL);
+            if (envp[count]) {
+                memcpy(envp[count], kv_start, kv_len);
+                envp[count][kv_len] = '\0';
+                count++;
+            }
+        }
+    }
+    
+    *action = action_str;
+    *path = path_str;
+    *envp_count = count;
+    
+    return 0;
+}
+
+/* ============================================================
+   uevent 事件处理 (由 netlink 回调调用)
+   ============================================================ */
+void hotplug_handle_uevent(struct sk_buff *skb) {
+    char *data;
+    size_t len;
+    char *action = NULL;
+    char *path = NULL;
+    char *envp[32] = {0};
+    int envp_count = 0;
+    
+    // 获取数据
+    data = nlmsg_data(nlmsg_hdr(skb));
+    len = nlmsg_len(nlmsg_hdr(skb));
+    
+    if (!data || len < 2) {
+        return;
+    }
+    
+    // 解析 uevent
+    hotplug_parse_uevent(data, len, &action, &path, envp, &envp_count);
+    
+    if (action && path) {
+        // 通过 IPC 通知用户态服务
+        hotplug_ipc_notify_uevent(action, path, (const char **)envp, envp_count);
+        
+        printk(KERN_DEBUG "HWRun HOTPLUG: uevent: %s @ %s\n", action, path);
+    }
+    
+    // 清理
+    if (action) kfree(action);
+    if (path) kfree(path);
+    for (int i = 0; i < envp_count; i++) {
+        if (envp[i]) kfree(envp[i]);
+    }
+}
+```
+
+5.3 用户态 netlink 监听器
+
+```c
+// hotplug/userspace/hotplug_netlink.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/socket.h>
+#include <linux/kobject_uevent.h>
+
+#include "hotplug.h"
+#include "hotplug_netlink.h"
+
+#define NETLINK_BUFFER_SIZE 4096
+
+/* ============================================================
+   创建 netlink 套接字
+   ============================================================ */
+int hotplug_netlink_create(void) {
+    int fd;
+    struct sockaddr_nl addr;
+    int ret;
+    
+    // 创建 netlink 套接字
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+    
+    // 绑定地址
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_groups = 1;  // 加入 uevent 组播组
+    addr.nl_pid = getpid();
+    
+    ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+    
+    return fd;
+}
+
+/* ============================================================
+   接收 uevent 事件
+   ============================================================ */
+int hotplug_netlink_recv(int fd, hotplug_event_t *out_event) {
+    char buf[NETLINK_BUFFER_SIZE];
+    struct nlmsghdr *nlh;
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+    ssize_t n;
+    int ret;
+    
+    // 接收数据
+    n = recvmsg(fd, &msg, 0);
+    if (n < 0) {
+        return -1;
+    }
+    
+    // 解析 netlink 消息
+    nlh = (struct nlmsghdr *)buf;
+    
+    // 检查消息类型
+    if (nlh->nlmsg_type == 0x11) {  // UEVENT 消息
+        char *data = NLMSG_DATA(nlh);
+        size_t len = nlh->nlmsg_len - NLMSG_HDRLEN;
+        
+        // 解析 uevent 数据
+        // 格式: "ACTION@/sys/path\0KEY=value\0..."
+        char *p = data;
+        char *end = data + len;
+        
+        // 提取 action@path
+        char *at = strchr(p, '@');
+        if (at) {
+            *at = '\0';
+            out_event->action = strdup(p);
+            p = at + 1;
+            
+            // 提取 path (到第一个 '\0')
+            out_event->path = strdup(p);
+        }
+        
+        // 解析环境变量
+        int count = 0;
+        p = data + strlen(data) + 1;
+        while (p < end && count < 31) {
+            char *kv = strdup(p);
+            if (kv) {
+                out_event->envp[count] = kv;
+                out_event->envp_count++;
+                count++;
+            }
+            p += strlen(p) + 1;
+        }
+        
+        out_event->timestamp = time(NULL);
+        return 0;
+    }
+    
+    return -1;
+}
+```
+
+5.4 设备分类与策略引擎
+
+```c
+// hotplug/userspace/hotplug_classifier.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "hotplug.h"
+#include "hotplug_classifier.h"
+
+/* ============================================================
+   根据子系统名称分类
+   ============================================================ */
+hotplug_subsys_t hotplug_classify_subsystem(const char *subsystem) {
+    if (!subsystem) return HOTPLUG_SUBSYS_UNKNOWN;
+    
+    if (strcmp(subsystem, "usb") == 0) return HOTPLUG_SUBSYS_USB;
+    if (strcmp(subsystem, "pci") == 0) return HOTPLUG_SUBSYS_PCI;
+    if (strcmp(subsystem, "scsi") == 0) return HOTPLUG_SUBSYS_SCSI;
+    if (strcmp(subsystem, "nvme") == 0) return HOTPLUG_SUBSYS_NVME;
+    if (strcmp(subsystem, "block") == 0) return HOTPLUG_SUBSYS_BLOCK;
+    if (strcmp(subsystem, "input") == 0) return HOTPLUG_SUBSYS_INPUT;
+    if (strcmp(subsystem, "drm") == 0) return HOTPLUG_SUBSYS_DRM;
+    if (strcmp(subsystem, "net") == 0) return HOTPLUG_SUBSYS_NET;
+    if (strcmp(subsystem, "gpio") == 0) return HOTPLUG_SUBSYS_GPIO;
+    if (strcmp(subsystem, "i2c") == 0) return HOTPLUG_SUBSYS_I2C;
+    if (strcmp(subsystem, "spi") == 0) return HOTPLUG_SUBSYS_SPI;
+    
+    return HOTPLUG_SUBSYS_UNKNOWN;
+}
+
+/* ============================================================
+   获取设备详细信息 (从 sysfs)
+   ============================================================ */
+int hotplug_get_device_info(const char *sysfs_path, hotplug_device_t *dev) {
+    char path[512];
+    FILE *fp;
+    char line[256];
+    
+    memset(dev, 0, sizeof(hotplug_device_t));
+    strncpy(dev->path, sysfs_path, sizeof(dev->path) - 1);
+    
+    // 读取设备名 (uevent 文件)
+    snprintf(path, sizeof(path), "%s/uevent", sysfs_path);
+    fp = fopen(path, "r");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            char *key = strtok(line, "=");
+            char *value = strtok(NULL, "\n");
+            if (key && value) {
+                if (strcmp(key, "DEVNAME") == 0) {
+                    strncpy(dev->devnode, value, sizeof(dev->devnode) - 1);
+                } else if (strcmp(key, "SUBSYSTEM") == 0) {
+                    strncpy(dev->subsystem, value, sizeof(dev->subsystem) - 1);
+                    dev->subsys_type = hotplug_classify_subsystem(value);
+                } else if (strcmp(key, "DRIVER") == 0) {
+                    strncpy(dev->driver, value, sizeof(dev->driver) - 1);
+                } else if (strcmp(key, "MODALIAS") == 0) {
+                    // 解析 modalias 获取 vendor/device ID
+                    // ...
+                }
+            }
+        }
+        fclose(fp);
+    }
+    
+    // 读取设备型号 (product 文件)
+    snprintf(path, sizeof(path), "%s/product", sysfs_path);
+    fp = fopen(path, "r");
+    if (fp) {
+        if (fgets(dev->model, sizeof(dev->model), fp)) {
+            // 去除换行
+            char *nl = strchr(dev->model, '\n');
+            if (nl) *nl = '\0';
+        }
+        fclose(fp);
+    }
+    
+    // 读取厂商 (manufacturer 文件)
+    snprintf(path, sizeof(path), "%s/manufacturer", sysfs_path);
+    fp = fopen(path, "r");
+    if (fp) {
+        if (fgets(dev->vendor, sizeof(dev->vendor), fp)) {
+            char *nl = strchr(dev->vendor, '\n');
+            if (nl) *nl = '\0';
+        }
+        fclose(fp);
+    }
+    
+    dev->online = 1;
+    dev->discovered_at = time(NULL);
+    
+    return 0;
+}
+```
+
+5.5 事件分发与通知
+
+```c
+// hotplug/userspace/hotplug_dispatcher.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "hotplug.h"
+#include "hotplug_dispatcher.h"
+#include "hotplug_ipc.h"
+
+/* ============================================================
+   事件分发到所有订阅者
+   ============================================================ */
+int hotplug_dispatch_event(hotplug_context_t *ctx, hotplug_event_t *event) {
+    hotplug_subscription_t *sub = ctx->subscriptions;
+    int count = 0;
+    
+    while (sub) {
+        if (!sub->active) {
+            sub = sub->next;
+            continue;
+        }
+        
+        // 检查子系统过滤器
+        if (sub->subsys_filter != 0 &&
+            event->device->subsys_type != sub->subsys_filter) {
+            sub = sub->next;
+            continue;
+        }
+        
+        // 检查事件类型过滤器
+        if (sub->type_filter != 0 &&
+            event->type != sub->type_filter) {
+            sub = sub->next;
+            continue;
+        }
+        
+        // 检查设备路径过滤器
+        if (sub->device_path[0] != '\0' &&
+            strstr(event->device->path, sub->device_path) == NULL) {
+            sub = sub->next;
+            continue;
+        }
+        
+        // 通过 IPC 发送事件到订阅者
+        hotplug_ipc_send_event(sub->task_id, event);
+        count++;
+        
+        sub = sub->next;
+    }
+    
+    return count;
+}
+
+/* ============================================================
+   策略引擎 - 根据配置执行动作
+   ============================================================ */
+int hotplug_apply_policy(hotplug_context_t *ctx, hotplug_event_t *event) {
+    hotplug_config_t *cfg = &ctx->config;
+    
+    for (int i = 0; i < cfg->rule_count; i++) {
+        // 检查子系统匹配
+        if (cfg->rules[i].subsystem &&
+            strcmp(cfg->rules[i].subsystem, event->device->subsystem) != 0) {
+            continue;
+        }
+        
+        // 执行动作
+        if (cfg->rules[i].action) {
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd), "%s %s %s",
+                     cfg->rules[i].action,
+                     event->device->devnode,
+                     event->device->path);
+            
+            // 执行命令 (后台运行)
+            if (fork() == 0) {
+                system(cmd);
+                exit(0);
+            }
+        }
+    }
+    
+    return 0;
+}
+```
+
+5.6 策略配置
+
+```yaml
+# /etc/hwrun/hotplug.yml
+hotplug:
+  # 全局启用
+  enabled: true
+  
+  # 事件队列大小
+  event_queue_size: 1024
+  
+  # 忽略的子系统 (不处理这些设备的热插拔)
+  ignore_subsystems:
+    - "power_supply"
+    - "thermal"
+  
+  # 策略规则 (按顺序匹配)
+  rules:
+    # USB 存储设备 → 自动挂载
+    - subsystem: "block"
+      action: "/usr/lib/hwrun/hotplug/mount-storage.sh"
+    
+    # 输入设备 → 自动加载驱动
+    - subsystem: "input"
+      action: "/usr/lib/hwrun/hotplug/load-input.sh"
+    
+    # 显示设备 → 自动配置显示
+    - subsystem: "drm"
+      action: "/usr/lib/hwrun/hotplug/configure-display.sh"
+    
+    # 网络设备 → 自动配置网络
+    - subsystem: "net"
+      action: "/usr/lib/hwrun/hotplug/configure-network.sh"
+```
+
+六、命令行接口
+
+```bash
+# 事件订阅
+hwrun hotplug subscribe
+hwrun hotplug subscribe --subsys block
+hwrun hotplug subscribe --type add
+
+# 查看事件
+hwrun hotplug events
+hwrun hotplug events --wait
+hwrun hotplug events --max 10
+
+# 设备管理
+hwrun hotplug devices
+hwrun hotplug devices --subsys usb
+hwrun hotplug device-info /dev/sda
+hwrun hotplug device-info /dev/input/event0
+
+# 策略管理
+hwrun hotplug policy list
+hwrun hotplug policy add --subsys block --action /path/to/script
+hwrun hotplug policy remove --id 1
+```
+
+七、构建与安装
+
+7.1 插件描述文件
+
+```yaml
+# plugins/hotplug/plugin.yml
+plugin:
+  id: "hotplug"
+  name: "Hotplug Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 热插拔协议，提供硬件设备动态插入/移除的检测、通知和管理功能"
+  
+  provides:
+    - protocol: "HOTPLUG"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+  
+  params:
+    - key: "hotplug.enabled"
+      type: "bool"
+      default: true
+      description: "是否启用热插拔"
+    - key: "hotplug.event_queue_size"
+      type: "int"
+      default: 1024
+      description: "事件队列大小"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/hotplug.ko"
+    - "/usr/bin/hwrun-hotplugd"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+7.2 构建脚本
+
+```makefile
+# hotplug/Makefile
+
+obj-m += hotplug.o
+
+hotplug-objs := hotplug.o hotplug_uevent.o hotplug_filter.o hotplug_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 hotplug.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-hotplugd /usr/bin/
+```
+
+八、总结
+
+维度 决策
+定位 热插拔协议，硬件动态变化的统一管理入口
+实现方式 Linux 内核模块 + 用户态服务，基于 uevent/netlink
+代码量 ~1000-1500 行 C
+提供协议 HOTPLUG (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP
+核心技术 uevent、netlink、sysfs、策略引擎
+关键功能 事件订阅、设备发现、策略匹配、事件分发
+
+HOTPLUG 是 HWRun OS 中热插拔管理的核心插件。它基于 Linux 内核的 uevent/netlink 机制，通过 HOTPLUG 协议向上层插件提供设备动态插入/移除事件的订阅、分发和管理功能。上层插件（STORAGE、DISPLAY、INPUT、NETWORK 等）通过 HOTPLUG 协议订阅设备事件，在设备插入或移除时执行相应的操作（挂载存储、配置显示、加载驱动等），实现真正的"即插即用"体验。

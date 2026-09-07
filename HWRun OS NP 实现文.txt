@@ -1,0 +1,1172 @@
+﻿HWRun OS NP 实现文档
+
+模块名称： NP (Network Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 网络协议，提供对 socket、TCP/UDP、网络接口等网络功能的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、PMP（进程管理）
+提供协议： NP
+
+一、设计哲学
+
+1.1 核心定位
+
+NP 是 HWRun OS 的网络核心——所有与 socket、TCP/UDP、网络接口相关的操作都通过 NP 协议进行。
+
+```
+NP = 网络协议 = 所有网络操作 (HAP) 的统一入口
+
+上层插件 (CLUSTER, FS_TRANSFER, NODE_DISCOVERY, ...)
+    │
+    │  通过 NP 协议进行网络通信
+    ▼
+NP 插件 (内核模块)
+    │
+    │  直接操作内核网络栈
+    ▼
+Linux 内核 (Socket / TCP/IP 协议栈)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有网络操作通过 NP 协议进行
+2. 内核实现：NP 插件运行在内核态，直接操作 socket
+3. 标准接口：暴露 socket/bind/listen/accept/connect/send/recv 等标准 BSD socket 接口
+4. 多协议支持：支持 TCP、UDP、RAW、UNIX 域 socket
+5. 异步通知：支持非阻塞和事件驱动
+6. 多网络接口：支持多个网络接口的管理
+
+1.3 NP 插件的本质
+
+NP 插件 = Linux 内核网络栈的 HWRun 协议封装
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         NP 插件架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  NP 协议接口 (通过 IPC 调用)                                        │   │
+│  │  Socket / Bind / Listen / Accept / Connect / Send / Recv / Close  │   │
+│  │  GetInterface / SetMtu / GetRouteTable / AddRoute / GetStats      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层 (将 NP 协议调用转换为内核 socket 操作)                   │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 权限检查                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核功能封装 (直接操作 Linux 内核网络栈)                            │   │
+│  │  ├── socket: sock_create() / sock_release()                       │   │
+│  │  ├── bind: kernel_bind()                                          │   │
+│  │  ├── listen: kernel_listen()                                      │   │
+│  │  ├── accept: kernel_accept()                                      │   │
+│  │  ├── connect: kernel_connect()                                    │   │
+│  │  ├── send: kernel_sendmsg()                                       │   │
+│  │  └── recv: kernel_recvmsg()                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (Socket / TCP/IP 协议栈)                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 NP 插件的组成
+
+```
+NP 插件 (np.ko)
+├── 协议处理层
+│   ├── np_ipc_handler()       ← IPC 消息分发
+│   ├── np_socket()            ← 创建 socket
+│   ├── np_bind()              ← 绑定地址
+│   ├── np_listen()            ← 监听连接
+│   ├── np_accept()            ← 接受连接
+│   ├── np_connect()           ← 连接服务器
+│   ├── np_send()              ← 发送数据
+│   ├── np_recv()              ← 接收数据
+│   ├── np_close()             ← 关闭 socket
+│   ├── np_get_interface()     ← 获取网络接口
+│   ├── np_set_mtu()           ← 设置 MTU
+│   ├── np_get_route_table()   ← 获取路由表
+│   ├── np_add_route()         ← 添加路由
+│   └── np_get_stats()         ← 获取统计信息
+│
+├── socket 管理
+│   ├── np_socket.c            ← socket 操作
+│   ├── np_tcp.c               ← TCP 专用操作
+│   └── np_udp.c               ← UDP 专用操作
+│
+├── 网络接口管理
+│   └── np_interface.c         ← 网络接口管理
+│
+├── 路由管理
+│   └── np_route.c             ← 路由表管理
+│
+└── 初始化/清理
+    ├── np_init()              ← 模块加载
+    └── np_exit()              ← 模块卸载
+```
+
+2.2 NP 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → 其他插件
+                                                                                    ↑
+                                                                           NP 在这里加载
+```
+
+NP 是第四个加载的硬件相关插件。在它之后，依赖网络的插件（CLUSTER、FS_TRANSFER、NODE_DISCOVERY 等）才能正常工作。
+
+2.3 NP 的上层消费者
+
+上层插件 需要 NP 提供什么
+CLUSTER (集群管理) 节点间通信、心跳
+FS_TRANSFER (文件传输) 跨节点文件传输
+NODE_DISCOVERY (节点发现) UDP 广播/mDNS
+CONSENSUS (共识协议) Raft/Paxos 网络通信
+CROSS_REGION (跨地域) 中继连接
+
+三、核心数据结构
+
+```c
+// np/include/np.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   Socket 类型 (对应 Linux socket 类型)
+   ============================================================ */
+#define NP_SOCK_STREAM          1
+#define NP_SOCK_DGRAM           2
+#define NP_SOCK_RAW             3
+#define NP_SOCK_RDM             4
+#define NP_SOCK_SEQPACKET       5
+
+/* ============================================================
+   Socket 协议族 (对应 Linux 协议族)
+   ============================================================ */
+#define NP_AF_UNIX              1
+#define NP_AF_INET              2
+#define NP_AF_INET6             10
+
+/* ============================================================
+   Socket 状态
+   ============================================================ */
+typedef enum {
+    NP_SOCK_UNCONNECTED = 0,
+    NP_SOCK_CONNECTING,
+    NP_SOCK_CONNECTED,
+    NP_SOCK_DISCONNECTING,
+    NP_SOCK_LISTENING,
+} np_sock_state_t;
+
+/* ============================================================
+   Socket 描述符
+   ============================================================ */
+typedef struct np_socket {
+    int32_t fd;                 // 内核 socket 文件描述符
+    int32_t domain;             // 协议族 (AF_INET, AF_UNIX, ...)
+    int32_t type;               // socket 类型 (SOCK_STREAM, SOCK_DGRAM, ...)
+    int32_t protocol;           // 协议 (IPPROTO_TCP, IPPROTO_UDP, ...)
+    np_sock_state_t state;
+    uint32_t local_ip;
+    uint32_t local_port;
+    uint32_t remote_ip;
+    uint32_t remote_port;
+    uint64_t owner_task_id;     // 拥有者任务 ID
+    struct np_socket *next;
+} np_socket_t;
+
+/* ============================================================
+   网络接口
+   ============================================================ */
+typedef struct np_interface {
+    char name[16];              // "eth0", "wlan0"
+    char mac[6];                // MAC 地址
+    uint32_t ipv4;              // IPv4 地址
+    uint32_t netmask;           // 子网掩码
+    uint32_t gateway;           // 网关
+    uint32_t ipv6[4];           // IPv6 地址
+    uint32_t mtu;               // MTU
+    int up;                     // 是否启用
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    struct np_interface *next;
+} np_interface_t;
+
+/* ============================================================
+   路由表项
+   ============================================================ */
+typedef struct np_route {
+    uint32_t dest;              // 目标网络
+    uint32_t mask;              // 子网掩码
+    uint32_t gateway;           // 网关
+    uint32_t metric;            // 度量值
+    char iface[16];             // 出口接口
+    struct np_route *next;
+} np_route_t;
+
+/* ============================================================
+   NP 上下文
+   ============================================================ */
+typedef struct np_context {
+    int initialized;
+    uint64_t np_task_id;        // NP 自身的任务 ID
+    
+    np_socket_t *sockets;       // socket 列表
+    np_interface_t *interfaces; // 网络接口列表
+    np_route_t *routes;         // 路由表
+    
+    void *lock;
+} np_context_t;
+```
+
+四、NP 协议定义
+
+```protobuf
+// protocols/np.proto
+syntax = "proto3";
+
+package hwrun.np;
+
+service Network {
+    // === Socket 操作 ===
+    rpc Socket(SocketRequest) returns (SocketResponse);
+    rpc Bind(BindRequest) returns (BindResponse);
+    rpc Listen(ListenRequest) returns (ListenResponse);
+    rpc Accept(AcceptRequest) returns (AcceptResponse);
+    rpc Connect(ConnectRequest) returns (ConnectResponse);
+    rpc Send(SendRequest) returns (SendResponse);
+    rpc Recv(RecvRequest) returns (RecvResponse);
+    rpc Close(CloseRequest) returns (CloseResponse);
+    
+    // === 网络接口 ===
+    rpc GetInterface(GetInterfaceRequest) returns (GetInterfaceResponse);
+    rpc SetMtu(SetMtuRequest) returns (SetMtuResponse);
+    rpc SetInterfaceUp(SetInterfaceUpRequest) returns (SetInterfaceUpResponse);
+    
+    // === 路由管理 ===
+    rpc GetRouteTable(Empty) returns (GetRouteTableResponse);
+    rpc AddRoute(AddRouteRequest) returns (AddRouteResponse);
+    rpc DelRoute(DelRouteRequest) returns (DelRouteResponse);
+    
+    // === 统计信息 ===
+    rpc GetStats(Empty) returns (GetStatsResponse);
+}
+
+message Empty {}
+
+// ============ Socket 操作 ============
+
+message SocketRequest {
+    int32 domain = 1;               // AF_INET, AF_UNIX, etc.
+    int32 type = 2;                 // SOCK_STREAM, SOCK_DGRAM, etc.
+    int32 protocol = 3;             // IPPROTO_TCP, IPPROTO_UDP, etc.
+}
+
+message SocketResponse {
+    int32 fd = 1;
+    int32 error = 2;
+}
+
+message BindRequest {
+    int32 fd = 1;
+    uint32 ip = 2;
+    uint32 port = 3;
+}
+
+message BindResponse {
+    int32 error = 1;
+}
+
+message ListenRequest {
+    int32 fd = 1;
+    int32 backlog = 2;
+}
+
+message ListenResponse {
+    int32 error = 1;
+}
+
+message AcceptRequest {
+    int32 fd = 1;
+    bool blocking = 2;
+}
+
+message AcceptResponse {
+    int32 new_fd = 1;
+    uint32 remote_ip = 2;
+    uint32 remote_port = 3;
+    int32 error = 4;
+}
+
+message ConnectRequest {
+    int32 fd = 1;
+    uint32 ip = 2;
+    uint32 port = 3;
+}
+
+message ConnectResponse {
+    int32 error = 1;
+}
+
+message SendRequest {
+    int32 fd = 1;
+    bytes data = 2;
+    int32 flags = 3;
+}
+
+message SendResponse {
+    uint64 sent = 1;
+    int32 error = 2;
+}
+
+message RecvRequest {
+    int32 fd = 1;
+    uint32 max_len = 2;
+    int32 flags = 3;
+}
+
+message RecvResponse {
+    bytes data = 1;
+    uint64 received = 2;
+    uint32 remote_ip = 3;
+    uint32 remote_port = 4;
+    int32 error = 5;
+}
+
+message CloseRequest {
+    int32 fd = 1;
+}
+
+message CloseResponse {
+    int32 error = 1;
+}
+
+// ============ 网络接口 ============
+
+message GetInterfaceRequest {
+    string name = 1;
+}
+
+message GetInterfaceResponse {
+    string name = 1;
+    string mac = 2;
+    uint32 ipv4 = 3;
+    uint32 netmask = 4;
+    uint32 gateway = 5;
+    bytes ipv6 = 6;
+    uint32 mtu = 7;
+    bool up = 8;
+    uint64 rx_bytes = 9;
+    uint64 tx_bytes = 10;
+    int32 error = 11;
+}
+
+message SetMtuRequest {
+    string name = 1;
+    uint32 mtu = 2;
+}
+
+message SetMtuResponse {
+    int32 error = 1;
+}
+
+message SetInterfaceUpRequest {
+    string name = 1;
+    bool up = 2;
+}
+
+message SetInterfaceUpResponse {
+    int32 error = 1;
+}
+
+// ============ 路由管理 ============
+
+message RouteEntry {
+    uint32 dest = 1;
+    uint32 mask = 2;
+    uint32 gateway = 3;
+    uint32 metric = 4;
+    string iface = 5;
+}
+
+message GetRouteTableResponse {
+    repeated RouteEntry routes = 1;
+    int32 error = 2;
+}
+
+message AddRouteRequest {
+    RouteEntry route = 1;
+}
+
+message AddRouteResponse {
+    int32 error = 1;
+}
+
+message DelRouteRequest {
+    uint32 dest = 1;
+    uint32 mask = 2;
+}
+
+message DelRouteResponse {
+    int32 error = 1;
+}
+
+// ============ 统计信息 ============
+
+message GetStatsResponse {
+    uint64 tcp_connections = 1;
+    uint64 udp_packets = 2;
+    uint64 rx_bytes = 3;
+    uint64 tx_bytes = 4;
+    uint64 rx_packets = 5;
+    uint64 tx_packets = 6;
+    uint64 rx_errors = 7;
+    uint64 tx_errors = 8;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// np/src/np.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/socket.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/if.h>
+#include <linux/route.h>
+#include <linux/rtnetlink.h>
+#include <linux/slab.h>
+#include <net/sock.h>
+#include <net/ip.h>
+#include <net/tcp.h>
+#include <net/udp.h>
+
+#include "np.h"
+#include "np_ipc.h"
+#include "np_socket.h"
+#include "np_interface.h"
+#include "np_route.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Network Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static np_context_t g_np_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init np_init(void) {
+    printk(KERN_INFO "HWRun NP: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_np_ctx, 0, sizeof(np_context_t));
+    
+    // 2. 获取网络接口列表
+    np_interface_probe(&g_np_ctx.interfaces);
+    
+    // 3. 获取路由表
+    np_route_probe(&g_np_ctx.routes);
+    
+    // 4. 注册 IPC 消息处理器
+    int ret = np_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun NP: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 5. 注册 NP 协议（通过 METAPROTO - 通过 IPC）
+    np_register_protocol();
+    
+    g_np_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun NP: Initialized successfully\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit np_exit(void) {
+    printk(KERN_INFO "HWRun NP: Exiting...\n");
+    
+    np_ipc_unregister();
+    
+    // 清理 socket 列表
+    // 清理接口列表
+    // 清理路由表
+    
+    g_np_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun NP: Exited\n");
+}
+
+module_init(np_init);
+module_exit(np_exit);
+```
+
+5.2 Socket 操作
+
+```c
+// np/src/np_socket.c
+
+#include <linux/kernel.h>
+#include <linux/socket.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <net/sock.h>
+
+#include "np.h"
+#include "np_ipc.h"
+
+/* ============================================================
+   创建 Socket
+   ============================================================ */
+int np_socket(int32_t domain, int32_t type, int32_t protocol, int32_t *out_fd) {
+    struct socket *sock;
+    int ret;
+    
+    ret = sock_create(domain, type, protocol, &sock);
+    if (ret < 0) {
+        *out_fd = -1;
+        return ret;
+    }
+    
+    // 获取文件描述符
+    ret = sock_map_fd(sock, 0);
+    if (ret < 0) {
+        sock_release(sock);
+        *out_fd = -1;
+        return ret;
+    }
+    
+    *out_fd = ret;
+    return 0;
+}
+
+/* ============================================================
+   Bind 绑定地址
+   ============================================================ */
+int np_bind(int32_t fd, uint32_t ip, uint32_t port) {
+    struct socket *sock;
+    struct sockaddr_in addr;
+    int ret;
+    
+    // 获取 socket
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    // 构建地址
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ip;
+    addr.sin_port = htons(port);
+    
+    ret = kernel_bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    
+    sockfd_put(sock);
+    return ret;
+}
+
+/* ============================================================
+   Listen 监听
+   ============================================================ */
+int np_listen(int32_t fd, int32_t backlog) {
+    struct socket *sock;
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    ret = kernel_listen(sock, backlog);
+    
+    sockfd_put(sock);
+    return ret;
+}
+
+/* ============================================================
+   Accept 接受连接
+   ============================================================ */
+int np_accept(int32_t fd, uint32_t *out_remote_ip, uint32_t *out_remote_port,
+              int32_t *out_new_fd) {
+    struct socket *sock, *newsock;
+    struct sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    ret = kernel_accept(sock, &newsock, 0);
+    if (ret < 0) {
+        sockfd_put(sock);
+        return ret;
+    }
+    
+    // 获取远程地址
+    ret = kernel_getpeername(newsock, (struct sockaddr *)&addr, &addr_len);
+    if (ret < 0) {
+        sock_release(newsock);
+        sockfd_put(sock);
+        return ret;
+    }
+    
+    *out_remote_ip = addr.sin_addr.s_addr;
+    *out_remote_port = ntohs(addr.sin_port);
+    
+    // 获取新 socket 的文件描述符
+    ret = sock_map_fd(newsock, 0);
+    if (ret < 0) {
+        sock_release(newsock);
+        sockfd_put(sock);
+        return ret;
+    }
+    
+    *out_new_fd = ret;
+    
+    sockfd_put(sock);
+    return 0;
+}
+
+/* ============================================================
+   Connect 连接服务器
+   ============================================================ */
+int np_connect(int32_t fd, uint32_t ip, uint32_t port) {
+    struct socket *sock;
+    struct sockaddr_in addr;
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ip;
+    addr.sin_port = htons(port);
+    
+    ret = kernel_connect(sock, (struct sockaddr *)&addr, sizeof(addr), 0);
+    
+    sockfd_put(sock);
+    return ret;
+}
+
+/* ============================================================
+   Send 发送数据
+   ============================================================ */
+int np_send(int32_t fd, const void *data, uint32_t len, int32_t flags,
+            uint64_t *out_sent) {
+    struct socket *sock;
+    struct msghdr msg;
+    struct kvec iov;
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = (void *)data;
+    iov.iov_len = len;
+    
+    ret = kernel_sendmsg(sock, &msg, &iov, 1, len);
+    
+    sockfd_put(sock);
+    
+    if (ret < 0) {
+        *out_sent = 0;
+        return ret;
+    }
+    
+    *out_sent = ret;
+    return 0;
+}
+
+/* ============================================================
+   Recv 接收数据
+   ============================================================ */
+int np_recv(int32_t fd, void *buf, uint32_t max_len, int32_t flags,
+            uint64_t *out_received, uint32_t *out_remote_ip, uint32_t *out_remote_port) {
+    struct socket *sock;
+    struct msghdr msg;
+    struct kvec iov;
+    struct sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &addr;
+    msg.msg_namelen = addr_len;
+    msg.msg_flags = flags;
+    
+    iov.iov_base = buf;
+    iov.iov_len = max_len;
+    
+    ret = kernel_recvmsg(sock, &msg, &iov, 1, max_len, msg.msg_flags);
+    
+    if (out_remote_ip && addr.sin_family == AF_INET) {
+        *out_remote_ip = addr.sin_addr.s_addr;
+        *out_remote_port = ntohs(addr.sin_port);
+    }
+    
+    sockfd_put(sock);
+    
+    if (ret < 0) {
+        *out_received = 0;
+        return ret;
+    }
+    
+    *out_received = ret;
+    return 0;
+}
+
+/* ============================================================
+   Close 关闭 Socket
+   ============================================================ */
+int np_close(int32_t fd) {
+    struct socket *sock;
+    int ret;
+    
+    sock = sockfd_lookup(fd, &ret);
+    if (!sock) {
+        return ret;
+    }
+    
+    ret = sock_release(sock);
+    
+    return ret;
+}
+```
+
+5.3 网络接口管理
+
+```c
+// np/src/np_interface.c
+
+#include <linux/kernel.h>
+#include <linux/netdevice.h>
+#include <linux/inetdevice.h>
+#include <linux/if.h>
+#include <linux/rtnetlink.h>
+#include <net/ip.h>
+#include <net/route.h>
+
+#include "np.h"
+#include "np_ipc.h"
+
+/* ============================================================
+   获取所有网络接口
+   ============================================================ */
+int np_interface_probe(np_interface_t **out_interfaces) {
+    struct net_device *dev;
+    np_interface_t *list = NULL;
+    int count = 0;
+    
+    rtnl_lock();
+    
+    for_each_netdev(&init_net, dev) {
+        np_interface_t *iface = kmalloc(sizeof(np_interface_t), GFP_KERNEL);
+        if (!iface) {
+            rtnl_unlock();
+            return -ENOMEM;
+        }
+        
+        memset(iface, 0, sizeof(np_interface_t));
+        
+        // 名称
+        strncpy(iface->name, dev->name, sizeof(iface->name) - 1);
+        
+        // MAC 地址
+        if (dev->dev_addr) {
+            memcpy(iface->mac, dev->dev_addr, 6);
+        }
+        
+        // IP 地址
+        struct in_device *in_dev = dev->ip_ptr;
+        if (in_dev) {
+            struct in_ifaddr *ifa = in_dev->ifa_list;
+            if (ifa) {
+                iface->ipv4 = ifa->ifa_address;
+                iface->netmask = ifa->ifa_mask;
+                iface->gateway = 0;  // 需要从路由表获取
+            }
+        }
+        
+        // MTU
+        iface->mtu = dev->mtu;
+        
+        // 状态
+        iface->up = (dev->flags & IFF_UP) ? 1 : 0;
+        
+        // 统计
+        iface->rx_bytes = dev->stats.rx_bytes;
+        iface->tx_bytes = dev->stats.tx_bytes;
+        
+        iface->next = list;
+        list = iface;
+        count++;
+    }
+    
+    rtnl_unlock();
+    
+    *out_interfaces = list;
+    return count;
+}
+
+/* ============================================================
+   设置 MTU
+   ============================================================ */
+int np_set_mtu(const char *iface_name, uint32_t mtu) {
+    struct net_device *dev;
+    int ret;
+    
+    rtnl_lock();
+    
+    dev = __dev_get_by_name(&init_net, iface_name);
+    if (!dev) {
+        rtnl_unlock();
+        return -ENODEV;
+    }
+    
+    ret = dev_set_mtu(dev, mtu);
+    
+    rtnl_unlock();
+    return ret;
+}
+
+/* ============================================================
+   设置接口状态 (up/down)
+   ============================================================ */
+int np_set_interface_up(const char *iface_name, int up) {
+    struct net_device *dev;
+    int ret;
+    
+    rtnl_lock();
+    
+    dev = __dev_get_by_name(&init_net, iface_name);
+    if (!dev) {
+        rtnl_unlock();
+        return -ENODEV;
+    }
+    
+    if (up) {
+        ret = dev_open(dev, NULL);
+    } else {
+        ret = dev_close(dev);
+    }
+    
+    rtnl_unlock();
+    return ret;
+}
+```
+
+5.4 路由管理
+
+```c
+// np/src/np_route.c
+
+#include <linux/kernel.h>
+#include <linux/route.h>
+#include <linux/rtnetlink.h>
+#include <net/route.h>
+#include <net/ip_fib.h>
+
+#include "np.h"
+#include "np_ipc.h"
+
+/* ============================================================
+   获取路由表
+   ============================================================ */
+int np_route_probe(np_route_t **out_routes) {
+    np_route_t *list = NULL;
+    int count = 0;
+    
+    // 读取 /proc/net/route 或使用 netlink
+    // 简化版本：只获取默认路由
+    
+    // 实际实现中需要遍历 FIB 表或解析 /proc/net/route
+    
+    *out_routes = list;
+    return count;
+}
+
+/* ============================================================
+   添加路由
+   ============================================================ */
+int np_add_route(uint32_t dest, uint32_t mask, uint32_t gateway,
+                 uint32_t metric, const char *iface) {
+    struct rtentry rt;
+    struct sockaddr_in *sin;
+    int ret;
+    struct socket *sock;
+    mm_segment_t oldfs;
+    
+    // 创建 socket 用于 ioctl
+    ret = sock_create(AF_INET, SOCK_DGRAM, 0, &sock);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    memset(&rt, 0, sizeof(rt));
+    
+    // 目标网络
+    sin = (struct sockaddr_in *)&rt.rt_dst;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = dest;
+    
+    // 子网掩码
+    sin = (struct sockaddr_in *)&rt.rt_genmask;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = mask;
+    
+    // 网关
+    sin = (struct sockaddr_in *)&rt.rt_gateway;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = gateway;
+    
+    rt.rt_metric = metric;
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    strncpy(rt.rt_dev, iface, IFNAMSIZ - 1);
+    
+    oldfs = get_fs();
+    set_fs(KERNEL_DS);
+    ret = sock->ops->ioctl(sock, SIOCADDRT, (unsigned long)&rt);
+    set_fs(oldfs);
+    
+    sock_release(sock);
+    return ret;
+}
+```
+
+5.5 IPC 消息处理
+
+```c
+// np/src/np_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "np.h"
+#include "np_ipc.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void np_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case NP_MSG_SOCKET: {
+            np_socket_req_t *req = (np_socket_req_t *)data;
+            np_socket_resp_t resp;
+            int ret = np_socket(req->domain, req->type, req->protocol, &resp.fd);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case NP_MSG_BIND: {
+            np_bind_req_t *req = (np_bind_req_t *)data;
+            int ret = np_bind(req->fd, req->ip, req->port);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case NP_MSG_LISTEN: {
+            np_listen_req_t *req = (np_listen_req_t *)data;
+            int ret = np_listen(req->fd, req->backlog);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case NP_MSG_ACCEPT: {
+            np_accept_req_t *req = (np_accept_req_t *)data;
+            np_accept_resp_t resp;
+            int ret = np_accept(req->fd, &resp.remote_ip, &resp.remote_port, &resp.new_fd);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case NP_MSG_CONNECT: {
+            np_connect_req_t *req = (np_connect_req_t *)data;
+            int ret = np_connect(req->fd, req->ip, req->port);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case NP_MSG_SEND: {
+            // 处理 send
+            break;
+        }
+        
+        case NP_MSG_RECV: {
+            // 处理 recv
+            break;
+        }
+        
+        case NP_MSG_CLOSE: {
+            int32_t fd = *(int32_t *)data;
+            int ret = np_close(fd);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case NP_MSG_GET_INTERFACE: {
+            // 获取网络接口信息
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun NP: Unknown IPC message type: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/np/plugin.yml
+plugin:
+  id: "np"
+  name: "Network Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 网络协议，提供 socket、TCP/UDP、网络接口等网络功能"
+  
+  provides:
+    - protocol: "NP"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+  
+  params:
+    - key: "np.default_mtu"
+      type: "int"
+      default: 1500
+      description: "默认 MTU"
+    - key: "np.tcp_keepalive"
+      type: "bool"
+      default: true
+      description: "是否启用 TCP keepalive"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/np.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# np/Makefile
+
+obj-m += np.o
+
+np-objs := np.o np_socket.o np_interface.o np_route.o np_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 np.ko /usr/lib/hwrun/plugins/
+```
+
+七、命令行接口
+
+```bash
+# Socket 操作
+hwrun np socket --domain AF_INET --type SOCK_STREAM
+hwrun np bind <fd> --ip 0.0.0.0 --port 8080
+hwrun np listen <fd> --backlog 10
+hwrun np accept <fd>
+hwrun np connect <fd> --ip 192.168.1.100 --port 8080
+hwrun np send <fd> --data "hello" --flags 0
+hwrun np recv <fd> --max-len 1024
+hwrun np close <fd>
+
+# 网络接口
+hwrun np interface list
+hwrun np interface eth0
+hwrun np interface set-mtu eth0 --mtu 9000
+hwrun np interface set-up eth0
+hwrun np interface set-down eth0
+
+# 路由管理
+hwrun np route list
+hwrun np route add --dest 10.0.0.0 --mask 255.0.0.0 --gateway 192.168.1.1
+hwrun np route del --dest 10.0.0.0 --mask 255.0.0.0
+
+# 统计信息
+hwrun np stats
+```
+
+八、总结
+
+维度 决策
+定位 网络协议，所有网络操作的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~1500-2000 行 C
+提供协议 NP (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + PMP
+加载时机 在 CLUSTER、FS_TRANSFER、NODE_DISCOVERY 等依赖网络的插件之前
+关键功能 socket/bind/listen/accept/connect/send/recv/close/接口管理/路由管理/统计
+
+NP 是 HWRun OS 中第四个加载的硬件相关插件（HAP → PMP → FSP → NP）。它作为内核模块运行，直接操作 Linux 内核的网络栈，通过 NP 协议向上层插件提供完整的网络通信功能。上层插件（CLUSTER、FS_TRANSFER、NODE_DISCOVERY 等）通过 NP 协议进行网络通信，不直接操作内核网络栈。

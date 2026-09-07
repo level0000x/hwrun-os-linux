@@ -1,0 +1,1413 @@
+﻿HWRun OS STORAGE 实现文档
+
+模块名称： STORAGE (Storage Backend Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 存储后端协议，提供存储卷管理、快照、备份、精简配置等存储功能的统一抽象
+实现语言： C（内核模块 + 用户态辅助服务）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统协议）、HAP（硬件抽象）
+提供协议： STORAGE
+
+一、设计哲学
+
+1.1 核心定位
+
+STORAGE 是 HWRun OS 的存储管理核心——所有与存储卷、快照、备份、精简配置、存储池相关的操作都通过 STORAGE 协议进行。
+
+```
+STORAGE = 存储后端协议 = 所有存储操作的统一入口
+
+上层插件 (INSTANCE, CONTAINER, PKGMGR, FSP, CLUSTER, ...)
+    │
+    │  通过 STORAGE 协议管理存储
+    ▼
+STORAGE 插件 (内核模块 + 用户态服务)
+    │
+    │  基于 Linux 存储栈
+    │  ├── Device Mapper (dm)        → 卷管理、快照、加密
+    │  ├── LVM (逻辑卷管理)           → 卷组、逻辑卷、精简池
+    │  ├── 块设备层 (Block Layer)    → 设备发现、分区管理
+    │  ├── SCSI 子系统              → SCSI 设备管理
+    │  ├── NVMe 驱动                → NVMe 设备管理
+    │  └── 文件系统层 (FSP)          → 格式化、挂载
+    │
+    ▼
+Linux 内核 (Device Mapper / LVM / Block / SCSI / NVMe)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有存储操作通过 STORAGE 协议进行
+2. 分层抽象：存储设备 → 存储池 → 存储卷 → 快照 → 备份
+3. 精简配置：支持 thin provisioning，按需分配存储空间
+4. 快照与回滚：支持存储卷的即时快照和回滚
+5. 多后端支持：支持本地存储、网络存储（iSCSI、NVMe-oF）、分布式存储
+6. 热插拔：支持存储设备的在线添加和移除
+
+1.3 存储层次模型
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HWRun OS 存储层次模型                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  存储卷 (Volume)                                                    │   │
+│  │  ├── 用户可见的存储单元                                              │   │
+│  │  ├── 可格式化、挂载、使用                                            │   │
+│  │  └── 支持快照、克隆、迁移                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  存储池 (Pool)                                                      │   │
+│  │  ├── 多个物理设备的聚合                                              │   │
+│  │  ├── 支持精简配置 (thin provisioning)                   │   │
+│  │  └── 支持冗余 (RAID, 镜像)                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  物理存储 (Physical Storage)                                        │   │
+│  │  ├── 本地磁盘 (NVMe, SATA, SAS)                                    │   │
+│  │  ├── 网络存储 (iSCSI, NVMe-oF, NFS)                                │   │
+│  │  └── 分布式存储 (Ceph, GlusterFS)                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.4 Linux 存储栈架构
+
+Linux 内核的存储栈是一个多层架构，从底层硬件到上层文件系统：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Linux 存储栈层次                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  文件系统层 (VFS / ext4 / btrfs / xfs)                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  块设备层 (Block Layer)                                             │   │
+│  │  ├── 通用块层 (Generic Block Layer)                                 │   │
+│  │  ├── I/O 调度器 (CFQ, Deadline, NOOP, MQ)                         │   │
+│  │  └── 块设备接口 (/dev/sdX, /dev/nvmeXnY)                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Device Mapper 层                                                   │   │
+│  │  ├── 线性映射 (linear)                    │   │
+│  │  ├── 条带映射 (striped)                                            │   │
+│  │  ├── 快照 (snapshot)                                               │   │
+│  │  ├── 加密 (crypt)                                                  │   │
+│  │  ├── 多路径 (multipath)                                            │   │
+│  │  └── 精简配置 (thin)                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  SCSI / NVMe 子系统                                                 │   │
+│  │  ├── SCSI 上层 (sd, sr, st)                 │   │
+│  │  ├── SCSI 中间层 (SCSI Midlayer)            │   │
+│  │  ├── SCSI 底层驱动 (HBA 驱动)              │   │
+│  │  └── NVMe 驱动 (nvme-core, nvme-pci)          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  硬件层 (PCIe NVMe, SATA, SAS, FC, iSCSI, NVMe-oF)                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+1.5 STORAGE 插件的本质
+
+STORAGE 插件 = Linux Device Mapper + LVM + 块设备层的 HWRun 协议封装
+
+Device Mapper 是 Linux 内核提供的框架，用于将物理块设备映射到更高级的虚拟块设备。它构成了逻辑卷管理器（LVM）、软件 RAID、dm-crypt 磁盘加密的基础。
+
+二、整体架构
+
+2.1 STORAGE 插件的组成
+
+```
+STORAGE 插件
+├── 内核模块 (storage.ko)
+│   ├── 协议处理层
+│   │   ├── storage_ipc_handler()   ← IPC 消息分发
+│   │   ├── storage_create_volume() ← 创建存储卷
+│   │   ├── storage_delete_volume() ← 删除存储卷
+│   │   ├── storage_list_volumes()  ← 列出存储卷
+│   │   ├── storage_mount_volume()  ← 挂载存储卷
+│   │   ├── storage_umount_volume() ← 卸载存储卷
+│   │   ├── storage_snapshot()      ← 创建快照
+│   │   ├── storage_restore()       ← 恢复快照
+│   │   ├── storage_backup()        ← 备份
+│   │   ├── storage_restore_backup()← 恢复备份
+│   │   └── storage_resize_volume() ← 调整大小
+│   ├── Device Mapper 封装层
+│   │   ├── storage_dm.c            ← Device Mapper 操作
+│   │   ├── storage_dm_linear.c     ← 线性映射
+│   │   ├── storage_dm_snapshot.c   ← 快照映射
+│   │   ├── storage_dm_thin.c       ← 精简配置
+│   │   └── storage_dm_crypt.c      ← 加密映射
+│   ├── LVM 封装层
+│   │   ├── storage_lvm.c           ← LVM 操作
+│   │   ├── storage_lvm_vg.c        ← 卷组管理
+│   │   └── storage_lvm_lv.c        ← 逻辑卷管理
+│   ├── 块设备层
+│   │   ├── storage_block.c         ← 块设备发现
+│   │   └── storage_partition.c     ← 分区管理
+│   └── 初始化/清理
+│       ├── storage_init()          ← 模块加载
+│       └── storage_exit()          ← 模块卸载
+│
+└── 用户态服务 (hwrun-storaged)
+    ├── 存储池管理
+    │   ├── pool_create.c           ← 创建存储池
+    │   ├── pool_delete.c           ← 删除存储池
+    │   └── pool_list.c             ← 列出存储池
+    ├── 卷管理
+    │   ├── volume_create.c         ← 创建卷
+    │   ├── volume_delete.c         ← 删除卷
+    │   ├── volume_resize.c         ← 调整大小
+    │   └── volume_list.c           ← 列出卷
+    ├── 快照管理
+    │   ├── snapshot_create.c       ← 创建快照
+    │   ├── snapshot_delete.c       ← 删除快照
+    │   └── snapshot_restore.c      ← 恢复快照
+    ├── 备份管理
+    │   ├── backup_create.c         ← 创建备份
+    │   ├── backup_restore.c        ← 恢复备份
+    │   └── backup_list.c           ← 列出备份
+    └── 存储设备发现
+        └── device_scan.c           ← 扫描存储设备
+```
+
+2.2 STORAGE 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → 其他插件
+                                                                                                                               ↑
+                                                                                                                     STORAGE 在这里加载
+```
+
+STORAGE 插件在 PERMISSION 之后、上层应用插件之前加载，为系统提供存储管理能力。
+
+2.3 STORAGE 的上层消费者
+
+上层插件 需要 STORAGE 提供什么
+INSTANCE (实例管理) 实例根文件系统存储卷
+CONTAINER (容器) 容器存储卷
+PKGMGR (包管理) 包缓存存储
+CLUSTER (集群) 分布式存储卷
+FSP (文件系统) 存储设备挂载
+
+三、核心数据结构
+
+```c
+// storage/include/storage.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+
+/* ============================================================
+   存储设备类型
+   ============================================================ */
+typedef enum {
+    STORAGE_DEVICE_UNKNOWN = 0,
+    STORAGE_DEVICE_NVME,            // NVMe SSD
+    STORAGE_DEVICE_SATA,            // SATA SSD/HDD
+    STORAGE_DEVICE_SAS,             // SAS HDD/SSD
+    STORAGE_DEVICE_SCSI,            // SCSI 设备
+    STORAGE_DEVICE_ISCSI,           // iSCSI 设备
+    STORAGE_DEVICE_NVME_OF,         // NVMe-oF 设备
+    STORAGE_DEVICE_VIRTIO,          // VirtIO 块设备
+    STORAGE_DEVICE_LOOP,            // Loop 设备
+    STORAGE_DEVICE_DM,              // Device Mapper 设备
+    STORAGE_DEVICE_LVM,             // LVM 逻辑卷
+} storage_device_type_t;
+
+/* ============================================================
+   存储池类型
+   ============================================================ */
+typedef enum {
+    STORAGE_POOL_LINEAR = 0,        // 线性聚合
+    STORAGE_POOL_STRIPED,           // 条带 (RAID 0)
+    STORAGE_POOL_MIRROR,            // 镜像 (RAID 1)
+    STORAGE_POOL_RAID5,             // RAID 5
+    STORAGE_POOL_RAID6,             // RAID 6
+    STORAGE_POOL_RAID10,            // RAID 10
+    STORAGE_POOL_THIN,              // 精简池
+} storage_pool_type_t;
+
+/* ============================================================
+   存储卷信息
+   ============================================================ */
+typedef struct storage_volume {
+    char id[64];                    // 卷 ID (UUID)
+    char name[128];                 // 卷名称
+    uint64_t size;                  // 总大小 (字节)
+    uint64_t used;                  // 已使用 (字节)
+    uint64_t available;             // 可用 (字节)
+    char path[256];                 // 设备路径 (如 /dev/mapper/vol-xxx)
+    char mount_point[256];          // 挂载点
+    char fstype[32];                // 文件系统类型 (ext4, xfs, btrfs)
+    int mounted;                    // 是否已挂载
+    int readonly;                   // 是否只读
+    uint64_t created_at;            // 创建时间
+    uint64_t modified_at;           // 修改时间
+    char pool_id[64];               // 所属存储池 ID
+    char snapshot_of[64];           // 快照源卷 ID
+    struct storage_volume *next;
+} storage_volume_t;
+
+/* ============================================================
+   存储池信息
+   ============================================================ */
+typedef struct storage_pool {
+    char id[64];                    // 池 ID
+    char name[128];                 // 池名称
+    storage_pool_type_t type;       // 池类型
+    uint64_t total_size;            // 总大小 (字节)
+    uint64_t used_size;             // 已使用 (字节)
+    uint64_t available_size;        // 可用 (字节)
+    uint32_t device_count;          // 物理设备数量
+    char **devices;                 // 设备路径列表
+    int thin_provisioning;          // 是否启用精简配置[reference:3]
+    uint64_t thin_pool_metadata;    // 精简池元数据大小
+    struct storage_pool *next;
+} storage_pool_t;
+
+/* ============================================================
+   快照信息
+   ============================================================ */
+typedef struct storage_snapshot {
+    char id[64];                    // 快照 ID
+    char name[128];                 // 快照名称
+    char volume_id[64];             // 源卷 ID
+    uint64_t size;                  // 快照大小
+    uint64_t created_at;            // 创建时间
+    int active;                     // 是否活跃
+    struct storage_snapshot *next;
+} storage_snapshot_t;
+
+/* ============================================================
+   备份信息
+   ============================================================ */
+typedef struct storage_backup {
+    char id[64];                    // 备份 ID
+    char name[128];                 // 备份名称
+    char volume_id[64];             // 源卷 ID
+    char location[256];             // 备份位置 (文件路径)
+    uint64_t size;                  // 备份大小
+    uint64_t created_at;            // 创建时间
+    int compressed;                 // 是否压缩
+    int encrypted;                  // 是否加密
+    struct storage_backup *next;
+} storage_backup_t;
+
+/* ============================================================
+   STORAGE 上下文
+   ============================================================ */
+typedef struct storage_context {
+    int initialized;
+    uint64_t storage_task_id;       // STORAGE 自身的任务 ID
+    
+    storage_pool_t *pools;          // 存储池列表
+    storage_volume_t *volumes;      // 存储卷列表
+    storage_snapshot_t *snapshots;  // 快照列表
+    storage_backup_t *backups;      // 备份列表
+    
+    void *lock;
+} storage_context_t;
+```
+
+四、STORAGE 协议定义
+
+```protobuf
+// protocols/storage.proto
+syntax = "proto3";
+
+package hwrun.storage;
+
+service Storage {
+    // === 存储池管理 ===
+    rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
+    rpc DeletePool(DeletePoolRequest) returns (DeletePoolResponse);
+    rpc ListPools(Empty) returns (ListPoolsResponse);
+    rpc GetPool(GetPoolRequest) returns (GetPoolResponse);
+    rpc ResizePool(ResizePoolRequest) returns (ResizePoolResponse);
+    
+    // === 存储卷管理 ===
+    rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse);
+    rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+    rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+    rpc GetVolume(GetVolumeRequest) returns (GetVolumeResponse);
+    rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
+    rpc MountVolume(MountVolumeRequest) returns (MountVolumeResponse);
+    rpc UmountVolume(UmountVolumeRequest) returns (UmountVolumeResponse);
+    
+    // === 快照管理 ===
+    rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+    rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+    rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+    
+    // === 备份管理 ===
+    rpc Backup(BackupRequest) returns (BackupResponse);
+    rpc RestoreBackup(RestoreBackupRequest) returns (RestoreBackupResponse);
+    rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+    rpc DeleteBackup(DeleteBackupRequest) returns (DeleteBackupResponse);
+    
+    // === 设备管理 ===
+    rpc ScanDevices(Empty) returns (ScanDevicesResponse);
+}
+
+message Empty {}
+
+// ============ 存储池管理 ============
+
+message CreatePoolRequest {
+    string name = 1;
+    uint32 type = 2;                // storage_pool_type_t
+    repeated string devices = 3;
+    bool thin_provisioning = 4;
+    uint64 thin_pool_metadata_size = 5;  // 精简池元数据大小 (MB)
+}
+
+message CreatePoolResponse {
+    string pool_id = 1;
+    bool success = 2;
+    int32 error = 3;
+}
+
+message DeletePoolRequest {
+    string pool_id = 1;
+    bool force = 2;
+}
+
+message DeletePoolResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message PoolInfo {
+    string id = 1;
+    string name = 2;
+    uint32 type = 3;
+    uint64 total_size = 4;
+    uint64 used_size = 5;
+    uint64 available_size = 6;
+    uint32 device_count = 7;
+    repeated string devices = 8;
+    bool thin_provisioning = 9;
+}
+
+message ListPoolsResponse {
+    repeated PoolInfo pools = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetPoolRequest {
+    string pool_id = 1;
+}
+
+message GetPoolResponse {
+    PoolInfo pool = 1;
+    int32 error = 2;
+}
+
+message ResizePoolRequest {
+    string pool_id = 1;
+    uint64 new_size = 2;
+}
+
+message ResizePoolResponse {
+    bool success = 1;
+    uint64 new_size = 2;
+    int32 error = 3;
+}
+
+// ============ 存储卷管理 ============
+
+message CreateVolumeRequest {
+    string name = 1;
+    string pool_id = 2;
+    uint64 size = 3;                // 大小 (字节)
+    string fstype = 4;              // 文件系统类型
+    bool thin = 5;                  // 是否精简卷
+}
+
+message CreateVolumeResponse {
+    string volume_id = 1;
+    string device_path = 2;
+    bool success = 3;
+    int32 error = 4;
+}
+
+message DeleteVolumeRequest {
+    string volume_id = 1;
+    bool force = 2;
+}
+
+message DeleteVolumeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message VolumeInfo {
+    string id = 1;
+    string name = 2;
+    uint64 size = 3;
+    uint64 used = 4;
+    uint64 available = 5;
+    string device_path = 6;
+    string mount_point = 7;
+    string fstype = 8;
+    bool mounted = 9;
+    bool readonly = 10;
+    uint64 created_at = 11;
+    string pool_id = 12;
+    string snapshot_of = 13;
+}
+
+message ListVolumesRequest {
+    string pool_id = 1;             // 可选，过滤指定池
+}
+
+message ListVolumesResponse {
+    repeated VolumeInfo volumes = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetVolumeRequest {
+    string volume_id = 1;
+}
+
+message GetVolumeResponse {
+    VolumeInfo volume = 1;
+    int32 error = 2;
+}
+
+message ResizeVolumeRequest {
+    string volume_id = 1;
+    uint64 new_size = 2;
+}
+
+message ResizeVolumeResponse {
+    bool success = 1;
+    uint64 new_size = 2;
+    int32 error = 3;
+}
+
+message MountVolumeRequest {
+    string volume_id = 1;
+    string mount_point = 2;
+    string options = 3;
+}
+
+message MountVolumeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UmountVolumeRequest {
+    string volume_id = 1;
+}
+
+message UmountVolumeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 快照管理 ============
+
+message SnapshotRequest {
+    string volume_id = 1;
+    string snapshot_name = 2;
+}
+
+message SnapshotResponse {
+    string snapshot_id = 1;
+    bool success = 2;
+    int32 error = 3;
+}
+
+message DeleteSnapshotRequest {
+    string snapshot_id = 1;
+}
+
+message DeleteSnapshotResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message SnapshotInfo {
+    string id = 1;
+    string name = 2;
+    string volume_id = 3;
+    uint64 size = 4;
+    uint64 created_at = 5;
+    bool active = 6;
+}
+
+message ListSnapshotsRequest {
+    string volume_id = 1;           // 可选
+}
+
+message ListSnapshotsResponse {
+    repeated SnapshotInfo snapshots = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message RestoreSnapshotRequest {
+    string snapshot_id = 1;
+    string target_volume_id = 2;    // 可选，默认覆盖原卷
+}
+
+message RestoreSnapshotResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 备份管理 ============
+
+message BackupRequest {
+    string volume_id = 1;
+    string backup_name = 2;
+    string location = 3;            // 备份保存位置
+    bool compress = 4;
+    bool encrypt = 5;
+}
+
+message BackupResponse {
+    string backup_id = 1;
+    bool success = 2;
+    int32 error = 3;
+}
+
+message RestoreBackupRequest {
+    string backup_id = 1;
+    string target_volume_id = 2;
+}
+
+message RestoreBackupResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message BackupInfo {
+    string id = 1;
+    string name = 2;
+    string volume_id = 3;
+    string location = 4;
+    uint64 size = 5;
+    uint64 created_at = 6;
+    bool compressed = 7;
+    bool encrypted = 8;
+}
+
+message ListBackupsRequest {
+    string volume_id = 1;           // 可选
+}
+
+message ListBackupsResponse {
+    repeated BackupInfo backups = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message DeleteBackupRequest {
+    string backup_id = 1;
+}
+
+message DeleteBackupResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 设备管理 ============
+
+message StorageDevice {
+    string path = 1;                // /dev/sda, /dev/nvme0n1
+    string model = 2;
+    string serial = 3;
+    uint64 size = 4;
+    uint32 type = 5;                // storage_device_type_t
+    string vendor = 6;
+    bool removable = 7;
+    bool readonly = 8;
+    repeated string partitions = 9;
+}
+
+message ScanDevicesResponse {
+    repeated StorageDevice devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// storage/src/storage.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/device-mapper.h>
+#include <linux/genhd.h>
+#include <linux/blkdev.h>
+#include <linux/fs.h>
+
+#include "storage.h"
+#include "storage_ipc.h"
+#include "storage_dm.h"
+#include "storage_lvm.h"
+#include "storage_block.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Storage Backend Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static storage_context_t g_storage_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init storage_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun STORAGE: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_storage_ctx, 0, sizeof(storage_context_t));
+    
+    // 2. 扫描现有存储设备
+    storage_scan_devices();
+    
+    // 3. 注册 IPC 消息处理器
+    ret = storage_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun STORAGE: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 STORAGE 协议（通过 METAPROTO - 通过 IPC）
+    storage_register_protocol();
+    
+    g_storage_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun STORAGE: Initialized successfully\n");
+    printk(KERN_INFO "  Device Mapper available\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit storage_exit(void) {
+    printk(KERN_INFO "HWRun STORAGE: Exiting...\n");
+    
+    storage_ipc_unregister();
+    storage_cleanup_pools();
+    storage_cleanup_volumes();
+    storage_cleanup_snapshots();
+    storage_cleanup_backups();
+    
+    g_storage_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun STORAGE: Exited\n");
+}
+
+module_init(storage_init);
+module_exit(storage_exit);
+```
+
+5.2 存储池管理 (LVM)
+
+```c
+// storage/src/storage_lvm.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/device-mapper.h>
+#include <linux/lvm.h>
+
+#include "storage.h"
+#include "storage_lvm.h"
+
+/* ============================================================
+   创建 LVM 卷组 (VG)
+   ============================================================ */
+int storage_lvm_create_vg(const char *vg_name, const char **devices,
+                           uint32_t device_count) {
+    char cmd[512];
+    int ret;
+    
+    // 构建 vgcreate 命令
+    // 实际使用 LVM 库或调用 lvm 命令
+    // 这里给出框架
+    
+    // 1. 初始化物理卷 (pvcreate)
+    for (int i = 0; i < device_count; i++) {
+        snprintf(cmd, sizeof(cmd), "pvcreate %s", devices[i]);
+        // 执行命令
+    }
+    
+    // 2. 创建卷组 (vgcreate)
+    snprintf(cmd, sizeof(cmd), "vgcreate %s", vg_name);
+    for (int i = 0; i < device_count; i++) {
+        strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
+        strncat(cmd, devices[i], sizeof(cmd) - strlen(cmd) - 1);
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   创建 LVM 逻辑卷 (LV)
+   ============================================================ */
+int storage_lvm_create_lv(const char *vg_name, const char *lv_name,
+                           uint64_t size_mb, int thin) {
+    char cmd[512];
+    
+    // 标准逻辑卷
+    if (!thin) {
+        snprintf(cmd, sizeof(cmd), "lvcreate -L %luM -n %s %s",
+                 size_mb, lv_name, vg_name);
+    } else {
+        // 精简逻辑卷 (thin provisioning)[reference:4]
+        // 需要先创建精简池
+        snprintf(cmd, sizeof(cmd), "lvcreate -T %s/%s -V %luM -n %s",
+                 vg_name, "thinpool", size_mb, lv_name);
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   删除逻辑卷
+   ============================================================ */
+int storage_lvm_remove_lv(const char *vg_name, const char *lv_name) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "lvremove -f %s/%s", vg_name, lv_name);
+    return 0;
+}
+```
+
+5.3 Device Mapper 操作
+
+Device Mapper 是 Linux 内核中用于创建虚拟块设备的框架。它通过 ioctl 系统调用与用户空间交互，用户界面是 dmsetup 命令。
+
+```c
+// storage/src/storage_dm.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/device-mapper.h>
+#include <linux/dm-ioctl.h>
+#include <linux/dm-linear.h>
+#include <linux/dm-snapshot.h>
+#include <linux/dm-thin.h>
+
+#include "storage.h"
+#include "storage_dm.h"
+
+/* ============================================================
+   创建 Device Mapper 线性设备
+   ============================================================ */
+int storage_dm_create_linear(const char *dm_name, const char *source_dev,
+                              uint64_t offset) {
+    struct dm_ioctl *dmi;
+    struct dm_target_spec *spec;
+    char *params;
+    int fd;
+    int ret;
+    
+    // 1. 打开 /dev/mapper/control
+    fd = open("/dev/mapper/control", O_RDWR);
+    if (fd < 0) {
+        return -1;
+    }
+    
+    // 2. 分配 DM ioctl 结构
+    dmi = kmalloc(sizeof(struct dm_ioctl) + 512, GFP_KERNEL);
+    if (!dmi) {
+        close(fd);
+        return -ENOMEM;
+    }
+    
+    memset(dmi, 0, sizeof(struct dm_ioctl) + 512);
+    strncpy(dmi->name, dm_name, DM_NAME_LEN - 1);
+    dmi->version[0] = DM_VERSION_MAJOR;
+    dmi->version[1] = DM_VERSION_MINOR;
+    dmi->version[2] = DM_VERSION_PATCHLEVEL;
+    dmi->data_size = sizeof(struct dm_ioctl) + 512;
+    dmi->data_start = sizeof(struct dm_ioctl);
+    dmi->target_count = 1;
+    
+    // 3. 设置目标
+    spec = (struct dm_target_spec *)((char *)dmi + dmi->data_start);
+    spec->sector_start = 0;
+    spec->length = 1024 * 1024;  // 1GB
+    strncpy(spec->target_type, "linear", DM_TARGET_NAME_LEN - 1);
+    spec->next = sizeof(struct dm_target_spec);
+    
+    // 4. 参数: 设备 偏移
+    params = (char *)spec + spec->next;
+    snprintf(params, 256, "%s %llu", source_dev, offset);
+    
+    // 5. 创建设备
+    ret = ioctl(fd, DM_DEV_CREATE, dmi);
+    if (ret < 0) {
+        close(fd);
+        kfree(dmi);
+        return ret;
+    }
+    
+    // 6. 加载表
+    ret = ioctl(fd, DM_TABLE_LOAD, dmi);
+    
+    // 7. 挂载设备
+    ret = ioctl(fd, DM_DEV_SUSPEND, dmi);
+    
+    close(fd);
+    kfree(dmi);
+    return ret;
+}
+
+/* ============================================================
+   创建 Device Mapper 快照设备
+   ============================================================ */
+int storage_dm_create_snapshot(const char *snap_name, const char *origin_dev,
+                                const char *cow_dev, int persistent) {
+    // 快照设备使用 snapshot 目标类型
+    // 需要 origin 设备和 COW (Copy-On-Write) 设备
+    // 公式: dmsetup create snap --table "0 2097152 snapshot /dev/sda1 /dev/sdb1 P 8"
+    // P = 持久化, N = 非持久化
+    
+    return 0;
+}
+
+/* ============================================================
+   创建 Device Mapper 精简池
+   ============================================================ */
+int storage_dm_create_thin_pool(const char *pool_name, const char *metadata_dev,
+                                 const char *data_dev, uint64_t data_block_size) {
+    // 精简池使用 thin-pool 目标类型
+    // 需要元数据设备和数据设备
+    // 公式: dmsetup create thin-pool --table "0 2097152 thin-pool /dev/sda1 /dev/sdb1 128 0"
+    
+    return 0;
+}
+```
+
+5.4 存储卷管理
+
+```c
+// storage/src/storage_volume.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/mount.h>
+
+#include "storage.h"
+#include "storage_volume.h"
+#include "storage_dm.h"
+#include "storage_lvm.h"
+
+/* ============================================================
+   创建存储卷
+   ============================================================ */
+int storage_create_volume(const char *name, const char *pool_id,
+                           uint64_t size, const char *fstype,
+                           int thin, char *out_id) {
+    storage_pool_t *pool;
+    storage_volume_t *vol;
+    char device_path[256];
+    int ret;
+    
+    // 1. 查找存储池
+    pool = storage_find_pool(pool_id);
+    if (!pool) {
+        return -ENOENT;
+    }
+    
+    // 2. 生成卷 ID
+    storage_generate_id(out_id, 64);
+    
+    // 3. 根据池类型创建卷
+    if (pool->type == STORAGE_POOL_LVM || pool->type == STORAGE_POOL_THIN) {
+        // 使用 LVM 创建逻辑卷
+        ret = storage_lvm_create_lv(pool->name, name, size / (1024 * 1024), thin);
+        if (ret < 0) {
+            return ret;
+        }
+        snprintf(device_path, sizeof(device_path), "/dev/%s/%s", pool->name, name);
+    } else if (pool->type == STORAGE_POOL_LINEAR) {
+        // 使用 Device Mapper 线性映射
+        if (pool->device_count < 1) {
+            return -ENODEV;
+        }
+        ret = storage_dm_create_linear(name, pool->devices[0], 0);
+        if (ret < 0) {
+            return ret;
+        }
+        snprintf(device_path, sizeof(device_path), "/dev/mapper/%s", name);
+    } else {
+        return -ENOTSUP;
+    }
+    
+    // 4. 创建文件系统 (mkfs)
+    if (fstype && fstype[0] != '\0') {
+        storage_mkfs(device_path, fstype);
+    }
+    
+    // 5. 创建卷记录
+    vol = kmalloc(sizeof(storage_volume_t), GFP_KERNEL);
+    if (!vol) {
+        return -ENOMEM;
+    }
+    
+    memset(vol, 0, sizeof(storage_volume_t));
+    strncpy(vol->id, out_id, sizeof(vol->id) - 1);
+    strncpy(vol->name, name, sizeof(vol->name) - 1);
+    vol->size = size;
+    vol->created_at = get_jiffies_64();
+    strncpy(vol->path, device_path, sizeof(vol->path) - 1);
+    if (fstype) {
+        strncpy(vol->fstype, fstype, sizeof(vol->fstype) - 1);
+    }
+    strncpy(vol->pool_id, pool_id, sizeof(vol->pool_id) - 1);
+    vol->mounted = 0;
+    
+    // 6. 添加到列表
+    vol->next = g_storage_ctx.volumes;
+    g_storage_ctx.volumes = vol;
+    
+    return 0;
+}
+
+/* ============================================================
+   删除存储卷
+   ============================================================ */
+int storage_delete_volume(const char *volume_id, int force) {
+    storage_volume_t *vol = storage_find_volume(volume_id);
+    if (!vol) {
+        return -ENOENT;
+    }
+    
+    // 1. 如果已挂载，先卸载
+    if (vol->mounted) {
+        storage_umount_volume(volume_id);
+    }
+    
+    // 2. 根据卷类型删除
+    // LVM: lvremove
+    // DM: dmsetup remove
+    
+    // 3. 从列表中移除
+    storage_remove_volume(vol);
+    
+    return 0;
+}
+
+/* ============================================================
+   挂载存储卷
+   ============================================================ */
+int storage_mount_volume(const char *volume_id, const char *mount_point,
+                          const char *options) {
+    storage_volume_t *vol = storage_find_volume(volume_id);
+    if (!vol) {
+        return -ENOENT;
+    }
+    
+    if (vol->mounted) {
+        return -EBUSY;
+    }
+    
+    // 使用 do_mount 系统调用
+    // 实际实现中通过内核的 mount 接口
+    // 或通过用户态 mount 命令
+    
+    vol->mounted = 1;
+    strncpy(vol->mount_point, mount_point, sizeof(vol->mount_point) - 1);
+    
+    return 0;
+}
+
+/* ============================================================
+   快照存储卷
+   ============================================================ */
+int storage_snapshot_volume(const char *volume_id, const char *snap_name,
+                             char *out_id) {
+    storage_volume_t *vol = storage_find_volume(volume_id);
+    if (!vol) {
+        return -ENOENT;
+    }
+    
+    // 使用 Device Mapper 快照
+    // 需要准备 COW (Copy-On-Write) 设备
+    // 创建快照设备: dmsetup create snap --table "0 2097152 snapshot /dev/mapper/vol  /dev/mapper/cow P 8"
+    
+    storage_generate_id(out_id, 64);
+    
+    // 创建快照记录
+    // ...
+    
+    return 0;
+}
+```
+
+5.5 设备发现
+
+```c
+// storage/src/storage_block.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/genhd.h>
+#include <linux/fs.h>
+#include <linux/blkdev.h>
+#include <linux/device.h>
+#include <linux/module.h>
+
+#include "storage.h"
+#include "storage_block.h"
+
+/* ============================================================
+   扫描块设备
+   ============================================================ */
+int storage_scan_block_devices(void) {
+    struct gendisk *disk;
+    struct block_device *bdev;
+    
+    // 遍历所有块设备
+    // 实际使用 class_find_device 或遍历 /sys/block
+    // 这里给出框架
+    
+    // 使用 for_each_disk 遍历
+    // 每个磁盘:
+    //   - 获取设备路径 (/dev/sdX, /dev/nvmeXnY)
+    //   - 获取容量 (get_capacity)
+    //   - 获取型号 (通过 sysfs)
+    //   - 检测设备类型 (NVME, SCSI, SATA)
+    
+    // 返回找到的设备数量
+    
+    return 0;
+}
+
+/* ============================================================
+   获取块设备大小
+   ============================================================ */
+uint64_t storage_get_device_size(const char *dev_path) {
+    struct block_device *bdev;
+    uint64_t size = 0;
+    
+    bdev = blkdev_get_by_path(dev_path, FMODE_READ, NULL);
+    if (IS_ERR(bdev)) {
+        return 0;
+    }
+    
+    size = bdev->bd_inode->i_size;
+    
+    blkdev_put(bdev, FMODE_READ);
+    return size;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// storage/src/storage_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "storage.h"
+#include "storage_ipc.h"
+#include "storage_volume.h"
+#include "storage_pool.h"
+#include "storage_snapshot.h"
+#include "storage_backup.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void storage_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case STORAGE_MSG_CREATE_VOLUME: {
+            storage_create_volume_req_t *req =
+                (storage_create_volume_req_t *)data;
+            storage_create_volume_resp_t resp;
+            int ret = storage_create_volume(req->name, req->pool_id,
+                                             req->size, req->fstype,
+                                             req->thin, resp.volume_id);
+            resp.success = (ret == 0);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case STORAGE_MSG_DELETE_VOLUME: {
+            char *volume_id = (char *)data;
+            int ret = storage_delete_volume(volume_id, 0);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case STORAGE_MSG_LIST_VOLUMES: {
+            storage_list_volumes_req_t *req =
+                (storage_list_volumes_req_t *)data;
+            storage_volume_t *volumes;
+            uint32_t count;
+            storage_get_volumes(&volumes, &count, req->pool_id);
+            ipc_reply(from_task, volumes, count * sizeof(storage_volume_t));
+            break;
+        }
+        
+        case STORAGE_MSG_MOUNT_VOLUME: {
+            storage_mount_volume_req_t *req =
+                (storage_mount_volume_req_t *)data;
+            int ret = storage_mount_volume(req->volume_id, req->mount_point,
+                                            req->options);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case STORAGE_MSG_SNAPSHOT: {
+            storage_snapshot_req_t *req = (storage_snapshot_req_t *)data;
+            storage_snapshot_resp_t resp;
+            int ret = storage_snapshot_volume(req->volume_id, req->snapshot_name,
+                                               resp.snapshot_id);
+            resp.success = (ret == 0);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun STORAGE: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、用户态服务
+
+```c
+// storage/userspace/hwrun-storaged.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <linux/fs.h>
+#include <linux/dm-ioctl.h>
+
+#include "storage.h"
+#include "storage_ipc.h"
+
+/* ============================================================
+   用户态服务主循环
+   ============================================================ */
+int main(int argc, char **argv) {
+    // 1. 初始化存储系统
+    // 2. 扫描现有 LVM 卷组和逻辑卷
+    // 3. 扫描现有 Device Mapper 设备
+    // 4. 注册 IPC 处理器
+    // 5. 进入事件循环
+    return 0;
+}
+
+/* ============================================================
+   LVM 卷组扫描
+   ============================================================ */
+int scan_lvm_volumes(void) {
+    // 通过 liblvm2 或调用 lvm 命令
+    // 或读取 /dev/mapper/ 目录
+    return 0;
+}
+```
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/storage.yml
+storage:
+  # 存储池配置
+  pools:
+    - name: "default"
+      type: "thin"               # linear / striped / mirror / thin
+      devices:
+        - "/dev/sda"
+        - "/dev/sdb"
+      thin_provisioning: true
+  
+  # 默认卷配置
+  default_volume:
+    fstype: "ext4"
+    size: "10GB"
+  
+  # 快照配置
+  snapshots:
+    max_per_volume: 10
+    retention_days: 7
+  
+  # 备份配置
+  backups:
+    location: "/var/lib/hwrun/backups/"
+    compress: true
+    encrypt: false
+```
+
+八、命令行接口
+
+```bash
+# 存储池管理
+hwrun storage pool create --name mypool --type thin --devices /dev/sda,/dev/sdb
+hwrun storage pool list
+hwrun storage pool info mypool
+hwrun storage pool delete mypool
+
+# 存储卷管理
+hwrun storage volume create --name myvol --pool mypool --size 10GB --fstype ext4
+hwrun storage volume list
+hwrun storage volume info myvol
+hwrun storage volume resize myvol --size 20GB
+hwrun storage volume mount myvol /mnt/myvol
+hwrun storage volume umount myvol
+hwrun storage volume delete myvol
+
+# 快照管理
+hwrun storage snapshot create myvol --name snap-001
+hwrun storage snapshot list
+hwrun storage snapshot restore snap-001
+hwrun storage snapshot delete snap-001
+
+# 备份管理
+hwrun storage backup create myvol --name backup-001
+hwrun storage backup list
+hwrun storage backup restore backup-001
+hwrun storage backup delete backup-001
+
+# 设备管理
+hwrun storage scan
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+```yaml
+# plugins/storage/plugin.yml
+plugin:
+  id: "storage"
+  name: "Storage Backend Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 存储后端协议，提供存储卷管理、快照、备份、精简配置等存储功能"
+  
+  provides:
+    - protocol: "STORAGE"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+  
+  params:
+    - key: "storage.default_pool"
+      type: "string"
+      default: "default"
+      description: "默认存储池"
+    - key: "storage.default_fstype"
+      type: "string"
+      default: "ext4"
+      description: "默认文件系统类型"
+    - key: "storage.auto_mount"
+      type: "bool"
+      default: true
+      description: "自动挂载存储卷"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/storage.ko"
+    - "/usr/bin/hwrun-storaged"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+9.2 构建脚本
+
+```makefile
+# storage/Makefile
+
+obj-m += storage.o
+
+storage-objs := storage.o storage_volume.o storage_pool.o \
+                storage_snapshot.o storage_backup.o \
+                storage_dm.o storage_lvm.o storage_block.o \
+                storage_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C userspace
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C userspace clean
+
+install:
+	install -D -m 644 storage.ko /usr/lib/hwrun/plugins/
+	install -D -m 755 userspace/hwrun-storaged /usr/bin/
+```
+
+十、总结
+
+维度 决策
+定位 存储后端协议，所有存储操作的统一入口
+实现方式 Linux 内核模块 + 用户态服务
+代码量 ~1500-2000 行 C
+提供协议 STORAGE (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + HAP
+核心技术 Device Mapper、LVM、块设备层、SCSI 子系统
+关键功能 存储池管理、存储卷管理、快照、备份、精简配置、设备发现
+
+STORAGE 是 HWRun OS 中存储管理的核心插件。它基于 Linux 内核的 Device Mapper、LVM 和块设备层，通过 STORAGE 协议向上层插件提供存储池管理、存储卷管理、快照、备份、精简配置、设备发现等完整的存储管理功能。Device Mapper 是 Linux 内核提供的框架，用于将物理块设备映射到更高级的虚拟块设备，构成了 LVM、软件 RAID 和 dm-crypt 磁盘加密的基础。上层插件（INSTANCE、CONTAINER、PKGMGR、CLUSTER 等）通过 STORAGE 协议进行存储操作，不直接操作 Device Mapper、LVM 或块设备接口。

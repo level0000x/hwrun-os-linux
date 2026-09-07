@@ -1,0 +1,1111 @@
+HWRun OS DRIVER 实现文档
+
+模块名称： DRIVER (Device Driver Framework Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 设备驱动框架协议，提供对硬件设备驱动的加载、卸载、枚举、控制、热插拔等功能的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、PMP（进程管理）
+提供协议： DRIVER
+
+一、设计哲学
+
+1.1 核心定位
+
+DRIVER 是 HWRun OS 的设备驱动管理核心——所有与硬件设备驱动加载、卸载、枚举、控制、热插拔相关的操作都通过 DRIVER 协议进行。
+
+```
+DRIVER = 设备驱动框架协议 = 所有设备驱动操作的统一入口
+
+上层插件 (HAP, PMP, NP, DISPLAY, STORAGE, INPUT, ...)
+    │
+    │  通过 DRIVER 协议加载/控制设备驱动
+    ▼
+DRIVER 插件 (内核模块)
+    │
+    │  基于 Linux 设备驱动模型
+    │  ├── 设备模型 (Device Model)          → bus/device/driver 统一管理
+    │  ├── Platform 框架                     → SoC 内部设备
+    │  ├── PCI 子系统                        → PCI/PCIe 设备
+    │  ├── USB 子系统                        → USB 设备
+    │  ├── I2C/SPI 子系统                   → 低速总线设备
+    │  └── 热插拔机制 (uevent)              → 设备动态发现
+    │
+    ▼
+Linux 内核 (设备驱动模型 / sysfs)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有设备驱动操作通过 DRIVER 协议进行
+2. 统一模型：基于 Linux 内核的 Bus-Device-Driver 模型
+3. 分离思想：驱动与设备分离，驱动只管驱动逻辑，设备只管硬件资源
+4. 分层思想：同类设备提炼核心层，驱动只需“填空”
+5. 热插拔支持：支持设备的动态发现和移除
+6. sysfs 暴露：通过 /sys 文件系统暴露设备拓扑
+
+1.3 驱动框架的层次结构
+
+Linux 内核中的驱动框架可以从两个层面理解：
+
+层次 说明
+广义（驱动架构） Linux 驱动的整体架构与模型，即设备模型（Device Model）
+狭义（驱动框架） 内核中用于组织和管理设备驱动的具体框架/子系统
+
+Linux 驱动并不是“随便写个函数”，而是基于一套统一模型：
+
+```
+用户空间程序
+    │
+    │  系统调用
+    ▼
+内核 (进程调度 / 内存 / 文件系统)
+    │
+    │
+    ▼
+驱动框架 (bus / class / driver)          ← DRIVER 插件管理这一层
+    │
+    │
+    ▼
+具体硬件 (CPU 外设 / PCI / USB / I2C ...)
+```
+
+1.4 DRIVER 插件的本质
+
+DRIVER 插件 = Linux 内核设备驱动模型的 HWRun 协议封装
+
+Linux 内核的驱动模型建立在三个核心概念之上：
+
+概念 说明 内核结构体
+Bus（总线） CPU 和设备之间的通道，负责匹配设备和驱动 struct bus_type
+Device（设备） 具体的硬件设备，描述硬件资源 struct device
+Driver（驱动） 控制设备的软件逻辑 struct device_driver
+
+三者的关系：
+
+· bus 下面可以有许多 device，一个 device 必须属于一个 bus
+· 每个 device 由一个 driver 驱动
+· driver 需要和 device 匹配（通过名字、ID、compatible 等信息）
+
+```
+bus
+├── device 1 ←── driver A (匹配)
+├── device 2 ←── driver B (匹配)
+└── device 3 ←── driver A (匹配)
+
+内核负责：设备与驱动匹配、自动加载、电源管理、热插拔（uevent）[reference:19]
+```
+
+二、整体架构
+
+2.1 DRIVER 插件的组成
+
+```
+DRIVER 插件 (driver.ko)
+├── 协议处理层
+│   ├── driver_ipc_handler()      ← IPC 消息分发
+│   ├── driver_list()             ← 列出所有驱动
+│   ├── driver_info()             ← 获取驱动信息
+│   ├── driver_load()             ← 加载驱动模块
+│   ├── driver_unload()           ← 卸载驱动模块
+│   ├── driver_bind()             ← 绑定驱动到设备
+│   ├── driver_unbind()           ← 解绑驱动
+│   ├── driver_control()          ← 控制设备
+│   ├── driver_scan()             ← 扫描设备
+│   └── driver_uevent()           ← 热插拔事件
+│
+├── 设备模型封装层
+│   ├── driver_model.c            ← 设备模型核心封装
+│   ├── driver_bus.c              ← 总线管理
+│   ├── driver_device.c           ← 设备管理
+│   └── driver_class.c            ← 类管理
+│
+├── 子系统框架层
+│   ├── driver_platform.c         ← Platform 设备驱动框架
+│   ├── driver_pci.c              ← PCI 设备驱动框架
+│   ├── driver_usb.c              ← USB 设备驱动框架
+│   ├── driver_i2c.c              ← I2C 设备驱动框架
+│   └── driver_spi.c              ← SPI 设备驱动框架
+│
+├── 热插拔层
+│   ├── driver_hotplug.c          ← 热插拔事件处理
+│   └── driver_uevent.c           ← uevent 监听
+│
+└── 初始化/清理
+    ├── driver_init()             ← 模块加载
+    └── driver_exit()             ← 模块卸载
+```
+
+2.2 DRIVER 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → DRIVER → 其他插件
+                                                                                                                                    ↑
+                                                                                                                          DRIVER 在这里加载
+```
+
+DRIVER 插件在 CONSENSUS 之后加载，为系统提供设备驱动管理能力。
+
+2.3 DRIVER 的上层消费者
+
+上层插件 需要 DRIVER 提供什么
+HAP (硬件抽象) 获取设备信息、加载硬件驱动
+NP (网络协议) 加载网卡驱动
+DISPLAY (显示) 加载显示驱动 (DRM/KMS)
+STORAGE (存储) 加载存储设备驱动
+INPUT (输入) 加载输入设备驱动
+HOTPLUG (热插拔) 设备热插拔事件通知
+
+三、核心数据结构
+
+```c
+// driver/include/driver.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   总线类型 (对应 Linux struct bus_type)
+   ============================================================ */
+typedef enum {
+    DRIVER_BUS_PLATFORM = 0,        // Platform 总线 (SoC 内部设备)
+    DRIVER_BUS_PCI,                  // PCI/PCIe 总线
+    DRIVER_BUS_USB,                  // USB 总线
+    DRIVER_BUS_I2C,                  // I2C 总线
+    DRIVER_BUS_SPI,                  // SPI 总线
+    DRIVER_BUS_MMC,                  // MMC/SD 总线
+    DRIVER_BUS_SERIO,                // 串行总线
+    DRIVER_BUS_VIRTIO,               // VirtIO 总线
+    DRIVER_BUS_UNKNOWN,
+} driver_bus_type_t;
+
+/* ============================================================
+   设备类型 (对应 Linux 设备类别)
+   ============================================================ */
+typedef enum {
+    DRIVER_DEVICE_UNKNOWN = 0,
+    DRIVER_DEVICE_NETWORK,           // 网络设备
+    DRIVER_DEVICE_DISPLAY,           // 显示设备
+    DRIVER_DEVICE_STORAGE,           // 存储设备
+    DRIVER_DEVICE_INPUT,             // 输入设备
+    DRIVER_DEVICE_AUDIO,             // 音频设备
+    DRIVER_DEVICE_GPU,               // GPU
+    DRIVER_DEVICE_PCI,               // PCI 设备
+    DRIVER_DEVICE_USB,               // USB 设备
+    DRIVER_DEVICE_I2C,               // I2C 设备
+    DRIVER_DEVICE_SPI,               // SPI 设备
+    DRIVER_DEVICE_PLATFORM,          // Platform 设备
+} driver_device_type_t;
+
+/* ============================================================
+   驱动信息
+   ============================================================ */
+typedef struct driver_info {
+    char name[64];                  // 驱动名称
+    char module[64];                // 内核模块名
+    char version[32];               // 驱动版本
+    driver_bus_type_t bus_type;     // 总线类型
+    driver_device_type_t device_type; // 设备类型
+    int loaded;                     // 是否已加载
+    int ref_count;                  // 引用计数
+    uint64_t loaded_at;             // 加载时间
+    struct driver_info *next;
+} driver_info_t;
+
+/* ============================================================
+   设备信息
+   ============================================================ */
+typedef struct driver_device_info {
+    char name[64];                  // 设备名称
+    char path[256];                 // sysfs 路径
+    driver_bus_type_t bus_type;     // 总线类型
+    driver_device_type_t type;      // 设备类型
+    char driver[64];                // 绑定驱动名称
+    int bound;                      // 是否已绑定驱动
+    uint64_t discovered_at;         // 发现时间
+    uint32_t vendor_id;             // 厂商 ID (PCI/USB)
+    uint32_t device_id;             // 设备 ID (PCI/USB)
+    struct driver_device_info *next;
+} driver_device_info_t;
+
+/* ============================================================
+   Platform 设备资源 (对应 struct resource)
+   ============================================================ */
+typedef struct platform_resource {
+    uint64_t start;                 // 资源起始地址
+    uint64_t end;                   // 资源结束地址
+    uint32_t flags;                 // 资源类型 (IORESOURCE_MEM, IORESOURCE_IRQ, etc.)
+    char name[64];
+} platform_resource_t;
+
+/* ============================================================
+   Platform 设备 (对应 struct platform_device)
+   ============================================================ */
+typedef struct platform_device {
+    char name[64];                  // 设备名称
+    uint32_t id;                    // 设备 ID
+    uint32_t num_resources;         // 资源数量
+    platform_resource_t *resources; // 资源列表
+    char compatible[128];           // Device Tree compatible 字符串
+    struct platform_device *next;
+} platform_device_t;
+
+/* ============================================================
+   Platform 驱动 (对应 struct platform_driver)
+   ============================================================ */
+typedef struct platform_driver {
+    char name[64];                  // 驱动名称
+    char compatible[128];           // 支持的 compatible 列表
+    int (*probe)(struct platform_device *dev);
+    int (*remove)(struct platform_device *dev);
+    int (*suspend)(struct platform_device *dev);
+    int (*resume)(struct platform_device *dev);
+    struct platform_driver *next;
+} platform_driver_t;
+
+/* ============================================================
+   DRIVER 上下文
+   ============================================================ */
+typedef struct driver_context {
+    int initialized;
+    uint64_t driver_task_id;        // DRIVER 自身的任务 ID
+    
+    driver_info_t *drivers;         // 驱动列表
+    driver_device_info_t *devices;  // 设备列表
+    platform_device_t *platform_devices;   // Platform 设备列表
+    platform_driver_t *platform_drivers;   // Platform 驱动列表
+    
+    void *lock;
+} driver_context_t;
+```
+
+四、DRIVER 协议定义
+
+```protobuf
+// protocols/driver.proto
+syntax = "proto3";
+
+package hwrun.driver;
+
+service Driver {
+    // === 驱动管理 ===
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Info(InfoRequest) returns (InfoResponse);
+    rpc Load(LoadRequest) returns (LoadResponse);
+    rpc Unload(UnloadRequest) returns (UnloadResponse);
+    
+    // === 设备管理 ===
+    rpc Devices(DevicesRequest) returns (DevicesResponse);
+    rpc DeviceInfo(DeviceInfoRequest) returns (DeviceInfoResponse);
+    
+    // === 绑定管理 ===
+    rpc Bind(BindRequest) returns (BindResponse);
+    rpc Unbind(UnbindRequest) returns (UnbindResponse);
+    
+    // === 设备控制 ===
+    rpc Control(ControlRequest) returns (ControlResponse);
+    
+    // === 扫描 ===
+    rpc Scan(Empty) returns (ScanResponse);
+}
+
+message Empty {}
+
+// ============ 驱动管理 ============
+
+message DriverInfo {
+    string name = 1;
+    string module = 2;
+    string version = 3;
+    uint32 bus_type = 4;
+    uint32 device_type = 5;
+    bool loaded = 6;
+    uint32 ref_count = 7;
+    uint64 loaded_at = 8;
+}
+
+message ListRequest {
+    string filter = 1;
+}
+
+message ListResponse {
+    repeated DriverInfo drivers = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message InfoRequest {
+    string name = 1;
+}
+
+message InfoResponse {
+    DriverInfo info = 1;
+    int32 error = 2;
+}
+
+message LoadRequest {
+    string module = 1;
+    string args = 2;
+}
+
+message LoadResponse {
+    bool success = 1;
+    string name = 2;
+    int32 error = 3;
+}
+
+message UnloadRequest {
+    string module = 1;
+    bool force = 2;
+}
+
+message UnloadResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 设备管理 ============
+
+message DeviceInfo {
+    string name = 1;
+    string path = 2;
+    uint32 bus_type = 3;
+    uint32 type = 4;
+    string driver = 5;
+    bool bound = 6;
+    uint64 discovered_at = 7;
+    uint32 vendor_id = 8;
+    uint32 device_id = 9;
+}
+
+message DevicesRequest {
+    string filter = 1;
+    uint32 bus_type = 2;
+}
+
+message DevicesResponse {
+    repeated DeviceInfo devices = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message DeviceInfoRequest {
+    string name = 1;
+}
+
+message DeviceInfoResponse {
+    DeviceInfo info = 1;
+    int32 error = 2;
+}
+
+// ============ 绑定管理 ============
+
+message BindRequest {
+    string device = 1;
+    string driver = 2;
+}
+
+message BindResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message UnbindRequest {
+    string device = 1;
+}
+
+message UnbindResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 设备控制 ============
+
+message ControlRequest {
+    string device = 1;
+    string command = 2;
+    bytes data = 3;
+}
+
+message ControlResponse {
+    bytes result = 1;
+    int32 error = 2;
+}
+
+// ============ 扫描 ============
+
+message ScanResponse {
+    uint32 devices_found = 1;
+    uint32 drivers_found = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// driver/src/driver.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/device.h>
+#include <linux/platform_device.h>
+#include <linux/pci.h>
+#include <linux/usb.h>
+#include <linux/i2c.h>
+#include <linux/spi/spi.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "driver.h"
+#include "driver_ipc.h"
+#include "driver_model.h"
+#include "driver_platform.h"
+#include "driver_pci.h"
+#include "driver_usb.h"
+#include "driver_hotplug.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Device Driver Framework Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static driver_context_t g_driver_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init driver_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun DRIVER: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_driver_ctx, 0, sizeof(driver_context_t));
+    
+    // 2. 初始化设备模型封装
+    ret = driver_model_init();
+    if (ret < 0) {
+        printk(KERN_WARNING "HWRun DRIVER: Device model init warning\n");
+    }
+    
+    // 3. 扫描现有设备
+    driver_scan_devices();
+    
+    // 4. 注册 IPC 消息处理器
+    ret = driver_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun DRIVER: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 5. 注册 DRIVER 协议（通过 METAPROTO - 通过 IPC）
+    driver_register_protocol();
+    
+    g_driver_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun DRIVER: Initialized successfully\n");
+    printk(KERN_INFO "  Device driver framework ready\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit driver_exit(void) {
+    printk(KERN_INFO "HWRun DRIVER: Exiting...\n");
+    
+    driver_ipc_unregister();
+    driver_cleanup_drivers();
+    driver_cleanup_devices();
+    
+    g_driver_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun DRIVER: Exited\n");
+}
+
+module_init(driver_init);
+module_exit(driver_exit);
+```
+
+5.2 设备模型封装
+
+Linux 内核的设备模型建立在 kobject 和 kset 之上。
+
+```c
+// driver/src/driver_model.c
+
+#include <linux/kernel.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "driver.h"
+#include "driver_model.h"
+
+/* ============================================================
+   初始化设备模型封装
+   ============================================================ */
+int driver_model_init(void) {
+    // 设备模型是内核的统一对象管理架构[reference:22]
+    // 驱动框架是具体类型驱动代码的编写规范[reference:23]
+    // 本封装层提供对设备模型核心接口的访问
+    
+    // 总线、设备、驱动在内核中都有对应的结构体[reference:24]：
+    // - struct bus_type
+    // - struct device
+    // - struct device_driver
+    // 这些结构定义在 include/linux/device.h[reference:25]
+    
+    return 0;
+}
+
+/* ============================================================
+   获取总线类型名称
+   ============================================================ */
+const char *driver_bus_type_name(driver_bus_type_t type) {
+    switch (type) {
+        case DRIVER_BUS_PLATFORM: return "platform";
+        case DRIVER_BUS_PCI: return "pci";
+        case DRIVER_BUS_USB: return "usb";
+        case DRIVER_BUS_I2C: return "i2c";
+        case DRIVER_BUS_SPI: return "spi";
+        case DRIVER_BUS_MMC: return "mmc";
+        case DRIVER_BUS_SERIO: return "serio";
+        case DRIVER_BUS_VIRTIO: return "virtio";
+        default: return "unknown";
+    }
+}
+```
+
+5.3 Platform 设备驱动框架
+
+Platform 总线是 Linux 内核中的一种虚拟总线，用于管理 SoC 内部设备。
+
+```
+Platform 设备驱动模型中，分为设备、驱动、总线3个实体[reference:28]：
+├── platform_device   → 描述硬件资源（寄存器地址、中断号等）
+├── platform_driver   → 驱动逻辑（probe、remove 等）
+└── platform_bus      → 负责将设备和驱动绑定[reference:29]
+```
+
+哪些设备使用 Platform 总线？几乎所有直接连接到 SoC 芯片的外设：
+
+· GPIO 控制器
+· UART 串口控制器
+· RTC 实时时钟
+· 看门狗
+· ADC/DAC
+· PWM 脉冲宽度调制器
+· DMA 控制器
+
+```c
+// driver/src/driver_platform.c
+
+#include <linux/kernel.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "driver.h"
+#include "driver_platform.h"
+
+/* ============================================================
+   注册 Platform 设备
+   ============================================================ */
+int driver_platform_device_register(platform_device_t *pdev) {
+    struct platform_device *dev;
+    int ret;
+    
+    // 创建设备资源
+    struct resource *res = NULL;
+    if (pdev->num_resources > 0) {
+        res = kmalloc(pdev->num_resources * sizeof(struct resource), GFP_KERNEL);
+        if (!res) {
+            return -ENOMEM;
+        }
+        for (int i = 0; i < pdev->num_resources; i++) {
+            res[i].start = pdev->resources[i].start;
+            res[i].end = pdev->resources[i].end;
+            res[i].flags = pdev->resources[i].flags;
+            if (pdev->resources[i].name[0]) {
+                res[i].name = pdev->resources[i].name;
+            }
+        }
+    }
+    
+    // 注册 platform 设备
+    // 实际使用 platform_device_register()
+    // 或 platform_device_alloc() + platform_device_add()
+    
+    ret = platform_device_register_simple(pdev->name, pdev->id, res, pdev->num_resources);
+    
+    if (res) {
+        kfree(res);
+    }
+    
+    return ret;
+}
+
+/* ============================================================
+   注册 Platform 驱动
+   ============================================================ */
+int driver_platform_driver_register(platform_driver_t *pdrv) {
+    struct platform_driver drv = {0};
+    int ret;
+    
+    drv.driver.name = pdrv->name;
+    drv.probe = pdrv->probe;
+    drv.remove = pdrv->remove;
+    drv.suspend = pdrv->suspend;
+    drv.resume = pdrv->resume;
+    
+    // 设置设备树匹配表 (of_match_table)[reference:31]
+    // 驱动通过 of_match_table 声明支持的 compatible 列表
+    // 注册时由内核按"最具体 → 最通用"的规则匹配节点[reference:32]
+    
+    ret = platform_driver_register(&drv);
+    return ret;
+}
+
+/* ============================================================
+   Platform 驱动 probe 函数 (匹配成功后执行)
+   ============================================================ */
+// 当驱动和设备匹配成功以后就会执行 probe 函数[reference:33]
+// 在 probe 函数里面执行设备初始化和资源分配[reference:34]
+static int driver_platform_probe(struct platform_device *pdev) {
+    // 获取设备资源 (IORESOURCE_MEM, IORESOURCE_IRQ 等)[reference:35]
+    struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (res) {
+        // 处理内存资源
+    }
+    
+    int irq = platform_get_irq(pdev, 0);
+    if (irq >= 0) {
+        // 处理中断资源
+    }
+    
+    // 设备初始化...
+    return 0;
+}
+```
+
+5.4 PCI 设备驱动框架
+
+PCI 子系统负责总线枚举、资源配置、设备发现。
+
+```
+PCI 驱动框架层次[reference:37]：
+├── drivers/pci/       → PCI 核心层
+│   ├── probe.c        → 总线枚举
+│   ├── bus.c          → 总线管理
+│   └── pci-driver.c   → 驱动管理
+├── struct pci_dev     → PCI 设备描述[reference:38]
+└── struct pci_driver  → PCI 驱动描述[reference:39]
+```
+
+PCI 设备枚举流程：
+
+1. 系统上电或 PCIe 设备热插拔时触发枚举
+2. PCI 通用代码扫描物理总线
+3. 读取每个设备的配置空间
+4. 获取 Vendor ID、Device ID、BAR 等关键信息
+5. 将设备登记到系统中
+
+```c
+// driver/src/driver_pci.c
+
+#include <linux/kernel.h>
+#include <linux/pci.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "driver.h"
+#include "driver_pci.h"
+
+/* ============================================================
+   PCI 驱动 ID 表
+   ============================================================ */
+// 驱动通过 ID 表声明支持的设备[reference:44]
+// 包含 vendor、device、subvendor、subdevice 等字段[reference:45]
+
+static const struct pci_device_id driver_pci_ids[] = {
+    { PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x1234) },
+    { PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x5678) },
+    { 0, }
+};
+
+/* ============================================================
+   PCI 驱动 probe 函数
+   ============================================================ */
+static int driver_pci_probe(struct pci_dev *dev, const struct pci_device_id *id) {
+    // 1. 启用 PCI 设备
+    pci_enable_device(dev);
+    
+    // 2. 请求 I/O 区域
+    pci_request_regions(dev, "driver_pci");
+    
+    // 3. 设置 DMA 掩码
+    pci_set_dma_mask(dev, DMA_BIT_MASK(64));
+    
+    // 4. 读取配置空间获取 BAR 地址
+    // 每个 PCI 设备有 256 字节（PCIe 扩展为 4096 字节）的配置空间[reference:46]
+    // 存储设备 ID、厂商 ID、基地址寄存器（BAR）、中断号等关键信息[reference:47]
+    
+    return 0;
+}
+
+/* ============================================================
+   PCI 驱动结构
+   ============================================================ */
+static struct pci_driver driver_pci_drv = {
+    .name = "driver_pci",
+    .id_table = driver_pci_ids,
+    .probe = driver_pci_probe,
+    .remove = NULL,
+};
+```
+
+5.5 USB 设备驱动框架
+
+USB 驱动框架分为多层：
+
+```
+USB 驱动框架层次[reference:49]：
+├── USB 主机控制器硬件 (最底层)
+├── USB 主机控制器驱动 (OHCI/EHCI/UHCI)[reference:50]
+├── USB 核心层[reference:51]
+└── USB 设备驱动层 (U盘、鼠标、USB转串口等)[reference:52]
+```
+
+```c
+// driver/src/driver_usb.c
+
+#include <linux/kernel.h>
+#include <linux/usb.h>
+#include <linux/slab.h>
+
+#include "driver.h"
+#include "driver_usb.h"
+
+/* ============================================================
+   USB 驱动 ID 表
+   ============================================================ */
+static const struct usb_device_id driver_usb_ids[] = {
+    { USB_DEVICE(0x1234, 0x5678) },
+    { USB_DEVICE(0x8765, 0x4321) },
+    { 0, }
+};
+
+/* ============================================================
+   USB 驱动 probe 函数
+   ============================================================ */
+static int driver_usb_probe(struct usb_interface *intf,
+                             const struct usb_device_id *id) {
+    struct usb_device *dev = interface_to_usbdev(intf);
+    
+    // 获取设备描述符
+    // 初始化设备
+    // 注册字符设备或创建 sysfs 节点
+    
+    return 0;
+}
+
+/* ============================================================
+   USB 驱动结构
+   ============================================================ */
+static struct usb_driver driver_usb_drv = {
+    .name = "driver_usb",
+    .id_table = driver_usb_ids,
+    .probe = driver_usb_probe,
+    .disconnect = NULL,
+};
+```
+
+5.6 热插拔 (uevent) 机制
+
+Linux 内核使用 uevent 机制通知用户空间设备事件。内核通过 netlink socket 发送事件。
+
+```
+热插拔事件流程[reference:55]：
+1. 内核检测到设备添加/移除
+2. 调用 kobject_uevent()[reference:56]
+3. 通过 netlink socket (NETLINK_KOBJECT_UEVENT) 发送事件[reference:57]
+4. 用户空间 udev 接收事件并处理[reference:58]
+```
+
+```c
+// driver/src/driver_hotplug.c
+
+#include <linux/kernel.h>
+#include <linux/device.h>
+#include <linux/string.h>
+
+#include "driver.h"
+#include "driver_hotplug.h"
+
+/* ============================================================
+   热插拔事件处理
+   ============================================================ */
+// 内核使用 kobject_uevent() 发送事件到用户空间[reference:59]
+// 用户空间可以通过 netlink 监听这些事件[reference:60]
+
+static int driver_uevent_callback(struct device *dev, struct kobj_uevent_env *env) {
+    // 添加设备信息到环境变量
+    add_uevent_var(env, "HWDEVICE=%s", dev_name(dev));
+    add_uevent_var(env, "HWBUS=%s", dev->bus ? dev->bus->name : "unknown");
+    
+    return 0;
+}
+
+/* ============================================================
+   注册热插拔事件监听
+   ============================================================ */
+int driver_hotplug_register(void) {
+    // 实际实现中使用 netlink 监听 uevent 事件
+    // 或通过 /sys 文件系统监听设备变化
+    
+    return 0;
+}
+```
+
+5.7 IPC 消息处理
+
+```c
+// driver/src/driver_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "driver.h"
+#include "driver_ipc.h"
+#include "driver_model.h"
+#include "driver_platform.h"
+#include "driver_pci.h"
+#include "driver_usb.h"
+#include "driver_hotplug.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void driver_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case DRIVER_MSG_LIST: {
+            // 返回驱动列表
+            driver_info_t *drivers;
+            uint32_t count;
+            driver_list_drivers(&drivers, &count);
+            ipc_reply(from_task, drivers, count * sizeof(driver_info_t));
+            break;
+        }
+        
+        case DRIVER_MSG_LOAD: {
+            driver_load_req_t *req = (driver_load_req_t *)data;
+            int ret = driver_load_module(req->module, req->args);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case DRIVER_MSG_UNLOAD: {
+            driver_unload_req_t *req = (driver_unload_req_t *)data;
+            int ret = driver_unload_module(req->module, req->force);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case DRIVER_MSG_DEVICES: {
+            driver_devices_req_t *req = (driver_devices_req_t *)data;
+            driver_device_info_t *devices;
+            uint32_t count;
+            driver_list_devices(&devices, &count, req->bus_type);
+            ipc_reply(from_task, devices, count * sizeof(driver_device_info_t));
+            break;
+        }
+        
+        case DRIVER_MSG_BIND: {
+            driver_bind_req_t *req = (driver_bind_req_t *)data;
+            int ret = driver_bind_device(req->device, req->driver);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case DRIVER_MSG_SCAN: {
+            int ret = driver_scan_devices();
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun DRIVER: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、驱动框架分类
+
+Linux 内核将设备驱动分为多个框架/子系统，驱动只需“填空”即可：
+
+框架 用途 用户空间接口
+字符设备 串口、传感器、自定义硬件 /dev/xxx
+块设备 硬盘、SD卡、SSD /dev/sdX
+网络设备 网卡、WiFi ifconfig / ip
+Input 键盘、鼠标、触摸 /dev/input/
+I2C I2C 设备 /dev/i2c-*
+SPI SPI 设备 /dev/spidev*
+USB USB 设备 /dev/bus/usb/
+GPIO 通用 IO /sys/class/gpio/
+DRM 显示 /dev/dri/
+ALSA 音频 /dev/snd/
+
+这些框架的好处：
+
+· 不用重复造轮子
+· 驱动更统一
+· 更易于维护
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/driver.yml
+driver:
+  # 自动加载驱动
+  auto_load:
+    - "pci"
+    - "usb"
+    - "i2c"
+  
+  # 黑名单（禁止加载的驱动）
+  blacklist:
+    - "dummy"
+    - "blacklist_module"
+  
+  # Platform 设备配置
+  platform:
+    devices:
+      - name: "uart1"
+        compatible: "snps,dw-apb-uart"
+        resources:
+          - type: "mem"
+            start: 0x10010000
+            end: 0x10010FFF
+          - type: "irq"
+            start: 42
+            end: 42
+```
+
+八、命令行接口
+
+```bash
+# 驱动管理
+hwrun driver list
+hwrun driver info e1000e
+hwrun driver load e1000e
+hwrun driver unload e1000e
+hwrun driver unload e1000e --force
+
+# 设备管理
+hwrun driver devices
+hwrun driver devices --bus pci
+hwrun driver device-info /dev/sda
+
+# 绑定管理
+hwrun driver bind /dev/sda --driver sd
+hwrun driver unbind /dev/sda
+
+# 设备控制
+hwrun driver control /dev/ttyS0 --command "reset"
+
+# 扫描
+hwrun driver scan
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+```yaml
+# plugins/driver/plugin.yml
+plugin:
+  id: "driver"
+  name: "Device Driver Framework Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 设备驱动框架协议，提供设备驱动的加载、卸载、枚举、控制、热插拔等管理功能"
+  
+  provides:
+    - protocol: "DRIVER"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+  
+  params:
+    - key: "driver.auto_load"
+      type: "list"
+      default: ["pci", "usb"]
+      description: "自动加载的驱动模块"
+    - key: "driver.blacklist"
+      type: "list"
+      default: []
+      description: "禁止加载的驱动模块"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/driver.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+9.2 构建脚本
+
+```makefile
+# driver/Makefile
+
+obj-m += driver.o
+
+driver-objs := driver.o driver_model.o driver_platform.o \
+               driver_pci.o driver_usb.o driver_i2c.o \
+               driver_spi.o driver_hotplug.o driver_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 driver.ko /usr/lib/hwrun/plugins/
+```
+
+十、总结
+
+维度 决策
+定位 设备驱动框架协议，所有设备驱动操作的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~1500-2000 行 C
+提供协议 DRIVER (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + PMP
+核心模型 Bus-Device-Driver 模型
+关键框架 Platform、PCI、USB、I2C、SPI
+热插拔 uevent netlink 机制
+
+DRIVER 是 HWRun OS 中设备驱动管理的核心插件。它基于 Linux 内核的 Bus-Device-Driver 设备模型，通过 DRIVER 协议向上层插件提供设备驱动的加载、卸载、枚举、控制、热插拔等完整的管理功能。设备模型让设备、驱动与总线之间形成清晰的组织体系，并通过统一的方式出现在内核和 sysfs 下。上层插件（HAP、PMP、NP、DISPLAY、STORAGE、INPUT 等）通过 DRIVER 协议加载和管理设备驱动，不直接操作内核的驱动模型接口。

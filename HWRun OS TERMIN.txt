@@ -1,0 +1,1385 @@
+﻿HWRun OS TERMINAL 实现文档
+
+模块名称： TERMINAL (Terminal Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 终端协议，提供伪终端（PTY）会话管理、终端控制、行规程处理等终端功能的统一抽象
+实现语言： C（用户态服务 + 内核模块辅助）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、PMP（进程管理）、FSP（文件系统）、NP（网络协议）、INPUT（输入设备）、DISPLAY（显示协议）、SHELL（Shell协议）
+提供协议： TERMINAL
+
+一、设计哲学
+
+1.1 核心定位
+
+TERMINAL 是 HWRun OS 的终端管理核心——所有与伪终端（PTY）会话、终端控制、行规程处理、终端仿真相关的操作都通过 TERMINAL 协议进行。
+
+```
+TERMINAL = 终端协议 = 所有终端操作的统一入口
+
+上层插件 (SHELL, CONSOLE, UI, DESKTOP, SSH, ...)
+    │
+    │  通过 TERMINAL 协议创建和管理终端会话
+    ▼
+TERMINAL 插件 (用户态服务)
+    │
+    │  基于 Linux 伪终端 (PTY) 子系统
+    │  ├── 伪终端管理 (posix_openpt / grantpt / unlockpt / ptsname)
+    │  ├── 终端控制 (tcgetattr / tcsetattr / termios)
+    │  ├── 窗口大小 (TIOCSWINSZ / TIOCGWINSZ)
+    │  ├── 行规程处理 (Line Discipline)
+    │  └── 终端仿真 (VT100 / xterm / 自定义)
+    │
+    ▼
+Linux 内核 (TTY / PTY / devpts 文件系统)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有终端操作通过 TERMINAL 协议进行
+2. 伪终端基础：基于 Linux 内核的 PTY（伪终端）子系统
+3. 行规程处理：支持标准的 POSIX 行规程（icanon、echo、信号处理等）
+4. 终端仿真：支持 VT100、xterm 等主流终端类型
+5. 会话管理：支持多个终端会话的创建、销毁、切换
+6. 窗口大小调整：支持动态调整终端窗口大小
+
+1.3 伪终端 (PTY) 概念
+
+伪终端（Pseudo-Terminal，PTY）是 Linux 内核提供的一对虚拟字符设备，用于在用户态程序与终端之间建立通信通道。PTY 提供了一种机制，让一个进程可以像操作真实终端一样与另一个进程通信。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    伪终端 (PTY) 工作原理                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  终端应用程序 (Terminal App)                                       │   │
+│  │  (如: hwrun-terminal, SSH 客户端, 终端仿真器)                     │   │
+│  │  作用: 显示输出、捕获键盘输入                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    │ 写入/读取                              │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PTY Master (/dev/ptmx)                                            │   │
+│  │  作用: 终端应用程序持有 Master 端                                   │   │
+│  │  功能: 接收从 Slave 端传来的输出，发送输入到 Slave 端              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                             内核数据转发                                    │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PTY Slave (/dev/pts/N)                                            │   │
+│  │  作用: 终端应用程序持有 Master 端                                   │   │
+│  │  功能: 运行 Shell 或子进程，将输出发送到 Master，从 Master 接收输入│   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│                                    │ 标准输入/输出                         │
+│                                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Shell / 子进程                                                    │   │
+│  │  (如: /bin/bash, /bin/sh, 用户程序)                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+PTY 的工作流程：
+
+1. 终端应用程序打开 /dev/ptmx（PTY Master），获取一个文件描述符
+2. 通过 grantpt() 设置 Slave 设备的权限
+3. 通过 unlockpt() 解锁 Slave 设备
+4. 通过 ptsname() 获取 Slave 设备路径（如 /dev/pts/0）
+5. 创建子进程，将子进程的 stdin/stdout/stderr 重定向到 Slave 设备
+6. 终端应用程序通过 Master 端读写数据，Shell 通过 Slave 端读写数据
+
+1.4 TERMINAL 插件的本质
+
+TERMINAL 插件 = Linux PTY 子系统的 HWRun 协议封装 + 终端仿真器
+
+二、整体架构
+
+2.1 TERMINAL 插件的组成
+
+```
+TERMINAL 插件 (用户态服务)
+├── 协议处理层
+│   ├── terminal_ipc_handler()    ← IPC 消息分发
+│   ├── terminal_open()           ← 打开终端会话
+│   ├── terminal_close()          ← 关闭终端会话
+│   ├── terminal_resize()         ← 调整终端大小
+│   ├── terminal_write()          ← 写入终端
+│   ├── terminal_read()           ← 读取终端
+│   └── terminal_get_size()       ← 获取终端大小
+│
+├── PTY 管理层
+│   ├── terminal_pty.c            ← PTY 创建和管理
+│   ├── terminal_pty_open()       ← posix_openpt
+│   ├── terminal_pty_grant()      ← grantpt
+│   ├── terminal_pty_unlock()     ← unlockpt
+│   └── terminal_pty_name()       ← ptsname
+│
+├── 终端控制层 (termios)
+│   ├── terminal_termios.c        ← termios 管理
+│   ├── terminal_tcgetattr()      ← 获取终端属性
+│   ├── terminal_tcsetattr()      ← 设置终端属性
+│   ├── terminal_cfsetispeed()    ← 设置输入速度
+│   └── terminal_cfsetospeed()    ← 设置输出速度
+│
+├── 终端仿真层
+│   ├── terminal_emulator.c       ← 终端仿真器
+│   ├── terminal_vt100.c          ← VT100 转义序列处理
+│   └── terminal_xterm.c          ← xterm 转义序列处理
+│
+├── 会话管理层
+│   ├── terminal_session.c        ← 会话管理
+│   └── terminal_session_list.c   ← 会话列表
+│
+└── 初始化/清理
+    ├── terminal_init()           ← 服务启动
+    └── terminal_exit()           ← 服务停止
+```
+
+2.2 TERMINAL 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → SANDBOX → INPUT → DISPLAY → PERMISSION → STORAGE → NODE_DISCOVERY → CONSENSUS → TERMINAL → 其他插件
+                                                                                                                                    ↑
+                                                                                                                          TERMINAL 在这里加载
+```
+
+TERMINAL 插件在 CONSENSUS 之后、其他应用插件之前加载，为系统提供终端会话管理能力。
+
+2.3 TERMINAL 的上层消费者
+
+上层插件 需要 TERMINAL 提供什么
+SHELL 终端会话、PTY 分配
+CONSOLE 系统控制台终端
+UI (用户界面) 终端窗口
+DESKTOP (桌面环境) 终端应用
+SSH 服务 远程终端会话
+
+三、核心数据结构
+
+```c
+// terminal/include/terminal.h
+
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+
+/* ============================================================
+   终端会话状态
+   ============================================================ */
+typedef enum {
+    TERMINAL_STATE_CREATED = 0,     // 已创建
+    TERMINAL_STATE_ACTIVE,          // 活跃 (正在运行)
+    TERMINAL_STATE_PAUSED,          // 已暂停
+    TERMINAL_STATE_CLOSED,          // 已关闭
+    TERMINAL_STATE_ERROR,           // 错误状态
+} terminal_state_t;
+
+/* ============================================================
+   终端类型
+   ============================================================ */
+typedef enum {
+    TERMINAL_TYPE_VT100 = 0,        // VT100
+    TERMINAL_TYPE_VT220,            // VT220
+    TERMINAL_TYPE_XTERM,            // xterm
+    TERMINAL_TYPE_XTERM_256COLOR,   // xterm-256color
+    TERMINAL_TYPE_LINUX,            // Linux 控制台
+    TERMINAL_TYPE_SCREEN,           // GNU Screen
+    TERMINAL_TYPE_CUSTOM,           // 自定义
+} terminal_type_t;
+
+/* ============================================================
+   终端会话信息
+   ============================================================ */
+typedef struct terminal_session {
+    char id[64];                    // 会话 ID (UUID)
+    char name[128];                 // 会话名称
+    terminal_state_t state;         // 会话状态
+    terminal_type_t type;           // 终端类型
+    
+    int master_fd;                  // PTY Master 文件描述符
+    char slave_path[64];            // PTY Slave 路径 (/dev/pts/N)
+    uint32_t slave_index;           // PTY 索引号
+    
+    uint32_t rows;                  // 行数
+    uint32_t cols;                  // 列数
+    
+    struct termios termios;         // 终端属性
+    struct winsize winsize;         // 窗口大小
+    
+    uint64_t task_id;               // 关联的微内核任务 ID
+    uint32_t pid;                   // 关联的进程 PID
+    
+    uint64_t created_at;            // 创建时间
+    uint64_t last_activity;         // 最后活动时间
+    
+    struct terminal_session *next;
+} terminal_session_t;
+
+/* ============================================================
+   终端配置
+   ============================================================ */
+typedef struct terminal_config {
+    terminal_type_t default_type;   // 默认终端类型
+    uint32_t default_rows;          // 默认行数
+    uint32_t default_cols;          // 默认列数
+    int echo_enabled;               // 是否启用回显
+    int canonical_mode;             // 是否启用规范模式
+    char term_env[32];              // TERM 环境变量值
+} terminal_config_t;
+
+/* ============================================================
+   TERMINAL 上下文
+   ============================================================ */
+typedef struct terminal_context {
+    int initialized;
+    uint64_t terminal_task_id;      // TERMINAL 自身的任务 ID
+    
+    terminal_config_t config;
+    terminal_session_t *sessions;   // 会话列表
+    uint32_t session_count;
+    
+    // devpts 挂载点
+    char devpts_path[64];
+    
+    void *lock;
+} terminal_context_t;
+```
+
+四、TERMINAL 协议定义
+
+```protobuf
+// protocols/terminal.proto
+syntax = "proto3";
+
+package hwrun.terminal;
+
+service Terminal {
+    // === 会话管理 ===
+    rpc Open(OpenRequest) returns (OpenResponse);
+    rpc Close(CloseRequest) returns (CloseResponse);
+    rpc List(Empty) returns (ListResponse);
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+    
+    // === 终端控制 ===
+    rpc Resize(ResizeRequest) returns (ResizeResponse);
+    rpc GetSize(GetSizeRequest) returns (GetSizeResponse);
+    
+    // === 终端 I/O ===
+    rpc Write(WriteRequest) returns (WriteResponse);
+    rpc Read(ReadRequest) returns (ReadResponse);
+    
+    // === 终端属性 ===
+    rpc GetAttr(GetAttrRequest) returns (GetAttrResponse);
+    rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+}
+
+message Empty {}
+
+// ============ 会话管理 ============
+
+message OpenRequest {
+    string name = 1;                // 会话名称 (可选)
+    uint32 type = 2;                // terminal_type_t
+    uint32 rows = 3;                // 行数
+    uint32 cols = 4;                // 列数
+    bool use_shell = 5;             // 是否自动启动 Shell
+    string shell_path = 6;          // Shell 路径 (可选)
+}
+
+message OpenResponse {
+    string session_id = 1;
+    string slave_path = 2;          // /dev/pts/N
+    uint32 slave_index = 3;
+    int32 master_fd = 4;
+    uint32 pid = 5;                 // Shell 进程 PID (如果启动)
+    int32 error = 6;
+}
+
+message CloseRequest {
+    string session_id = 1;
+    bool force = 2;
+}
+
+message CloseResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message SessionInfo {
+    string id = 1;
+    string name = 2;
+    string state = 3;               // "created", "active", "paused", "closed"
+    string type = 4;                // "vt100", "xterm", etc.
+    uint32 rows = 5;
+    uint32 cols = 6;
+    uint32 pid = 7;
+    uint64 created_at = 8;
+    uint64 last_activity = 9;
+}
+
+message ListResponse {
+    repeated SessionInfo sessions = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message GetInfoRequest {
+    string session_id = 1;
+}
+
+message GetInfoResponse {
+    SessionInfo info = 1;
+    int32 error = 2;
+}
+
+// ============ 终端控制 ============
+
+message ResizeRequest {
+    string session_id = 1;
+    uint32 rows = 2;
+    uint32 cols = 3;
+}
+
+message ResizeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message GetSizeRequest {
+    string session_id = 1;
+}
+
+message GetSizeResponse {
+    uint32 rows = 1;
+    uint32 cols = 2;
+    int32 error = 3;
+}
+
+// ============ 终端 I/O ============
+
+message WriteRequest {
+    string session_id = 1;
+    bytes data = 2;
+}
+
+message WriteResponse {
+    uint64 written = 1;
+    int32 error = 2;
+}
+
+message ReadRequest {
+    string session_id = 1;
+    uint32 max_len = 2;
+    int32 timeout_ms = 3;           // -1 阻塞, 0 非阻塞
+}
+
+message ReadResponse {
+    bytes data = 1;
+    uint64 read = 2;
+    int32 error = 3;
+}
+
+// ============ 终端属性 ============
+
+message TermiosInfo {
+    uint32 c_iflag = 1;             // 输入模式标志
+    uint32 c_oflag = 2;             // 输出模式标志
+    uint32 c_cflag = 3;             // 控制模式标志
+    uint32 c_lflag = 4;             // 本地模式标志
+    uint32 c_ispeed = 5;            // 输入速度
+    uint32 c_ospeed = 6;            // 输出速度
+    repeated uint32 c_cc = 7;       // 控制字符 (NCCS)
+}
+
+message GetAttrRequest {
+    string session_id = 1;
+}
+
+message GetAttrResponse {
+    TermiosInfo termios = 1;
+    int32 error = 2;
+}
+
+message SetAttrRequest {
+    string session_id = 1;
+    TermiosInfo termios = 2;
+    uint32 action = 3;              // 0=TCSANOW, 1=TCSADRAIN, 2=TCSAFLUSH
+}
+
+message SetAttrResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 服务初始化和启动
+
+```c
+// terminal/src/terminal.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <pty.h>
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+
+#include "terminal.h"
+#include "terminal_ipc.h"
+#include "terminal_pty.h"
+#include "terminal_termios.h"
+#include "terminal_session.h"
+#include "terminal_emulator.h"
+
+static terminal_context_t g_term_ctx = {0};
+
+/* ============================================================
+   服务初始化
+   ============================================================ */
+int terminal_init(void) {
+    int ret;
+    
+    log_info("TERMINAL: Initializing...");
+    
+    // 1. 初始化上下文
+    memset(&g_term_ctx, 0, sizeof(terminal_context_t));
+    
+    // 2. 加载配置
+    terminal_load_config(&g_term_ctx);
+    
+    // 3. 检查 devpts 文件系统
+    if (access("/dev/ptmx", F_OK) != 0) {
+        log_error("TERMINAL: /dev/ptmx not found");
+        return -1;
+    }
+    strcpy(g_term_ctx.devpts_path, "/dev/pts");
+    
+    // 4. 注册 IPC 消息处理器
+    ret = terminal_ipc_register();
+    if (ret < 0) {
+        log_error("TERMINAL: Failed to register IPC handler");
+        return ret;
+    }
+    
+    // 5. 注册 TERMINAL 协议
+    terminal_register_protocol();
+    
+    g_term_ctx.initialized = 1;
+    log_info("TERMINAL: Initialized successfully");
+    log_info("  devpts: %s", g_term_ctx.devpts_path);
+    log_info("  Default terminal: %s, %dx%d",
+             terminal_type_to_string(g_term_ctx.config.default_type),
+             g_term_ctx.config.default_cols,
+             g_term_ctx.config.default_rows);
+    
+    return 0;
+}
+```
+
+5.2 PTY 管理
+
+```c
+// terminal/src/terminal_pty.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <errno.h>
+
+#include "terminal.h"
+#include "terminal_pty.h"
+
+/* ============================================================
+   打开 PTY Master (使用 posix_openpt)
+   ============================================================ */
+int terminal_pty_open(int *master_fd, char *slave_path, size_t path_size) {
+    int fd;
+    int ret;
+    
+    // 1. 打开 PTY Master
+    fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        log_error("TERMINAL: posix_openpt failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    // 2. 设置权限 (grantpt)
+    ret = grantpt(fd);
+    if (ret < 0) {
+        log_error("TERMINAL: grantpt failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    // 3. 解锁 (unlockpt)
+    ret = unlockpt(fd);
+    if (ret < 0) {
+        log_error("TERMINAL: unlockpt failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    // 4. 获取 Slave 设备路径 (ptsname)
+    char *name = ptsname(fd);
+    if (name == NULL) {
+        log_error("TERMINAL: ptsname failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    
+    strncpy(slave_path, name, path_size - 1);
+    slave_path[path_size - 1] = '\0';
+    
+    *master_fd = fd;
+    log_debug("TERMINAL: PTY opened: master=%d, slave=%s", fd, slave_path);
+    
+    return 0;
+}
+
+/* ============================================================
+   打开 PTY Slave (用于子进程)
+   ============================================================ */
+int terminal_pty_open_slave(const char *slave_path) {
+    int fd;
+    
+    fd = open(slave_path, O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        log_error("TERMINAL: Failed to open slave %s: %s",
+                  slave_path, strerror(errno));
+        return -1;
+    }
+    
+    // 设置为会话领导者
+    if (setsid() < 0) {
+        log_warn("TERMINAL: setsid failed: %s", strerror(errno));
+    }
+    
+    // 设置为控制终端
+    if (ioctl(fd, TIOCSCTTY, 0) < 0) {
+        log_warn("TERMINAL: TIOCSCTTY failed: %s", strerror(errno));
+    }
+    
+    return fd;
+}
+
+/* ============================================================
+   关闭 PTY
+   ============================================================ */
+void terminal_pty_close(int master_fd) {
+    if (master_fd >= 0) {
+        close(master_fd);
+        log_debug("TERMINAL: PTY master %d closed", master_fd);
+    }
+}
+```
+
+5.3 终端属性管理 (termios)
+
+```c
+// terminal/src/terminal_termios.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include "terminal.h"
+#include "terminal_termios.h"
+
+/* ============================================================
+   获取终端属性 (tcgetattr)
+   ============================================================ */
+int terminal_tcgetattr(int fd, struct termios *termios_p) {
+    if (tcgetattr(fd, termios_p) < 0) {
+        log_error("TERMINAL: tcgetattr failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* ============================================================
+   设置终端属性 (tcsetattr)
+   ============================================================ */
+int terminal_tcsetattr(int fd, int action, const struct termios *termios_p) {
+    if (tcsetattr(fd, action, termios_p) < 0) {
+        log_error("TERMINAL: tcsetattr failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* ============================================================
+   设置原始模式 (无回显, 无缓冲)
+   ============================================================ */
+int terminal_set_raw_mode(int fd) {
+    struct termios term;
+    
+    if (terminal_tcgetattr(fd, &term) < 0) {
+        return -1;
+    }
+    
+    // 关闭规范模式、回显、信号处理
+    term.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG);
+    term.c_iflag &= ~(IXON | IXOFF | ICRNL | INLCR | IGNCR);
+    term.c_oflag &= ~(OPOST | ONLCR);
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+    
+    return terminal_tcsetattr(fd, TCSANOW, &term);
+}
+
+/* ============================================================
+   设置规范模式 (标准终端模式)
+   ============================================================ */
+int terminal_set_canonical_mode(int fd) {
+    struct termios term;
+    
+    if (terminal_tcgetattr(fd, &term) < 0) {
+        return -1;
+    }
+    
+    // 启用规范模式、回显
+    term.c_lflag |= ICANON | ECHO | ECHOE | ISIG;
+    term.c_iflag |= ICRNL;
+    term.c_oflag |= OPOST | ONLCR;
+    
+    return terminal_tcsetattr(fd, TCSANOW, &term);
+}
+
+/* ============================================================
+   设置窗口大小
+   ============================================================ */
+int terminal_set_winsize(int fd, uint32_t rows, uint32_t cols) {
+    struct winsize ws;
+    
+    ws.ws_row = rows;
+    ws.ws_col = cols;
+    ws.ws_xpixel = 0;
+    ws.ws_ypixel = 0;
+    
+    if (ioctl(fd, TIOCSWINSZ, &ws) < 0) {
+        log_error("TERMINAL: TIOCSWINSZ failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* ============================================================
+   获取窗口大小
+   ============================================================ */
+int terminal_get_winsize(int fd, uint32_t *rows, uint32_t *cols) {
+    struct winsize ws;
+    
+    if (ioctl(fd, TIOCGWINSZ, &ws) < 0) {
+        log_error("TERMINAL: TIOCGWINSZ failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    
+    return 0;
+}
+```
+
+5.4 会话管理
+
+```c
+// terminal/src/terminal_session.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <uuid/uuid.h>
+
+#include "terminal.h"
+#include "terminal_session.h"
+#include "terminal_pty.h"
+#include "terminal_termios.h"
+
+/* ============================================================
+   创建终端会话
+   ============================================================ */
+int terminal_session_create(const char *name, terminal_type_t type,
+                             uint32_t rows, uint32_t cols,
+                             int use_shell, const char *shell_path,
+                             char *out_id, int *out_master_fd,
+                             char *out_slave_path, uint32_t *out_pid) {
+    terminal_session_t *session;
+    char slave_path[64];
+    int master_fd;
+    pid_t pid;
+    int ret;
+    char uuid_str[37];
+    uuid_t uuid;
+    
+    // 1. 打开 PTY
+    ret = terminal_pty_open(&master_fd, slave_path, sizeof(slave_path));
+    if (ret < 0) {
+        return -1;
+    }
+    
+    // 2. 设置窗口大小
+    terminal_set_winsize(master_fd, rows, cols);
+    
+    // 3. 创建会话记录
+    session = calloc(1, sizeof(terminal_session_t));
+    if (!session) {
+        terminal_pty_close(master_fd);
+        return -ENOMEM;
+    }
+    
+    // 4. 生成 UUID
+    uuid_generate(uuid);
+    uuid_unparse(uuid, uuid_str);
+    strncpy(session->id, uuid_str, sizeof(session->id) - 1);
+    if (name && name[0]) {
+        strncpy(session->name, name, sizeof(session->name) - 1);
+    } else {
+        snprintf(session->name, sizeof(session->name), "term-%s", uuid_str);
+    }
+    session->state = TERMINAL_STATE_ACTIVE;
+    session->type = type;
+    session->master_fd = master_fd;
+    strncpy(session->slave_path, slave_path, sizeof(session->slave_path) - 1);
+    session->rows = rows;
+    session->cols = cols;
+    session->created_at = time(NULL);
+    session->last_activity = time(NULL);
+    
+    // 5. 获取终端属性
+    terminal_tcgetattr(master_fd, &session->termios);
+    
+    // 6. 如果 use_shell 为 true，启动 Shell
+    if (use_shell) {
+        pid = fork();
+        if (pid == 0) {
+            // 子进程：运行 Shell
+            int slave_fd;
+            
+            // 打开 Slave
+            slave_fd = terminal_pty_open_slave(slave_path);
+            if (slave_fd < 0) {
+                exit(1);
+            }
+            
+            // 重定向 stdin/stdout/stderr
+            dup2(slave_fd, STDIN_FILENO);
+            dup2(slave_fd, STDOUT_FILENO);
+            dup2(slave_fd, STDERR_FILENO);
+            
+            // 关闭不需要的文件描述符
+            if (slave_fd > STDERR_FILENO) {
+                close(slave_fd);
+            }
+            close(master_fd);
+            
+            // 设置环境变量
+            char term_env[32];
+            snprintf(term_env, sizeof(term_env), "TERM=%s",
+                     terminal_type_to_string(type));
+            putenv(term_env);
+            
+            // 执行 Shell
+            const char *shell = shell_path ? shell_path : "/bin/sh";
+            execlp(shell, shell, NULL);
+            
+            // 如果 exec 失败
+            exit(1);
+        } else if (pid > 0) {
+            // 父进程
+            session->pid = pid;
+            *out_pid = pid;
+        } else {
+            // fork 失败
+            log_error("TERMINAL: fork failed: %s", strerror(errno));
+            free(session);
+            terminal_pty_close(master_fd);
+            return -1;
+        }
+    }
+    
+    // 7. 添加到会话列表
+    session->next = g_term_ctx.sessions;
+    g_term_ctx.sessions = session;
+    g_term_ctx.session_count++;
+    
+    // 8. 返回结果
+    strncpy(out_id, session->id, 64);
+    *out_master_fd = master_fd;
+    strncpy(out_slave_path, slave_path, 64);
+    
+    log_info("TERMINAL: Session %s created (slave=%s, pid=%u)",
+             session->id, slave_path, session->pid);
+    
+    return 0;
+}
+
+/* ============================================================
+   关闭终端会话
+   ============================================================ */
+int terminal_session_close(const char *session_id, int force) {
+    terminal_session_t *session;
+    terminal_session_t *prev = NULL;
+    
+    // 1. 查找会话
+    session = g_term_ctx.sessions;
+    while (session) {
+        if (strcmp(session->id, session_id) == 0) {
+            break;
+        }
+        prev = session;
+        session = session->next;
+    }
+    
+    if (!session) {
+        return -ENOENT;
+    }
+    
+    // 2. 终止 Shell 进程 (如果存在)
+    if (session->pid > 0) {
+        if (force) {
+            kill(session->pid, SIGKILL);
+        } else {
+            kill(session->pid, SIGTERM);
+            // 等待进程结束
+            waitpid(session->pid, NULL, 0);
+        }
+    }
+    
+    // 3. 关闭 PTY
+    terminal_pty_close(session->master_fd);
+    
+    // 4. 从列表中移除
+    if (prev) {
+        prev->next = session->next;
+    } else {
+        g_term_ctx.sessions = session->next;
+    }
+    g_term_ctx.session_count--;
+    
+    // 5. 释放内存
+    free(session);
+    
+    log_info("TERMINAL: Session %s closed", session_id);
+    return 0;
+}
+
+/* ============================================================
+   查找会话
+   ============================================================ */
+terminal_session_t *terminal_session_find(const char *session_id) {
+    terminal_session_t *session = g_term_ctx.sessions;
+    
+    while (session) {
+        if (strcmp(session->id, session_id) == 0) {
+            return session;
+        }
+        session = session->next;
+    }
+    
+    return NULL;
+}
+```
+
+5.5 终端 I/O
+
+```c
+// terminal/src/terminal_io.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <poll.h>
+
+#include "terminal.h"
+#include "terminal_io.h"
+#include "terminal_session.h"
+
+/* ============================================================
+   写入终端 (通过 PTY Master)
+   ============================================================ */
+int terminal_write(const char *session_id, const uint8_t *data,
+                    uint32_t len, uint64_t *out_written) {
+    terminal_session_t *session;
+    ssize_t ret;
+    
+    session = terminal_session_find(session_id);
+    if (!session) {
+        return -ENOENT;
+    }
+    
+    if (session->state != TERMINAL_STATE_ACTIVE) {
+        return -EBADF;
+    }
+    
+    ret = write(session->master_fd, data, len);
+    if (ret < 0) {
+        log_error("TERMINAL: write failed: %s", strerror(errno));
+        return -errno;
+    }
+    
+    session->last_activity = time(NULL);
+    *out_written = ret;
+    
+    return 0;
+}
+
+/* ============================================================
+   读取终端
+   ============================================================ */
+int terminal_read(const char *session_id, uint32_t max_len,
+                   int timeout_ms, uint8_t *buf, uint64_t *out_read) {
+    terminal_session_t *session;
+    struct pollfd pfd;
+    int ret;
+    ssize_t n;
+    
+    session = terminal_session_find(session_id);
+    if (!session) {
+        return -ENOENT;
+    }
+    
+    if (session->state != TERMINAL_STATE_ACTIVE) {
+        return -EBADF;
+    }
+    
+    // 使用 poll 实现超时
+    if (timeout_ms != 0) {
+        pfd.fd = session->master_fd;
+        pfd.events = POLLIN;
+        
+        ret = poll(&pfd, 1, timeout_ms);
+        if (ret < 0) {
+            return -errno;
+        }
+        if (ret == 0) {
+            // 超时
+            *out_read = 0;
+            return 0;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            *out_read = 0;
+            return 0;
+        }
+    }
+    
+    n = read(session->master_fd, buf, max_len);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            *out_read = 0;
+            return 0;
+        }
+        log_error("TERMINAL: read failed: %s", strerror(errno));
+        return -errno;
+    }
+    
+    session->last_activity = time(NULL);
+    *out_read = n;
+    
+    return 0;
+}
+
+/* ============================================================
+   调整终端大小
+   ============================================================ */
+int terminal_resize(const char *session_id, uint32_t rows, uint32_t cols) {
+    terminal_session_t *session;
+    int ret;
+    
+    session = terminal_session_find(session_id);
+    if (!session) {
+        return -ENOENT;
+    }
+    
+    ret = terminal_set_winsize(session->master_fd, rows, cols);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 发送 SIGWINCH 信号通知进程窗口大小变化
+    if (session->pid > 0) {
+        kill(session->pid, SIGWINCH);
+    }
+    
+    session->rows = rows;
+    session->cols = cols;
+    session->last_activity = time(NULL);
+    
+    return 0;
+}
+```
+
+5.6 IPC 消息处理
+
+```c
+// terminal/src/terminal_ipc.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "terminal.h"
+#include "terminal_ipc.h"
+#include "terminal_session.h"
+#include "terminal_io.h"
+#include "terminal_termios.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void terminal_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case TERMINAL_MSG_OPEN: {
+            terminal_open_req_t *req = (terminal_open_req_t *)data;
+            terminal_open_resp_t resp;
+            int ret = terminal_session_create(
+                req->name, req->type, req->rows, req->cols,
+                req->use_shell, req->shell_path,
+                resp.session_id, &resp.master_fd,
+                resp.slave_path, &resp.pid);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case TERMINAL_MSG_CLOSE: {
+            terminal_close_req_t *req = (terminal_close_req_t *)data;
+            int ret = terminal_session_close(req->session_id, req->force);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case TERMINAL_MSG_LIST: {
+            terminal_list_resp_t resp;
+            // 返回会话列表
+            ipc_reply(from_task, g_term_ctx.sessions,
+                      g_term_ctx.session_count * sizeof(terminal_session_t));
+            break;
+        }
+        
+        case TERMINAL_MSG_GET_INFO: {
+            char *session_id = (char *)data;
+            terminal_session_t *session = terminal_session_find(session_id);
+            if (session) {
+                ipc_reply(from_task, session, sizeof(terminal_session_t));
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        case TERMINAL_MSG_RESIZE: {
+            terminal_resize_req_t *req = (terminal_resize_req_t *)data;
+            int ret = terminal_resize(req->session_id, req->rows, req->cols);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case TERMINAL_MSG_GET_SIZE: {
+            terminal_get_size_req_t *req = (terminal_get_size_req_t *)data;
+            terminal_get_size_resp_t resp;
+            terminal_session_t *session = terminal_session_find(req->session_id);
+            if (session) {
+                resp.rows = session->rows;
+                resp.cols = session->cols;
+                resp.error = 0;
+            } else {
+                resp.error = -ENOENT;
+            }
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case TERMINAL_MSG_WRITE: {
+            terminal_write_req_t *req = (terminal_write_req_t *)data;
+            terminal_write_resp_t resp;
+            int ret = terminal_write(req->session_id, req->data,
+                                      req->data_len, &resp.written);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case TERMINAL_MSG_READ: {
+            terminal_read_req_t *req = (terminal_read_req_t *)data;
+            terminal_read_resp_t resp;
+            uint8_t *buf = malloc(req->max_len);
+            if (!buf) {
+                resp.read = 0;
+                resp.error = -ENOMEM;
+                ipc_reply(from_task, &resp, sizeof(resp));
+                break;
+            }
+            int ret = terminal_read(req->session_id, req->max_len,
+                                     req->timeout_ms, buf, &resp.read);
+            resp.error = ret;
+            // 发送数据
+            ipc_reply(from_task, buf, resp.read);
+            free(buf);
+            break;
+        }
+        
+        case TERMINAL_MSG_GET_ATTR: {
+            terminal_get_attr_req_t *req = (terminal_get_attr_req_t *)data;
+            terminal_get_attr_resp_t resp;
+            terminal_session_t *session = terminal_session_find(req->session_id);
+            if (session) {
+                // 转换 termios 到 protobuf 格式
+                terminal_termios_to_proto(&session->termios, &resp.termios);
+                resp.error = 0;
+            } else {
+                resp.error = -ENOENT;
+            }
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case TERMINAL_MSG_SET_ATTR: {
+            terminal_set_attr_req_t *req = (terminal_set_attr_req_t *)data;
+            terminal_set_attr_resp_t resp;
+            terminal_session_t *session = terminal_session_find(req->session_id);
+            if (session) {
+                struct termios term;
+                terminal_termios_from_proto(&req->termios, &term);
+                int ret = terminal_tcsetattr(session->master_fd, req->action, &term);
+                if (ret == 0) {
+                    session->termios = term;
+                }
+                resp.success = (ret == 0);
+                resp.error = ret;
+            } else {
+                resp.success = 0;
+                resp.error = -ENOENT;
+            }
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        default:
+            log_warn("TERMINAL: Unknown IPC message type: %u", msg_type);
+            break;
+    }
+}
+```
+
+六、终端仿真器
+
+```c
+// terminal/src/terminal_emulator.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "terminal.h"
+#include "terminal_emulator.h"
+
+/* ============================================================
+   终端类型转字符串
+   ============================================================ */
+const char *terminal_type_to_string(terminal_type_t type) {
+    switch (type) {
+        case TERMINAL_TYPE_VT100: return "vt100";
+        case TERMINAL_TYPE_VT220: return "vt220";
+        case TERMINAL_TYPE_XTERM: return "xterm";
+        case TERMINAL_TYPE_XTERM_256COLOR: return "xterm-256color";
+        case TERMINAL_TYPE_LINUX: return "linux";
+        case TERMINAL_TYPE_SCREEN: return "screen";
+        default: return "unknown";
+    }
+}
+
+/* ============================================================
+   解析 VT100 转义序列 (简化版)
+   ============================================================ */
+void terminal_parse_vt100(const char *data, uint32_t len,
+                           terminal_escape_callback_t callback,
+                           void *user_data) {
+    // 简化的 VT100 转义序列解析器
+    // 实际实现需要完整的 VT100/xterm 转义序列支持
+}
+```
+
+七、配置文件
+
+```yaml
+# /etc/hwrun/params/terminal.yml
+terminal:
+  # 默认终端类型
+  default_type: "xterm-256color"   # vt100 / vt220 / xterm / xterm-256color
+  
+  # 默认窗口大小
+  default_rows: 24
+  default_cols: 80
+  
+  # 是否启用回显
+  echo_enabled: true
+  
+  # 是否启用规范模式
+  canonical_mode: true
+  
+  # 环境变量
+  term_env: "xterm-256color"
+  
+  # 默认 Shell
+  default_shell: "/bin/sh"
+```
+
+八、命令行接口
+
+```bash
+# 创建终端会话
+hwrun terminal open
+hwrun terminal open --name my-term --rows 30 --cols 100
+hwrun terminal open --shell /bin/bash
+
+# 终端会话管理
+hwrun terminal list
+hwrun terminal info <session-id>
+hwrun terminal close <session-id>
+hwrun terminal close --force <session-id>
+
+# 终端控制
+hwrun terminal resize <session-id> --rows 30 --cols 100
+hwrun terminal size <session-id>
+
+# 终端 I/O
+hwrun terminal write <session-id> --data "ls -la\n"
+hwrun terminal read <session-id> --max 1024
+
+# 终端属性
+hwrun terminal attr get <session-id>
+hwrun terminal attr set <session-id> --echo off --icanon off
+```
+
+九、构建与安装
+
+9.1 插件描述文件
+
+```yaml
+# plugins/terminal/plugin.yml
+plugin:
+  id: "terminal"
+  name: "Terminal Protocol"
+  version: "1.0.0"
+  type: "application"
+  
+  description: "HWRun OS 终端协议，提供伪终端会话管理、终端控制、行规程处理等终端功能"
+  
+  provides:
+    - protocol: "TERMINAL"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+    - protocol: "FSP"
+      version: "1.0"
+    - protocol: "INPUT"
+      version: "1.0"
+    - protocol: "DISPLAY"
+      version: "1.0"
+  
+  params:
+    - key: "terminal.default_type"
+      type: "string"
+      default: "xterm-256color"
+      description: "默认终端类型"
+    - key: "terminal.default_rows"
+      type: "int"
+      default: 24
+      description: "默认行数"
+    - key: "terminal.default_cols"
+      type: "int"
+      default: 80
+      description: "默认列数"
+    - key: "terminal.default_shell"
+      type: "string"
+      default: "/bin/sh"
+      description: "默认 Shell"
+  
+  files:
+    - "/usr/bin/hwrun-terminald"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+9.2 构建脚本
+
+```makefile
+# terminal/Makefile
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -Iinclude
+LDFLAGS = -lpthread -lutil -luuid
+
+TARGET = hwrun-terminald
+OBJS = terminal.o terminal_ipc.o terminal_pty.o \
+       terminal_termios.o terminal_session.o \
+       terminal_io.o terminal_emulator.o
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+install:
+	install -D -m 755 $(TARGET) /usr/bin/
+```
+
+十、总结
+
+维度 决策
+定位 终端协议，所有终端操作的统一入口
+实现方式 用户态服务 (C)
+代码量 ~1200-1500 行 C
+提供协议 TERMINAL (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + PMP + FSP
+核心机制 PTY Master/Slave、termios 控制、行规程、终端仿真
+关键功能 PTY 分配、终端属性管理、窗口大小调整、会话管理、VT100/xterm 仿真
+
+TERMINAL 是 HWRun OS 中终端管理的核心插件。它基于 Linux 内核的 PTY（伪终端）子系统和 devpts 文件系统，通过 TERMINAL 协议向上层插件提供终端会话创建、PTY 管理、终端属性控制（termios）、窗口大小调整、VT100/xterm 终端仿真等完整的终端管理功能。PTY 是一对虚拟字符设备（Master/Slave），终端应用程序持有 Master 端，Shell 或子进程持有 Slave 端，通过内核转发数据实现双向通信。上层插件（SHELL、CONSOLE、UI、DESKTOP 等）通过 TERMINAL 协议创建和管理终端会话，不直接操作 /dev/ptmx 或 /dev/pts/ 设备节点。*

@@ -1,0 +1,1277 @@
+﻿HWRun OS INSTANCE 实现文档
+
+模块名称： INSTANCE (Instance Management Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 操作系统实例管理协议，提供容器、MicroVM、完整虚拟机、Unikernel、沙盒的统一管理接口
+实现语言： C（内核模块 + 用户态辅助进程）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、FSP（文件系统）、PMP（进程管理）、NP（网络协议）、CLUSTER（集群管理）
+提供协议： INSTANCE
+
+一、设计哲学
+
+1.1 核心定位
+
+INSTANCE 是 HWRun OS 的“操作系统实例工厂”——所有与操作系统实例（容器、MicroVM、虚拟机、Unikernel、沙盒）相关的操作都通过 INSTANCE 协议进行。
+
+```
+INSTANCE = 操作系统实例管理协议 = 所有实例操作的统一入口
+
+上层插件 (SANDBOX, CONTAINER, CLUSTER, PERMISSION, MONITOR, ...)
+    │
+    │  通过 INSTANCE 协议管理实例
+    ▼
+INSTANCE 插件
+    │
+    │  统一实例管理层
+    │  ├── 实例生命周期 (创建/销毁/启动/停止/暂停/恢复)
+    │  ├── 实例资源管理 (CPU/内存/GPU/存储/网络)
+    │  ├── 实例快照 (创建/恢复/删除)
+    │  ├── 实例迁移 (跨节点)
+    │  └── 实例监控 (状态/资源使用)
+    │
+    ├── 容器后端 (runc)        → 进程级隔离，共享内核[reference:0]
+    ├── 系统容器后端 (LXD)     → 操作系统级隔离，共享内核
+    ├── MicroVM 后端 (Firecracker) → 硬件级隔离，独立内核，<125ms 启动[reference:1]
+    ├── 完整 VM 后端 (KVM)     → 完整硬件虚拟化，最强隔离[reference:2]
+    ├── Unikernel 后端         → 应用直接跑在内核态，极致轻量[reference:3]
+    └── 沙盒后端 (gVisor)      → 用户态内核拦截，中等隔离[reference:4]
+    │
+    ▼
+硬件层 / 内核层
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有实例操作通过 INSTANCE 协议进行
+2. 后端可插拔：容器、MicroVM、虚拟机、Unikernel、沙盒都是可替换的后端
+3. 统一抽象：所有实例类型通过同一套接口管理
+4. 用户选择：用户通过配置选择实例类型，无需改变操作方式
+5. 资源隔离：每个实例有独立的 CPU/内存/GPU/存储/网络资源
+6. 生命周期管理：完整的创建→启动→运行→停止→销毁生命周期
+
+1.3 实例类型对比
+
+特性 容器 (runc) 系统容器 (LXD) MicroVM (Firecracker) 完整 VM (KVM) Unikernel 沙盒 (gVisor)
+内核 共享宿主机 共享宿主机 独立内核 独立内核 独立内核 用户态内核
+隔离级别 进程级 操作系统级 硬件级 硬件级 硬件级 系统调用级
+启动时间 ~100ms ~500ms <125ms ~10s+ ~50ms ~200ms
+内存开销 ~10-50MB ~50-200MB ~5MB ~500MB+ ~2-10MB ~50-100MB
+安全边界 较弱 中等 强 最强 强 中等
+设备支持 基础 完整 基础 (virtio) 完整 有限 基础
+适用场景 微服务 多租户OS Serverless 完整环境 极简应用 安全容器
+
+二、整体架构
+
+2.1 INSTANCE 插件的组成
+
+```
+INSTANCE 插件 (instance.ko)
+├── 协议处理层
+│   ├── instance_ipc_handler()    ← IPC 消息分发
+│   ├── instance_create()         ← 创建实例
+│   ├── instance_destroy()        ← 销毁实例
+│   ├── instance_start()          ← 启动实例
+│   ├── instance_stop()           ← 停止实例
+│   ├── instance_pause()          ← 暂停实例
+│   ├── instance_resume()         ← 恢复实例
+│   ├── instance_list()           ← 列出实例
+│   ├── instance_info()           ← 获取实例信息
+│   ├── instance_enter()          ← 进入实例
+│   ├── instance_snapshot()       ← 创建快照
+│   ├── instance_restore()        ← 恢复快照
+│   └── instance_migrate()        ← 迁移实例
+│
+├── 实例管理层
+│   ├── instance_manager.c        ← 实例管理器
+│   └── instance_state.c          ← 实例状态管理
+│
+├── 后端实现
+│   ├── instance_backend_runc.c   ← 容器后端 (runc)[reference:17]
+│   ├── instance_backend_lxc.c    ← 系统容器后端 (LXD)
+│   ├── instance_backend_firecracker.c ← MicroVM 后端 (Firecracker)[reference:18]
+│   ├── instance_backend_kvm.c    ← 完整 VM 后端 (KVM)[reference:19]
+│   ├── instance_backend_unikernel.c ← Unikernel 后端[reference:20]
+│   └── instance_backend_gvisor.c ← 沙盒后端 (gVisor)[reference:21]
+│
+├── 资源管理
+│   ├── instance_resource.c       ← CPU/内存/GPU/存储分配
+│   └── instance_network.c        ← 网络配置
+│
+└── 初始化/清理
+    ├── instance_init()           ← 模块加载
+    └── instance_exit()           ← 模块卸载
+```
+
+2.2 INSTANCE 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE → 其他插件
+                                                                                                              ↑
+                                                                                                   INSTANCE 在这里加载
+```
+
+INSTANCE 是第八个加载的核心功能插件（HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE）。在它之后，依赖实例管理的插件（SANDBOX、CONTAINER 等）才能正常工作。
+
+2.3 INSTANCE 的上层消费者
+
+上层插件 需要 INSTANCE 提供什么
+SANDBOX（沙盒） 轻量级沙盒环境
+CONTAINER（容器） 容器运行时隔离
+CLUSTER（集群） 跨节点实例调度
+PERMISSION（权限） 实例级权限控制
+MONITOR（监控） 实例状态监控
+
+三、核心数据结构
+
+```c
+// instance/include/instance.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   实例类型
+   ============================================================ */
+typedef enum {
+    INSTANCE_TYPE_CONTAINER = 0,        // 容器 (runc)
+    INSTANCE_TYPE_SYSTEM_CONTAINER,     // 系统容器 (LXD)
+    INSTANCE_TYPE_MICROVM,              // MicroVM (Firecracker)
+    INSTANCE_TYPE_VM,                   // 完整虚拟机 (KVM)
+    INSTANCE_TYPE_UNIKERNEL,            // Unikernel
+    INSTANCE_TYPE_SANDBOX,              // 沙盒 (gVisor)
+} instance_type_t;
+
+/* ============================================================
+   实例状态
+   ============================================================ */
+typedef enum {
+    INSTANCE_STATE_CREATED = 0,         // 已创建 (未启动)
+    INSTANCE_STATE_STARTING,            // 启动中
+    INSTANCE_STATE_RUNNING,             // 运行中
+    INSTANCE_STATE_PAUSING,             // 暂停中
+    INSTANCE_STATE_PAUSED,              // 已暂停
+    INSTANCE_STATE_STOPPING,            // 停止中
+    INSTANCE_STATE_STOPPED,             // 已停止
+    INSTANCE_STATE_DESTROYING,          // 销毁中
+    INSTANCE_STATE_ERROR,               // 错误状态
+    INSTANCE_STATE_MIGRATING,           // 迁移中
+} instance_state_t;
+
+/* ============================================================
+   实例配置
+   ============================================================ */
+typedef struct instance_config {
+    // 基础配置
+    char name[64];                      // 实例名称
+    instance_type_t type;               // 实例类型
+    char image[256];                    // 镜像路径
+    char kernel[256];                   // 内核路径 (MicroVM/VM/Unikernel)
+    char initrd[256];                   // initrd 路径 (MicroVM/VM)
+    char cmdline[256];                  // 内核命令行
+    
+    // 资源
+    uint32_t cpu_cores;                 // CPU 核心数
+    uint64_t memory_mb;                 // 内存大小 (MB)
+    uint32_t gpu_count;                 // GPU 数量
+    uint64_t storage_mb;                // 存储大小 (MB)
+    
+    // 网络
+    char network_mode[32];              // "bridge", "host", "isolated"
+    char network_name[64];              // 网络名称
+    
+    // 隔离
+    int isolated;                       // 是否完全隔离
+    int privileged;                     // 是否特权
+    
+    // 自动启动
+    int auto_start;                     // 是否自动启动
+    int auto_restart;                   // 是否自动重启
+} instance_config_t;
+
+/* ============================================================
+   实例信息
+   ============================================================ */
+typedef struct instance_info {
+    char id[64];                        // 实例 ID
+    char name[64];                      // 实例名称
+    instance_type_t type;               // 实例类型
+    instance_state_t state;             // 实例状态
+    uint32_t pid;                       // 主进程 PID (容器)
+    uint32_t vmid;                      // VM ID (MicroVM/VM)
+    uint64_t created_at;                // 创建时间
+    uint64_t started_at;                // 启动时间
+    
+    // 资源使用
+    uint64_t cpu_usage;                 // CPU 使用率 (百分比*100)
+    uint64_t memory_used_mb;            // 内存使用 (MB)
+    uint64_t memory_max_mb;             // 最大内存 (MB)
+    
+    // 网络
+    char ipv4[16];                      // IPv4 地址
+    char ipv6[64];                      // IPv6 地址
+    
+    // 后端特定信息
+    void *backend_data;                 // 后端数据
+} instance_info_t;
+
+/* ============================================================
+   实例创建请求
+   ============================================================ */
+typedef struct instance_create_req {
+    instance_config_t config;
+    char **env;                         // 环境变量
+    char **mounts;                      // 挂载点
+} instance_create_req_t;
+
+/* ============================================================
+   实例创建响应
+   ============================================================ */
+typedef struct instance_create_resp {
+    char instance_id[64];
+    int32_t error;
+} instance_create_resp_t;
+
+/* ============================================================
+   INSTANCE 上下文
+   ============================================================ */
+typedef struct instance_context {
+    int initialized;
+    uint64_t instance_task_id;          // INSTANCE 自身的任务 ID
+    
+    // 实例列表
+    instance_info_t *instances;
+    uint32_t instance_count;
+    
+    // 后端
+    struct instance_backend *backends[6];
+    int backend_count;
+    
+    // 资源池
+    void *resource_pool;
+    
+    void *lock;
+} instance_context_t;
+
+/* ============================================================
+   实例后端接口
+   ============================================================ */
+typedef struct instance_backend {
+    instance_type_t type;
+    char name[32];
+    int (*create)(instance_config_t *config, char *out_id);
+    int (*destroy)(const char *instance_id);
+    int (*start)(const char *instance_id);
+    int (*stop)(const char *instance_id);
+    int (*pause)(const char *instance_id);
+    int (*resume)(const char *instance_id);
+    int (*get_info)(const char *instance_id, instance_info_t *info);
+    int (*list)(instance_info_t **out, uint32_t *count);
+    int (*snapshot)(const char *instance_id, const char *snapshot_name);
+    int (*restore)(const char *snapshot_name, char *out_id);
+    int (*migrate)(const char *instance_id, const char *target_node);
+} instance_backend_t;
+```
+
+四、INSTANCE 协议定义
+
+```protobuf
+// protocols/instance.proto
+syntax = "proto3";
+
+package hwrun.instance;
+
+service Instance {
+    // === 实例生命周期 ===
+    rpc Create(CreateRequest) returns (CreateResponse);
+    rpc Destroy(DestroyRequest) returns (DestroyResponse);
+    rpc Start(StartRequest) returns (StartResponse);
+    rpc Stop(StopRequest) returns (StopResponse);
+    rpc Pause(PauseRequest) returns (PauseResponse);
+    rpc Resume(ResumeRequest) returns (ResumeResponse);
+    rpc Restart(RestartRequest) returns (RestartResponse);
+    
+    // === 实例查询 ===
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Info(InfoRequest) returns (InfoResponse);
+    rpc Status(StatusRequest) returns (StatusResponse);
+    
+    // === 实例进入 ===
+    rpc Enter(EnterRequest) returns (EnterResponse);
+    rpc Exec(ExecRequest) returns (ExecResponse);
+    
+    // === 实例快照 ===
+    rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+    rpc Restore(RestoreRequest) returns (RestoreResponse);
+    
+    // === 实例迁移 ===
+    rpc Migrate(MigrateRequest) returns (MigrateResponse);
+}
+
+message Empty {}
+
+// ============ 生命周期 ============
+
+message CreateRequest {
+    string name = 1;
+    uint32 type = 2;                // instance_type_t
+    string image = 3;
+    string kernel = 4;
+    string initrd = 5;
+    string cmdline = 6;
+    uint32 cpu_cores = 7;
+    uint64 memory_mb = 8;
+    uint32 gpu_count = 9;
+    uint64 storage_mb = 10;
+    string network_mode = 11;
+    string network_name = 12;
+    bool isolated = 13;
+    bool privileged = 14;
+    bool auto_start = 15;
+    bool auto_restart = 16;
+    repeated string env = 17;
+    repeated string mounts = 18;
+}
+
+message CreateResponse {
+    string instance_id = 1;
+    int32 error = 2;
+}
+
+message DestroyRequest {
+    string instance_id = 1;
+    bool force = 2;
+}
+
+message DestroyResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StartRequest {
+    string instance_id = 1;
+}
+
+message StartResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message StopRequest {
+    string instance_id = 1;
+    bool force = 2;
+}
+
+message StopResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message PauseRequest {
+    string instance_id = 1;
+}
+
+message PauseResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message ResumeRequest {
+    string instance_id = 1;
+}
+
+message ResumeResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+message RestartRequest {
+    string instance_id = 1;
+}
+
+message RestartResponse {
+    bool success = 1;
+    int32 error = 2;
+}
+
+// ============ 查询 ============
+
+message ListRequest {
+    string filter = 1;              // 按名称过滤
+    string state = 2;               // 按状态过滤
+}
+
+message ListResponse {
+    repeated InstanceInfo instances = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message InfoRequest {
+    string instance_id = 1;
+}
+
+message InfoResponse {
+    InstanceInfo info = 1;
+    int32 error = 2;
+}
+
+message StatusRequest {
+    string instance_id = 1;
+}
+
+message StatusResponse {
+    string state = 1;
+    uint64 cpu_usage = 2;
+    uint64 memory_used_mb = 3;
+    string ipv4 = 4;
+    int32 error = 5;
+}
+
+message InstanceInfo {
+    string id = 1;
+    string name = 2;
+    uint32 type = 3;
+    string state = 4;
+    uint32 pid = 5;
+    uint32 vmid = 6;
+    uint64 created_at = 7;
+    uint64 started_at = 8;
+    uint64 cpu_usage = 9;
+    uint64 memory_used_mb = 10;
+    uint64 memory_max_mb = 11;
+    string ipv4 = 12;
+    string ipv6 = 13;
+}
+
+// ============ 进入与执行 ============
+
+message EnterRequest {
+    string instance_id = 1;
+    string command = 2;             // 可选，默认 /bin/sh
+}
+
+message EnterResponse {
+    int32 error = 1;
+}
+
+message ExecRequest {
+    string instance_id = 1;
+    string command = 2;
+    repeated string args = 3;
+}
+
+message ExecResponse {
+    int32 exit_code = 1;
+    string stdout = 2;
+    string stderr = 3;
+    int32 error = 4;
+}
+
+// ============ 快照 ============
+
+message SnapshotRequest {
+    string instance_id = 1;
+    string snapshot_name = 2;
+}
+
+message SnapshotResponse {
+    bool success = 1;
+    string snapshot_id = 2;
+    int32 error = 3;
+}
+
+message RestoreRequest {
+    string snapshot_id = 1;
+    string new_instance_id = 2;     // 可选
+}
+
+message RestoreResponse {
+    string instance_id = 1;
+    bool success = 2;
+    int32 error = 3;
+}
+
+// ============ 迁移 ============
+
+message MigrateRequest {
+    string instance_id = 1;
+    string target_node = 2;
+}
+
+message MigrateResponse {
+    bool success = 1;
+    string new_instance_id = 2;
+    int32 error = 3;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// instance/src/instance.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+
+#include "instance.h"
+#include "instance_ipc.h"
+#include "instance_manager.h"
+#include "instance_backend_runc.h"
+#include "instance_backend_lxc.h"
+#include "instance_backend_firecracker.h"
+#include "instance_backend_kvm.h"
+#include "instance_backend_unikernel.h"
+#include "instance_backend_gvisor.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS Instance Management Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static instance_context_t g_instance_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init instance_init(void) {
+    int ret;
+    
+    printk(KERN_INFO "HWRun INSTANCE: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_instance_ctx, 0, sizeof(instance_context_t));
+    
+    // 2. 注册后端
+    instance_backend_register(&runc_backend);
+    instance_backend_register(&lxc_backend);
+    instance_backend_register(&firecracker_backend);
+    instance_backend_register(&kvm_backend);
+    instance_backend_register(&unikernel_backend);
+    instance_backend_register(&gvisor_backend);
+    
+    // 3. 注册 IPC 消息处理器
+    ret = instance_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun INSTANCE: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 4. 注册 INSTANCE 协议（通过 METAPROTO - 通过 IPC）
+    instance_register_protocol();
+    
+    g_instance_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun INSTANCE: Initialized successfully\n");
+    printk(KERN_INFO "  Supported backends: Container, System Container, MicroVM, VM, Unikernel, Sandbox\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit instance_exit(void) {
+    printk(KERN_INFO "HWRun INSTANCE: Exiting...\n");
+    
+    instance_ipc_unregister();
+    instance_cleanup_instances();
+    
+    g_instance_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun INSTANCE: Exited\n");
+}
+
+module_init(instance_init);
+module_exit(instance_exit);
+```
+
+5.2 实例创建
+
+```c
+// instance/src/instance_manager.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/random.h>
+#include <linux/time.h>
+
+#include "instance.h"
+#include "instance_ipc.h"
+#include "instance_backend.h"
+
+/* ============================================================
+   生成实例 ID
+   ============================================================ */
+static void instance_generate_id(char *out_id, size_t size) {
+    uint32_t rand1, rand2;
+    get_random_bytes(&rand1, sizeof(rand1));
+    get_random_bytes(&rand2, sizeof(rand2));
+    snprintf(out_id, size, "inst-%08x%08x", rand1, rand2);
+}
+
+/* ============================================================
+   创建实例
+   ============================================================ */
+int instance_create(instance_config_t *config, char *out_id, size_t id_size) {
+    instance_backend_t *backend;
+    int ret;
+    
+    // 1. 根据类型选择后端
+    backend = instance_backend_find(config->type);
+    if (!backend) {
+        return -ENOENT;
+    }
+    
+    // 2. 生成实例 ID
+    char instance_id[64];
+    instance_generate_id(instance_id, sizeof(instance_id));
+    strncpy(out_id, instance_id, id_size - 1);
+    
+    // 3. 调用后端创建
+    ret = backend->create(config, instance_id);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 4. 创建实例信息
+    instance_info_t *info = kmalloc(sizeof(instance_info_t), GFP_KERNEL);
+    if (!info) {
+        backend->destroy(instance_id);
+        return -ENOMEM;
+    }
+    
+    memset(info, 0, sizeof(instance_info_t));
+    strncpy(info->id, instance_id, sizeof(info->id) - 1);
+    strncpy(info->name, config->name, sizeof(info->name) - 1);
+    info->type = config->type;
+    info->state = INSTANCE_STATE_CREATED;
+    info->created_at = get_jiffies_64();
+    
+    // 5. 添加到实例列表
+    info->next = g_instance_ctx.instances;
+    g_instance_ctx.instances = info;
+    g_instance_ctx.instance_count++;
+    
+    // 6. 如果配置了自动启动，启动实例
+    if (config->auto_start) {
+        instance_start(instance_id);
+    }
+    
+    printk(KERN_INFO "HWRun INSTANCE: Created %s (type=%d, id=%s)\n",
+           config->name, config->type, instance_id);
+    
+    return 0;
+}
+
+/* ============================================================
+   启动实例
+   ============================================================ */
+int instance_start(const char *instance_id) {
+    instance_info_t *info = instance_find(instance_id);
+    if (!info) {
+        return -ENOENT;
+    }
+    
+    instance_backend_t *backend = instance_backend_find(info->type);
+    if (!backend) {
+        return -ENOENT;
+    }
+    
+    info->state = INSTANCE_STATE_STARTING;
+    int ret = backend->start(instance_id);
+    if (ret < 0) {
+        info->state = INSTANCE_STATE_ERROR;
+        return ret;
+    }
+    
+    info->state = INSTANCE_STATE_RUNNING;
+    info->started_at = get_jiffies_64();
+    
+    printk(KERN_INFO "HWRun INSTANCE: Started %s\n", instance_id);
+    return 0;
+}
+
+/* ============================================================
+   停止实例
+   ============================================================ */
+int instance_stop(const char *instance_id, int force) {
+    instance_info_t *info = instance_find(instance_id);
+    if (!info) {
+        return -ENOENT;
+    }
+    
+    instance_backend_t *backend = instance_backend_find(info->type);
+    if (!backend) {
+        return -ENOENT;
+    }
+    
+    info->state = INSTANCE_STATE_STOPPING;
+    int ret = backend->stop(instance_id);
+    if (ret < 0) {
+        info->state = INSTANCE_STATE_ERROR;
+        return ret;
+    }
+    
+    info->state = INSTANCE_STATE_STOPPED;
+    printk(KERN_INFO "HWRun INSTANCE: Stopped %s\n", instance_id);
+    return 0;
+}
+```
+
+5.3 容器后端 (runc)
+
+```c
+// instance/src/instance_backend_runc.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/sched.h>
+
+#include "instance.h"
+
+/* ============================================================
+   runc 容器后端
+   基于 Linux namespace 和 cgroup[reference:22]
+   ============================================================ */
+
+static int runc_create(instance_config_t *config, const char *instance_id) {
+    // 1. 创建容器目录
+    // /var/lib/hwrun/instances/<id>/
+    
+    // 2. 生成 config.json (OCI 规范)
+    // 配置 namespace: pid, network, mount, ipc, uts, user[reference:23]
+    // 配置 cgroup: CPU, memory, I/O[reference:24]
+    
+    // 3. 调用 runc create
+    // runc create --bundle /var/lib/hwrun/instances/<id> <id>
+    
+    // 4. 如果配置了自动启动，调用 runc start
+    // runc start <id>
+    
+    return 0;
+}
+
+static int runc_destroy(const char *instance_id) {
+    // 1. 如果容器在运行，先停止
+    // runc kill <id> SIGTERM
+    // runc delete --force <id>
+    
+    // 2. 删除容器目录
+    // rm -rf /var/lib/hwrun/instances/<id>/
+    
+    return 0;
+}
+
+static int runc_start(const char *instance_id) {
+    // runc start <id>
+    return 0;
+}
+
+static int runc_stop(const char *instance_id) {
+    // runc kill <id> SIGTERM
+    // runc delete <id>
+    return 0;
+}
+
+static int runc_pause(const char *instance_id) {
+    // runc pause <id>
+    return 0;
+}
+
+static int runc_resume(const char *instance_id) {
+    // runc resume <id>
+    return 0;
+}
+
+static int runc_get_info(const char *instance_id, instance_info_t *out) {
+    // 读取 /var/lib/hwrun/instances/<id>/state.json
+    // 获取 PID、状态、资源使用等
+    return 0;
+}
+
+instance_backend_t runc_backend = {
+    .type = INSTANCE_TYPE_CONTAINER,
+    .name = "runc",
+    .create = runc_create,
+    .destroy = runc_destroy,
+    .start = runc_start,
+    .stop = runc_stop,
+    .pause = runc_pause,
+    .resume = runc_resume,
+    .get_info = runc_get_info,
+    .list = NULL,
+    .snapshot = NULL,
+    .restore = NULL,
+    .migrate = NULL,
+};
+```
+
+5.4 MicroVM 后端 (Firecracker)
+
+```c
+// instance/src/instance_backend_firecracker.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+
+#include "instance.h"
+
+/* ============================================================
+   Firecracker MicroVM 后端[reference:25]
+   - 每个 Firecracker 进程运行一个 MicroVM[reference:26]
+   - 使用 KVM 创建和管理 MicroVM[reference:27]
+   - 启动时间 < 125ms，内存开销 < 5MB[reference:28]
+   - 使用 virtio-net, virtio-blk, virtio-vsock 驱动[reference:29]
+   ============================================================ */
+
+static int firecracker_create(instance_config_t *config, const char *instance_id) {
+    // 1. 创建 MicroVM 目录
+    // /var/lib/hwrun/instances/<id>/
+    
+    // 2. 准备内核和 rootfs
+    // 复制 kernel 和 initrd 到实例目录
+    
+    // 3. 生成 Firecracker 配置文件
+    // {
+    //   "boot-source": { "kernel_image_path": "...", "boot_args": "..." },
+    //   "drives": [{ "drive_id": "rootfs", "path_on_host": "...", "is_root_device": true }],
+    //   "network-interfaces": [{ "iface_id": "eth0", "guest_mac": "...", "host_dev_name": "..." }]
+    // }
+    
+    // 4. 启动 Firecracker 进程
+    // firecracker --config-file config.json
+    
+    // Firecracker 进程架构: API, VMM, vCPU 三个线程[reference:30]
+    // 使用 epoll 处理 I/O 事件[reference:31]
+    
+    return 0;
+}
+
+static int firecracker_destroy(const char *instance_id) {
+    // 1. 停止 Firecracker 进程
+    // 2. 删除实例目录
+    return 0;
+}
+
+static int firecracker_start(const char *instance_id) {
+    // 启动 Firecracker 进程
+    // firecracker --config-file /var/lib/hwrun/instances/<id>/config.json
+    return 0;
+}
+
+static int firecracker_stop(const char *instance_id) {
+    // kill Firecracker 进程
+    return 0;
+}
+
+static int firecracker_pause(const char *instance_id) {
+    // 暂停 vCPU
+    return 0;
+}
+
+static int firecracker_resume(const char *instance_id) {
+    // 恢复 vCPU
+    return 0;
+}
+
+instance_backend_t firecracker_backend = {
+    .type = INSTANCE_TYPE_MICROVM,
+    .name = "firecracker",
+    .create = firecracker_create,
+    .destroy = firecracker_destroy,
+    .start = firecracker_start,
+    .stop = firecracker_stop,
+    .pause = firecracker_pause,
+    .resume = firecracker_resume,
+    .get_info = NULL,
+    .list = NULL,
+    .snapshot = NULL,
+    .restore = NULL,
+    .migrate = NULL,
+};
+```
+
+5.5 完整 VM 后端 (KVM)
+
+```c
+// instance/src/instance_backend_kvm.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/ioctl.h>
+#include <linux/kvm.h>
+#include <linux/kvm_host.h>
+
+#include "instance.h"
+
+/* ============================================================
+   KVM 完整虚拟机后端[reference:32]
+   - 通过 /dev/kvm ioctl API 创建虚拟机[reference:33]
+   - KVM_CREATE_VM → KVM_CREATE_VCPU[reference:34]
+   - 每个 vCPU 一个文件描述符[reference:35]
+   - 支持 Intel VT-x / AMD-V[reference:36]
+   ============================================================ */
+
+static int kvm_create(instance_config_t *config, const char *instance_id) {
+    int kvm_fd, vm_fd;
+    struct kvm_userspace_memory_region mem;
+    int vcpu_fd;
+    
+    // 1. 打开 /dev/kvm
+    kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);[reference:37]
+    if (kvm_fd < 0) {
+        return -1;
+    }
+    
+    // 2. 创建 VM[reference:38]
+    vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+    if (vm_fd < 0) {
+        close(kvm_fd);
+        return -1;
+    }
+    
+    // 3. 分配内存[reference:39]
+    // 使用 KVM_SET_USER_MEMORY_REGION
+    
+    // 4. 创建 vCPU[reference:40]
+    vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);[reference:41]
+    if (vcpu_fd < 0) {
+        close(vm_fd);
+        close(kvm_fd);
+        return -1;
+    }
+    
+    // 5. 加载内核和 initrd
+    // 6. 运行 vCPU (KVM_RUN)[reference:42]
+    
+    return 0;
+}
+
+static int kvm_destroy(const char *instance_id) {
+    // 关闭所有 fd，释放内存
+    return 0;
+}
+
+static int kvm_start(const char *instance_id) {
+    // 启动 vCPU 执行
+    return 0;
+}
+
+static int kvm_stop(const char *instance_id) {
+    // 停止 vCPU
+    return 0;
+}
+
+instance_backend_t kvm_backend = {
+    .type = INSTANCE_TYPE_VM,
+    .name = "kvm",
+    .create = kvm_create,
+    .destroy = kvm_destroy,
+    .start = kvm_start,
+    .stop = kvm_stop,
+    .pause = NULL,
+    .resume = NULL,
+    .get_info = NULL,
+    .list = NULL,
+    .snapshot = NULL,
+    .restore = NULL,
+    .migrate = NULL,
+};
+```
+
+5.6 Unikernel 后端
+
+```c
+// instance/src/instance_backend_unikernel.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+
+#include "instance.h"
+
+/* ============================================================
+   Unikernel 后端[reference:43]
+   - 应用直接运行在内核态[reference:44]
+   - 只包含必要的 OS 组件[reference:45]
+   - 单个进程，无法 SSH 进入[reference:46]
+   - 极轻量，快速启动[reference:47]
+   - 没有内核态/用户态地址空间分割[reference:48]
+   ============================================================ */
+
+static int unikernel_create(instance_config_t *config, const char *instance_id) {
+    // 1. 准备 Unikernel 镜像
+    // 2. 直接加载到内存
+    // 3. 设置入口点
+    return 0;
+}
+
+static int unikernel_destroy(const char *instance_id) {
+    return 0;
+}
+
+static int unikernel_start(const char *instance_id) {
+    // 直接跳转到 Unikernel 入口
+    return 0;
+}
+
+static int unikernel_stop(const char *instance_id) {
+    return 0;
+}
+
+instance_backend_t unikernel_backend = {
+    .type = INSTANCE_TYPE_UNIKERNEL,
+    .name = "unikernel",
+    .create = unikernel_create,
+    .destroy = unikernel_destroy,
+    .start = unikernel_start,
+    .stop = unikernel_stop,
+    .pause = NULL,
+    .resume = NULL,
+    .get_info = NULL,
+    .list = NULL,
+    .snapshot = NULL,
+    .restore = NULL,
+    .migrate = NULL,
+};
+```
+
+5.7 沙盒后端 (gVisor)
+
+```c
+// instance/src/instance_backend_gvisor.c
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+
+#include "instance.h"
+
+/* ============================================================
+   gVisor 沙盒后端[reference:49]
+   - 用户态内核 (Sentry)[reference:50]
+   - 拦截所有系统调用[reference:51]
+   - 实现 Linux 系统调用表面[reference:52]
+   - 通过 seccomp-bpf 限制宿主机系统调用[reference:53]
+   - Gofer 处理文件系统 I/O[reference:54]
+   ============================================================ */
+
+static int gvisor_create(instance_config_t *config, const char *instance_id) {
+    // 1. 启动 gVisor Sentry 进程[reference:55]
+    // 2. 配置 Gofer[reference:56]
+    // 3. 设置 seccomp-bpf 过滤器[reference:57]
+    return 0;
+}
+
+static int gvisor_destroy(const char *instance_id) {
+    return 0;
+}
+
+static int gvisor_start(const char *instance_id) {
+    return 0;
+}
+
+static int gvisor_stop(const char *instance_id) {
+    return 0;
+}
+
+instance_backend_t gvisor_backend = {
+    .type = INSTANCE_TYPE_SANDBOX,
+    .name = "gvisor",
+    .create = gvisor_create,
+    .destroy = gvisor_destroy,
+    .start = gvisor_start,
+    .stop = gvisor_stop,
+    .pause = NULL,
+    .resume = NULL,
+    .get_info = NULL,
+    .list = NULL,
+    .snapshot = NULL,
+    .restore = NULL,
+    .migrate = NULL,
+};
+```
+
+5.8 IPC 消息处理
+
+```c
+// instance/src/instance_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "instance.h"
+#include "instance_ipc.h"
+#include "instance_manager.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void instance_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case INSTANCE_MSG_CREATE: {
+            instance_create_req_t *req = (instance_create_req_t *)data;
+            instance_create_resp_t resp;
+            int ret = instance_create(&req->config, resp.instance_id,
+                                       sizeof(resp.instance_id));
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case INSTANCE_MSG_DESTROY: {
+            char *instance_id = (char *)data;
+            int ret = instance_destroy(instance_id, 0);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case INSTANCE_MSG_START: {
+            char *instance_id = (char *)data;
+            int ret = instance_start(instance_id);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case INSTANCE_MSG_STOP: {
+            char *instance_id = (char *)data;
+            int ret = instance_stop(instance_id, 0);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case INSTANCE_MSG_LIST: {
+            instance_info_t *list;
+            uint32_t count;
+            instance_list(&list, &count);
+            ipc_reply(from_task, list, count * sizeof(instance_info_t));
+            break;
+        }
+        
+        case INSTANCE_MSG_INFO: {
+            char *instance_id = (char *)data;
+            instance_info_t info;
+            int ret = instance_info(instance_id, &info);
+            if (ret == 0) {
+                ipc_reply(from_task, &info, sizeof(info));
+            } else {
+                ipc_reply(from_task, NULL, 0);
+            }
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun INSTANCE: Unknown IPC message type: %u\n",
+                   msg_type);
+            break;
+    }
+}
+```
+
+六、配置与命令行
+
+6.1 配置示例
+
+```yaml
+# /etc/hwrun/params/instance.yml
+instance:
+  # 默认实例类型
+  default_type: "container"    # container / system-container / microvm / vm / unikernel / sandbox
+  
+  # 默认资源
+  default_cpu: 1
+  default_memory: "256MB"
+  default_storage: "1GB"
+  
+  # 后端配置
+  backends:
+    runc:
+      enabled: true
+      root: "/var/lib/hwrun/containers/"
+    firecracker:
+      enabled: true
+      kernel: "/boot/vmlinuz-hwrun"
+      initrd: "/boot/initrd.img-hwrun"
+      jailer: "/usr/bin/jailer"[reference:58]
+    kvm:
+      enabled: true
+      kernel: "/boot/vmlinuz-hwrun"
+      initrd: "/boot/initrd.img-hwrun"
+    unikernel:
+      enabled: true
+    gvisor:
+      enabled: true
+      runtime: "/usr/bin/runsc"[reference:59]
+  
+  # 存储池
+  storage_pool: "/var/lib/hwrun/instances/"
+```
+
+6.2 命令行接口
+
+```bash
+# 创建实例 (默认容器)
+hwrun instance create --name my-app --image ubuntu:22.04
+
+# 创建 MicroVM 实例
+hwrun instance create --name my-vm --type microvm --kernel vmlinuz --initrd initrd.img --memory 512
+
+# 创建完整虚拟机
+hwrun instance create --name my-vm --type vm --kernel vmlinuz --memory 1024 --cpu 2
+
+# 创建 Unikernel
+hwrun instance create --name my-unikernel --type unikernel --image app.img
+
+# 创建沙盒
+hwrun instance create --name my-sandbox --type sandbox --image alpine
+
+# 实例管理
+hwrun instance list
+hwrun instance info my-app
+hwrun instance start my-app
+hwrun instance stop my-app
+hwrun instance pause my-app
+hwrun instance resume my-app
+hwrun instance destroy my-app
+
+# 进入实例
+hwrun instance enter my-app
+hwrun instance exec my-app -- ls -la
+
+# 快照
+hwrun instance snapshot my-app --name snap-001
+hwrun instance restore snap-001
+
+# 迁移
+hwrun instance migrate my-app --target node-02
+```
+
+七、总结
+
+维度 决策
+定位 操作系统实例管理协议，所有实例操作的统一入口
+实现方式 Linux 内核模块 + 用户态后端
+代码量 ~1500-2000 行 C
+提供协议 INSTANCE (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + FSP + PMP + NP + CLUSTER
+加载时机 在 SANDBOX、CONTAINER 等依赖实例管理的插件之前
+支持后端 容器 (runc)、系统容器 (LXD)、MicroVM (Firecracker)、完整 VM (KVM)、Unikernel、沙盒 (gVisor)
+
+INSTANCE 是 HWRun OS 中第八个加载的核心功能插件（HAP → PMP → FSP → NP → SP → LOADER → CLUSTER → INSTANCE）。它通过统一的 INSTANCE 协议向上层插件提供容器、MicroVM、完整虚拟机、Unikernel、沙盒等多种操作系统实例的统一管理接口。用户通过配置选择实例类型，操作方式完全一致。INSTANCE 协议使 HWRun OS 实现了从进程级隔离到硬件级隔离的完整实例管理能力。

@@ -1,0 +1,1730 @@
+﻿HWRun OS FSP 实现文档
+
+模块名称： FSP (FileSystem Protocol)
+版本： 1.0.0
+状态： 设计冻结
+定位： 文件系统协议，提供对文件、目录、权限、挂载等标准文件系统操作的统一抽象
+实现语言： C（内核模块）
+依赖： 微内核（任务、IPC、内存）、METAPROTO（协议注册）、PARAM（参数读取）、LOG（日志记录）、HAP（硬件抽象）、PMP（进程管理）
+提供协议： FSP
+
+一、设计哲学
+
+1.1 核心定位
+
+FSP 是 HWRun OS 的文件系统核心——所有与文件、目录、权限、挂载相关的操作都通过 FSP 协议进行。
+
+```
+FSP = 文件系统协议 = 所有文件系统操作 (HAP) 的统一入口
+
+上层插件 (LOADER, SHELL, PKGMGR, CONFIG, LOG, GIT, ...)
+    │
+    │  通过 FSP 协议访问文件系统
+    ▼
+FSP 插件 (内核模块)
+    │
+    │  直接操作内核 VFS
+    ▼
+Linux 内核 (VFS / 具体文件系统)
+```
+
+1.2 设计原则
+
+1. 协议驱动：所有文件系统操作通过 FSP 协议进行
+2. 内核实现：FSP 插件运行在内核态，直接操作 VFS
+3. 标准接口：暴露 open/close/read/write/lseek/stat/mkdir/rmdir 等标准 POSIX 接口
+4. 路径解析：支持绝对路径和相对路径
+5. 权限检查：支持标准的 UNIX 权限模型
+6. 挂载管理：支持 mount/umount 操作
+
+1.3 FSP 插件的本质
+
+FSP 插件 = Linux 内核 VFS 接口的 HWRun 协议封装
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         FSP 插件架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  FSP 协议接口 (通过 IPC 调用)                                        │   │
+│  │  Open / Close / Read / Write / Lseek / Stat / Mkdir / Rmdir       │   │
+│  │  Readdir / Mount / Umount / Chmod / Chown / Symlink / Readlink    │   │
+│  │  Getxattr / Setxattr / Flock / Statfs                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  协议适配层 (将 FSP 协议调用转换为内核 VFS 操作)                     │   │
+│  │  ├── 参数解析                                                       │   │
+│  │  ├── 路径解析 (kern_path)                                          │   │
+│  │  ├── 权限检查                                                       │   │
+│  │  └── 结果序列化                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  内核功能封装 (直接操作 Linux 内核 VFS)                              │   │
+│  │  ├── 文件: filp_open() / filp_close() / vfs_read() / vfs_write()   │   │
+│  │  ├── 目录: vfs_mkdir() / vfs_rmdir() / iterate_dir()              │   │
+│  │  ├── 链接: vfs_link() / vfs_unlink() / vfs_symlink()              │   │
+│  │  ├── 权限: vfs_chmod() / vfs_chown() / inode_permission()         │   │
+│  │  ├── 挂载: do_mount() / do_umount()                               │   │
+│  │  └── 扩展属性: vfs_getxattr() / vfs_setxattr()                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Linux 内核 (VFS / 具体文件系统)                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+二、整体架构
+
+2.1 FSP 插件的组成
+
+```
+FSP 插件 (fsp.ko)
+├── 协议处理层
+│   ├── fsp_ipc_handler()       ← IPC 消息分发
+│   ├── fsp_open()              ← 打开文件
+│   ├── fsp_close()             ← 关闭文件
+│   ├── fsp_read()              ← 读取文件
+│   ├── fsp_write()             ← 写入文件
+│   ├── fsp_lseek()             ← 文件定位
+│   ├── fsp_stat()              ← 文件状态
+│   ├── fsp_mkdir()             ← 创建目录
+│   ├── fsp_rmdir()             ← 删除目录
+│   ├── fsp_readdir()           ← 读取目录
+│   ├── fsp_mount()             ← 挂载文件系统
+│   ├── fsp_umount()            ← 卸载文件系统
+│   ├── fsp_chmod()             ← 修改权限
+│   ├── fsp_chown()             ← 修改所有者
+│   ├── fsp_symlink()           ← 创建符号链接
+│   ├── fsp_readlink()          ← 读取符号链接
+│   ├── fsp_unlink()            ← 删除文件
+│   ├── fsp_rename()            ← 重命名
+│   ├── fsp_getxattr()          ← 获取扩展属性
+│   ├── fsp_setxattr()          ← 设置扩展属性
+│   ├── fsp_flock()             ← 文件锁定
+│   └── fsp_statfs()            ← 文件系统统计
+│
+├── VFS 封装层
+│   ├── fsp_file.c              ← 文件操作
+│   ├── fsp_dir.c               ← 目录操作
+│   ├── fsp_link.c              ← 链接操作
+│   ├── fsp_perm.c              ← 权限管理
+│   ├── fsp_mount.c             ← 挂载管理
+│   ├── fsp_xattr.c             ← 扩展属性
+│   └── fsp_lock.c              ← 文件锁定
+│
+└── 初始化/清理
+    ├── fsp_init()              ← 模块加载
+    └── fsp_exit()              ← 模块卸载
+```
+
+2.2 FSP 在 HWRun OS 中的位置
+
+```
+系统启动顺序：
+BIOS/UEFI → 引导加载器 → 微内核 → METAPROTO → BUS → PARAM → LOG → GIT → HAP → PMP → FSP → NP → SP → 其他插件
+                                                                                    ↑
+                                                                           FSP 在这里加载
+```
+
+FSP 是第三个加载的硬件相关插件。在它之后，依赖文件系统的插件（LOADER、SHELL、PKGMGR、CONFIG 等）才能正常工作。
+
+2.3 FSP 的上层消费者
+
+上层插件 需要 FSP 提供什么
+LOADER (格式加载器) 读取可执行文件
+SHELL 读取脚本、配置文件
+PKGMGR (包管理) 读写包文件
+CONFIG 读写配置文件
+LOG 写入日志文件
+GIT 读写 Git 仓库文件
+UI (用户界面) 读取图标、字体等资源
+
+三、核心数据结构
+
+```c
+// fsp/include/fsp.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   文件打开模式 (对应 Linux 的 open flags)
+   ============================================================ */
+#define FSP_O_RDONLY        0x0000
+#define FSP_O_WRONLY        0x0001
+#define FSP_O_RDWR          0x0002
+#define FSP_O_CREAT         0x0100
+#define FSP_O_EXCL          0x0200
+#define FSP_O_TRUNC         0x0400
+#define FSP_O_APPEND        0x0800
+#define FSP_O_NONBLOCK      0x1000
+#define FSP_O_DIRECTORY     0x2000
+#define FSP_O_NOFOLLOW      0x4000
+#define FSP_O_CLOEXEC       0x8000
+
+/* ============================================================
+   文件状态 (对应 struct stat)
+   ============================================================ */
+typedef struct fsp_stat {
+    uint64_t dev;               // 设备 ID
+    uint64_t ino;               // inode 号
+    uint32_t mode;              // 文件类型和权限
+    uint32_t nlink;             // 硬链接数
+    uint32_t uid;               // 所有者 UID
+    uint32_t gid;               // 所有者 GID
+    uint64_t size;              // 文件大小 (bytes)
+    uint64_t atime;             // 访问时间
+    uint64_t mtime;             // 修改时间
+    uint64_t ctime;             // 状态变更时间
+    uint64_t blocks;            // 512 字节块数
+    uint32_t blksize;           // 块大小
+} fsp_stat_t;
+
+/* ============================================================
+   目录项 (readdir 返回)
+   ============================================================ */
+typedef struct fsp_dirent {
+    uint64_t ino;               // inode 号
+    uint32_t type;              // 文件类型 (DT_REG, DT_DIR, DT_LNK, ...)
+    char name[256];             // 文件名
+} fsp_dirent_t;
+
+/* ============================================================
+   文件系统统计 (对应 struct statfs)
+   ============================================================ */
+typedef struct fsp_statfs {
+    uint64_t f_type;            // 文件系统类型
+    uint64_t f_bsize;           // 块大小
+    uint64_t f_blocks;          // 总块数
+    uint64_t f_bfree;           // 空闲块数
+    uint64_t f_bavail;          // 可用块数 (非特权用户)
+    uint64_t f_files;           // 总 inode 数
+    uint64_t f_ffree;           // 空闲 inode 数
+    uint64_t f_namelen;         // 最大文件名长度
+} fsp_statfs_t;
+
+/* ============================================================
+   Open 请求
+   ============================================================ */
+typedef struct fsp_open_req {
+    char path[256];             // 文件路径
+    uint32_t flags;             // 打开标志
+    uint32_t mode;              // 创建时使用的权限
+} fsp_open_req_t;
+
+/* ============================================================
+   Open 响应
+   ============================================================ */
+typedef struct fsp_open_resp {
+    int32_t fd;                 // 文件描述符 (-1 表示失败)
+    int32_t error;              // 错误码
+} fsp_open_resp_t;
+
+/* ============================================================
+   Read/Write 请求
+   ============================================================ */
+typedef struct fsp_rw_req {
+    int32_t fd;                 // 文件描述符
+    uint64_t offset;            // 偏移量
+    uint32_t count;             // 要读/写的字节数
+} fsp_rw_req_t;
+
+/* ============================================================
+   Read/Write 响应
+   ============================================================ */
+typedef struct fsp_rw_resp {
+    uint64_t bytes;             // 实际读/写的字节数
+    int32_t error;              // 错误码
+} fsp_rw_resp_t;
+
+/* ============================================================
+   Stat 请求
+   ============================================================ */
+typedef struct fsp_stat_req {
+    char path[256];             // 文件路径
+} fsp_stat_req_t;
+
+/* ============================================================
+   Stat 响应
+   ============================================================ */
+typedef struct fsp_stat_resp {
+    fsp_stat_t stat;
+    int32_t error;
+} fsp_stat_resp_t;
+
+/* ============================================================
+   FSP 上下文
+   ============================================================ */
+typedef struct fsp_context {
+    int initialized;
+    uint64_t fsp_task_id;       // FSP 自身的任务 ID
+    void *lock;
+} fsp_context_t;
+```
+
+四、FSP 协议定义
+
+```protobuf
+// protocols/fsp.proto
+syntax = "proto3";
+
+package hwrun.fsp;
+
+service FileSystem {
+    // === 文件操作 ===
+    rpc Open(OpenRequest) returns (OpenResponse);
+    rpc Close(CloseRequest) returns (CloseResponse);
+    rpc Read(ReadRequest) returns (ReadResponse);
+    rpc Write(WriteRequest) returns (WriteResponse);
+    rpc Lseek(LseekRequest) returns (LseekResponse);
+    
+    // === 文件状态 ===
+    rpc Stat(StatRequest) returns (StatResponse);
+    rpc Lstat(LstatRequest) returns (StatResponse);
+    rpc Fstat(FstatRequest) returns (StatResponse);
+    rpc Access(AccessRequest) returns (AccessResponse);
+    
+    // === 目录操作 ===
+    rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+    rpc Rmdir(RmdirRequest) returns (RmdirResponse);
+    rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
+    
+    // === 链接操作 ===
+    rpc Link(LinkRequest) returns (LinkResponse);
+    rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+    rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
+    rpc Readlink(ReadlinkRequest) returns (ReadlinkResponse);
+    
+    // === 重命名 ===
+    rpc Rename(RenameRequest) returns (RenameResponse);
+    
+    // === 权限管理 ===
+    rpc Chmod(ChmodRequest) returns (ChmodResponse);
+    rpc Chown(ChownRequest) returns (ChownResponse);
+    
+    // === 挂载管理 ===
+    rpc Mount(MountRequest) returns (MountResponse);
+    rpc Umount(UmountRequest) returns (UmountResponse);
+    
+    // === 扩展属性 ===
+    rpc Getxattr(GetxattrRequest) returns (GetxattrResponse);
+    rpc Setxattr(SetxattrRequest) returns (SetxattrResponse);
+    rpc Listxattr(ListxattrRequest) returns (ListxattrResponse);
+    rpc Removexattr(RemovexattrRequest) returns (RemovexattrResponse);
+    
+    // === 文件锁定 ===
+    rpc Flock(FlockRequest) returns (FlockResponse);
+    
+    // === 文件系统信息 ===
+    rpc Statfs(StatfsRequest) returns (StatfsResponse);
+}
+
+// ============ 文件操作 ============
+
+message OpenRequest {
+    string path = 1;
+    uint32 flags = 2;
+    uint32 mode = 3;
+}
+
+message OpenResponse {
+    int32 fd = 1;
+    int32 error = 2;
+}
+
+message CloseRequest {
+    int32 fd = 1;
+}
+
+message CloseResponse {
+    int32 error = 1;
+}
+
+message ReadRequest {
+    int32 fd = 1;
+    uint64 offset = 2;
+    uint32 count = 3;
+}
+
+message ReadResponse {
+    bytes data = 1;
+    uint64 read = 2;
+    int32 error = 3;
+}
+
+message WriteRequest {
+    int32 fd = 1;
+    uint64 offset = 2;
+    bytes data = 3;
+}
+
+message WriteResponse {
+    uint64 written = 1;
+    int32 error = 2;
+}
+
+message LseekRequest {
+    int32 fd = 1;
+    uint64 offset = 2;
+    uint32 whence = 3;              // 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
+}
+
+message LseekResponse {
+    uint64 offset = 1;
+    int32 error = 2;
+}
+
+// ============ 文件状态 ============
+
+message StatRequest {
+    string path = 1;
+}
+
+message LstatRequest {
+    string path = 1;
+}
+
+message FstatRequest {
+    int32 fd = 1;
+}
+
+message StatResponse {
+    StatInfo stat = 1;
+    int32 error = 2;
+}
+
+message StatInfo {
+    uint64 dev = 1;
+    uint64 ino = 2;
+    uint32 mode = 3;
+    uint32 nlink = 4;
+    uint32 uid = 5;
+    uint32 gid = 6;
+    uint64 size = 7;
+    uint64 atime = 8;
+    uint64 mtime = 9;
+    uint64 ctime = 10;
+    uint64 blocks = 11;
+    uint32 blksize = 12;
+}
+
+message AccessRequest {
+    string path = 1;
+    uint32 mode = 2;                // R_OK, W_OK, X_OK, F_OK
+}
+
+message AccessResponse {
+    bool ok = 1;
+    int32 error = 2;
+}
+
+// ============ 目录操作 ============
+
+message MkdirRequest {
+    string path = 1;
+    uint32 mode = 2;
+}
+
+message MkdirResponse {
+    int32 error = 1;
+}
+
+message RmdirRequest {
+    string path = 1;
+}
+
+message RmdirResponse {
+    int32 error = 1;
+}
+
+message ReaddirRequest {
+    string path = 1;
+    uint32 offset = 2;
+    uint32 count = 3;
+}
+
+message ReaddirResponse {
+    repeated Dirent entries = 1;
+    uint32 total = 2;
+    int32 error = 3;
+}
+
+message Dirent {
+    uint64 ino = 1;
+    uint32 type = 2;
+    string name = 3;
+}
+
+// ============ 链接操作 ============
+
+message LinkRequest {
+    string oldpath = 1;
+    string newpath = 2;
+}
+
+message LinkResponse {
+    int32 error = 1;
+}
+
+message UnlinkRequest {
+    string path = 1;
+}
+
+message UnlinkResponse {
+    int32 error = 1;
+}
+
+message SymlinkRequest {
+    string target = 1;
+    string linkpath = 2;
+}
+
+message SymlinkResponse {
+    int32 error = 1;
+}
+
+message ReadlinkRequest {
+    string path = 1;
+}
+
+message ReadlinkResponse {
+    string target = 1;
+    int32 error = 2;
+}
+
+// ============ 重命名 ============
+
+message RenameRequest {
+    string oldpath = 1;
+    string newpath = 2;
+}
+
+message RenameResponse {
+    int32 error = 1;
+}
+
+// ============ 权限管理 ============
+
+message ChmodRequest {
+    string path = 1;
+    uint32 mode = 2;
+}
+
+message ChmodResponse {
+    int32 error = 1;
+}
+
+message ChownRequest {
+    string path = 1;
+    uint32 uid = 2;
+    uint32 gid = 3;
+}
+
+message ChownResponse {
+    int32 error = 1;
+}
+
+// ============ 挂载管理 ============
+
+message MountRequest {
+    string source = 1;              // 设备或远程路径
+    string target = 2;              // 挂载点
+    string fstype = 3;              // 文件系统类型
+    uint32 flags = 4;               // 挂载标志
+    string options = 5;             // 挂载选项
+}
+
+message MountResponse {
+    int32 error = 1;
+}
+
+message UmountRequest {
+    string target = 1;
+    uint32 flags = 2;
+}
+
+message UmountResponse {
+    int32 error = 1;
+}
+
+// ============ 扩展属性 ============
+
+message GetxattrRequest {
+    string path = 1;
+    string name = 2;
+}
+
+message GetxattrResponse {
+    bytes value = 1;
+    int32 error = 2;
+}
+
+message SetxattrRequest {
+    string path = 1;
+    string name = 2;
+    bytes value = 3;
+    uint32 flags = 4;               // 0: replace, XATTR_CREATE, XATTR_REPLACE
+}
+
+message SetxattrResponse {
+    int32 error = 1;
+}
+
+message ListxattrRequest {
+    string path = 1;
+}
+
+message ListxattrResponse {
+    repeated string names = 1;
+    int32 error = 2;
+}
+
+message RemovexattrRequest {
+    string path = 1;
+    string name = 2;
+}
+
+message RemovexattrResponse {
+    int32 error = 1;
+}
+
+// ============ 文件锁定 ============
+
+message FlockRequest {
+    string path = 1;
+    uint32 operation = 2;           // LOCK_SH, LOCK_EX, LOCK_UN, LOCK_NB
+}
+
+message FlockResponse {
+    int32 error = 1;
+}
+
+// ============ 文件系统信息 ============
+
+message StatfsRequest {
+    string path = 1;
+}
+
+message StatfsResponse {
+    uint64 f_type = 1;
+    uint64 f_bsize = 2;
+    uint64 f_blocks = 3;
+    uint64 f_bfree = 4;
+    uint64 f_bavail = 5;
+    uint64 f_files = 6;
+    uint64 f_ffree = 7;
+    uint64 f_namelen = 8;
+    int32 error = 9;
+}
+```
+
+五、核心函数实现
+
+5.1 模块初始化和加载
+
+```c
+// fsp/src/fsp.c
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/stat.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/mount.h>
+#include <linux/fsnotify.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+#include "fsp_file.h"
+#include "fsp_dir.h"
+#include "fsp_link.h"
+#include "fsp_perm.h"
+#include "fsp_mount.h"
+#include "fsp_xattr.h"
+#include "fsp_lock.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("HWRun OS");
+MODULE_DESCRIPTION("HWRun OS FileSystem Protocol Plugin");
+MODULE_VERSION("1.0.0");
+
+static fsp_context_t g_fsp_ctx = {0};
+
+/* ============================================================
+   模块加载入口
+   ============================================================ */
+static int __init fsp_init(void) {
+    printk(KERN_INFO "HWRun FSP: Initializing...\n");
+    
+    // 1. 初始化上下文
+    memset(&g_fsp_ctx, 0, sizeof(fsp_context_t));
+    
+    // 2. 注册 IPC 消息处理器
+    int ret = fsp_ipc_register();
+    if (ret < 0) {
+        printk(KERN_ERR "HWRun FSP: Failed to register IPC handler\n");
+        return ret;
+    }
+    
+    // 3. 注册 FSP 协议（通过 METAPROTO - 通过 IPC）
+    fsp_register_protocol();
+    
+    g_fsp_ctx.initialized = 1;
+    printk(KERN_INFO "HWRun FSP: Initialized successfully\n");
+    
+    return 0;
+}
+
+/* ============================================================
+   模块卸载入口
+   ============================================================ */
+static void __exit fsp_exit(void) {
+    printk(KERN_INFO "HWRun FSP: Exiting...\n");
+    
+    fsp_ipc_unregister();
+    
+    g_fsp_ctx.initialized = 0;
+    printk(KERN_INFO "HWRun FSP: Exited\n");
+}
+
+module_init(fsp_init);
+module_exit(fsp_exit);
+```
+
+5.2 文件操作
+
+```c
+// fsp/src/fsp_file.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/stat.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   打开文件
+   ============================================================ */
+int fsp_open(const char *path, uint32_t flags, uint32_t mode, int32_t *out_fd) {
+    struct file *filp;
+    int ret;
+    int fd;
+    
+    // 使用 filp_open 打开文件
+    filp = filp_open(path, flags, mode);
+    if (IS_ERR(filp)) {
+        *out_fd = -1;
+        return PTR_ERR(filp);
+    }
+    
+    // 分配文件描述符 (简化版)
+    // 实际实现中需要维护 fd 表
+    fd = get_unused_fd_flags(flags & FSP_O_CLOEXEC ? O_CLOEXEC : 0);
+    if (fd < 0) {
+        filp_close(filp, NULL);
+        *out_fd = -1;
+        return fd;
+    }
+    
+    // 关联 file 结构到 fd
+    fd_install(fd, filp);
+    
+    *out_fd = fd;
+    return 0;
+}
+
+/* ============================================================
+   关闭文件
+   ============================================================ */
+int fsp_close(int32_t fd) {
+    struct file *filp;
+    int ret;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    ret = filp_close(filp, NULL);
+    fput(filp);
+    
+    return ret;
+}
+
+/* ============================================================
+   读取文件
+   ============================================================ */
+int fsp_read(int32_t fd, uint64_t offset, uint32_t count,
+             void *buf, uint64_t *out_read) {
+    struct file *filp;
+    ssize_t ret;
+    loff_t pos = offset;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    // 检查文件是否可读
+    if (!(filp->f_mode & FMODE_READ)) {
+        fput(filp);
+        return -EBADF;
+    }
+    
+    // 执行读取
+    ret = kernel_read(filp, buf, count, &pos);
+    
+    fput(filp);
+    
+    if (ret < 0) {
+        *out_read = 0;
+        return ret;
+    }
+    
+    *out_read = ret;
+    return 0;
+}
+
+/* ============================================================
+   写入文件
+   ============================================================ */
+int fsp_write(int32_t fd, uint64_t offset, const void *buf,
+              uint32_t count, uint64_t *out_written) {
+    struct file *filp;
+    ssize_t ret;
+    loff_t pos = offset;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    // 检查文件是否可写
+    if (!(filp->f_mode & FMODE_WRITE)) {
+        fput(filp);
+        return -EBADF;
+    }
+    
+    // 执行写入
+    ret = kernel_write(filp, buf, count, &pos);
+    
+    fput(filp);
+    
+    if (ret < 0) {
+        *out_written = 0;
+        return ret;
+    }
+    
+    *out_written = ret;
+    return 0;
+}
+
+/* ============================================================
+   文件定位
+   ============================================================ */
+int fsp_lseek(int32_t fd, uint64_t offset, uint32_t whence, uint64_t *out_offset) {
+    struct file *filp;
+    loff_t ret;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    ret = vfs_llseek(filp, offset, whence);
+    
+    fput(filp);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    *out_offset = ret;
+    return 0;
+}
+
+/* ============================================================
+   获取文件状态 (通过路径)
+   ============================================================ */
+int fsp_stat(const char *path, fsp_stat_t *out_stat) {
+    struct path p;
+    struct kstat stat;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_getattr(&p, &stat);
+    path_put(&p);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 转换为 fsp_stat_t
+    out_stat->dev = stat.dev;
+    out_stat->ino = stat.ino;
+    out_stat->mode = stat.mode;
+    out_stat->nlink = stat.nlink;
+    out_stat->uid = stat.uid;
+    out_stat->gid = stat.gid;
+    out_stat->size = stat.size;
+    out_stat->atime = stat.atime.tv_sec;
+    out_stat->mtime = stat.mtime.tv_sec;
+    out_stat->ctime = stat.ctime.tv_sec;
+    out_stat->blocks = stat.blocks;
+    out_stat->blksize = stat.blksize;
+    
+    return 0;
+}
+
+/* ============================================================
+   获取文件状态 (通过文件描述符)
+   ============================================================ */
+int fsp_fstat(int32_t fd, fsp_stat_t *out_stat) {
+    struct file *filp;
+    struct kstat stat;
+    int ret;
+    
+    filp = fget(fd);
+    if (!filp) {
+        return -EBADF;
+    }
+    
+    ret = vfs_getattr(&filp->f_path, &stat);
+    
+    fput(filp);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 转换为 fsp_stat_t
+    out_stat->dev = stat.dev;
+    out_stat->ino = stat.ino;
+    out_stat->mode = stat.mode;
+    out_stat->nlink = stat.nlink;
+    out_stat->uid = stat.uid;
+    out_stat->gid = stat.gid;
+    out_stat->size = stat.size;
+    out_stat->atime = stat.atime.tv_sec;
+    out_stat->mtime = stat.mtime.tv_sec;
+    out_stat->ctime = stat.ctime.tv_sec;
+    out_stat->blocks = stat.blocks;
+    out_stat->blksize = stat.blksize;
+    
+    return 0;
+}
+```
+
+5.3 目录操作
+
+```c
+// fsp/src/fsp_dir.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/dcache.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   创建目录
+   ============================================================ */
+int fsp_mkdir(const char *path, uint32_t mode) {
+    struct path p;
+    int ret;
+    
+    // 解析路径
+    ret = kern_path_create(AT_FDCWD, path, &p, LOOKUP_DIRECTORY);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 创建目录
+    ret = vfs_mkdir(d_inode(p.dentry->d_parent), p.dentry->d_name, mode);
+    
+    done_path_create(&p);
+    return ret;
+}
+
+/* ============================================================
+   删除目录
+   ============================================================ */
+int fsp_rmdir(const char *path) {
+    struct path p;
+    int ret;
+    
+    // 解析路径
+    ret = kern_path(path, LOOKUP_DIRECTORY, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 删除目录
+    ret = vfs_rmdir(d_inode(p.dentry->d_parent), p.dentry);
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   读取目录
+   ============================================================ */
+struct dir_context {
+    struct dir_context ctx;
+    fsp_dirent_t *entries;
+    uint32_t count;
+    uint32_t max_count;
+    uint32_t offset;
+};
+
+static int filldir_callback(struct dir_context *ctx, const char *name, int namelen,
+                            loff_t offset, uint64_t ino, unsigned int d_type) {
+    struct dir_context *dir = container_of(ctx, struct dir_context, ctx);
+    
+    if (dir->count >= dir->max_count) {
+        return -ENOSPC;
+    }
+    
+    if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.'))) {
+        // 跳过 . 和 ..
+        return 0;
+    }
+    
+    fsp_dirent_t *entry = &dir->entries[dir->count];
+    entry->ino = ino;
+    entry->type = d_type;
+    if (namelen >= sizeof(entry->name)) {
+        namelen = sizeof(entry->name) - 1;
+    }
+    memcpy(entry->name, name, namelen);
+    entry->name[namelen] = '\0';
+    dir->count++;
+    
+    return 0;
+}
+
+int fsp_readdir(const char *path, uint32_t offset, uint32_t count,
+                fsp_dirent_t **out_entries, uint32_t *out_count) {
+    struct path p;
+    struct file *file;
+    struct dir_context dir_ctx;
+    fsp_dirent_t *entries;
+    int ret;
+    
+    // 分配内存
+    entries = kmalloc(count * sizeof(fsp_dirent_t), GFP_KERNEL);
+    if (!entries) {
+        return -ENOMEM;
+    }
+    
+    // 打开目录
+    ret = kern_path(path, LOOKUP_DIRECTORY, &p);
+    if (ret < 0) {
+        kfree(entries);
+        return ret;
+    }
+    
+    file = dentry_open(&p, O_RDONLY | O_DIRECTORY, current_cred());
+    if (IS_ERR(file)) {
+        path_put(&p);
+        kfree(entries);
+        return PTR_ERR(file);
+    }
+    
+    // 初始化目录上下文
+    memset(&dir_ctx, 0, sizeof(dir_ctx));
+    dir_ctx.ctx.actor = filldir_callback;
+    dir_ctx.entries = entries;
+    dir_ctx.max_count = count;
+    dir_ctx.count = 0;
+    
+    // 读取目录
+    ret = iterate_dir(file, &dir_ctx.ctx);
+    
+    fput(file);
+    path_put(&p);
+    
+    if (ret < 0 && ret != -ENOSPC) {
+        kfree(entries);
+        return ret;
+    }
+    
+    *out_entries = entries;
+    *out_count = dir_ctx.count;
+    return 0;
+}
+```
+
+5.4 链接操作
+
+```c
+// fsp/src/fsp_link.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   创建硬链接
+   ============================================================ */
+int fsp_link(const char *oldpath, const char *newpath) {
+    struct path old_path;
+    struct dentry *new_dentry;
+    int ret;
+    
+    // 解析旧路径
+    ret = kern_path(oldpath, LOOKUP_FOLLOW, &old_path);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 创建新路径
+    ret = kern_path_create(AT_FDCWD, newpath, &old_path, 0);
+    if (ret < 0) {
+        path_put(&old_path);
+        return ret;
+    }
+    
+    // 创建硬链接
+    ret = vfs_link(old_path.dentry, d_inode(old_path.dentry->d_parent),
+                   new_dentry, NULL);
+    
+    done_path_create(&old_path);
+    path_put(&old_path);
+    return ret;
+}
+
+/* ============================================================
+   删除文件（硬链接）
+   ============================================================ */
+int fsp_unlink(const char *path) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, 0, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_unlink(d_inode(p.dentry->d_parent), p.dentry, NULL);
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   创建符号链接
+   ============================================================ */
+int fsp_symlink(const char *target, const char *linkpath) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path_create(AT_FDCWD, linkpath, &p, LOOKUP_PARENT);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_symlink(d_inode(p.dentry->d_parent), p.dentry->d_name, target);
+    
+    done_path_create(&p);
+    return ret;
+}
+
+/* ============================================================
+   读取符号链接
+   ============================================================ */
+int fsp_readlink(const char *path, char *buf, size_t size) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_readlink(p.dentry, buf, size);
+    
+    path_put(&p);
+    return ret;
+}
+```
+
+5.5 权限管理
+
+```c
+// fsp/src/fsp_perm.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   修改文件权限
+   ============================================================ */
+int fsp_chmod(const char *path, uint32_t mode) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_chmod(&p, mode);
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   修改文件所有者
+   ============================================================ */
+int fsp_chown(const char *path, uint32_t uid, uint32_t gid) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_chown(&p, make_kuid(current_user_ns(), uid),
+                    make_kgid(current_user_ns(), gid));
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   检查文件访问权限
+   ============================================================ */
+int fsp_access(const char *path, uint32_t mode) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = inode_permission(p.dentry->d_inode, mode);
+    
+    path_put(&p);
+    return ret;
+}
+```
+
+5.6 挂载管理
+
+```c
+// fsp/src/fsp_mount.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/mount.h>
+#include <linux/slab.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   挂载文件系统
+   ============================================================ */
+int fsp_mount(const char *source, const char *target, const char *fstype,
+              uint32_t flags, const char *options) {
+    int ret;
+    char *options_copy = NULL;
+    struct path path;
+    struct file_system_type *fs_type;
+    
+    // 查找文件系统类型
+    fs_type = get_fs_type(fstype);
+    if (!fs_type) {
+        return -ENODEV;
+    }
+    
+    // 复制选项
+    if (options && options[0] != '\0') {
+        options_copy = kstrdup(options, GFP_KERNEL);
+        if (!options_copy) {
+            put_filesystem(fs_type);
+            return -ENOMEM;
+        }
+    }
+    
+    // 解析挂载点路径
+    ret = kern_path(target, LOOKUP_DIRECTORY | LOOKUP_MOUNTPOINT, &path);
+    if (ret < 0) {
+        put_filesystem(fs_type);
+        kfree(options_copy);
+        return ret;
+    }
+    
+    // 执行挂载
+    ret = do_mount(source, target, fstype, flags, options_copy);
+    
+    path_put(&path);
+    put_filesystem(fs_type);
+    kfree(options_copy);
+    
+    return ret;
+}
+
+/* ============================================================
+   卸载文件系统
+   ============================================================ */
+int fsp_umount(const char *target, uint32_t flags) {
+    struct path path;
+    int ret;
+    
+    ret = kern_path(target, LOOKUP_DIRECTORY | LOOKUP_MOUNTPOINT, &path);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = path_umount(&path, flags);
+    
+    path_put(&path);
+    return ret;
+}
+```
+
+5.7 扩展属性
+
+```c
+// fsp/src/fsp_xattr.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/xattr.h>
+#include <linux/slab.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   获取扩展属性
+   ============================================================ */
+int fsp_getxattr(const char *path, const char *name, void *value, size_t size) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_getxattr(&p, name, value, size);
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   设置扩展属性
+   ============================================================ */
+int fsp_setxattr(const char *path, const char *name, const void *value,
+                 size_t size, uint32_t flags) {
+    struct path p;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_setxattr(&p, name, value, size, flags);
+    
+    path_put(&p);
+    return ret;
+}
+
+/* ============================================================
+   列出扩展属性
+   ============================================================ */
+int fsp_listxattr(const char *path, char **out_names, int *out_count) {
+    struct path p;
+    char *list;
+    ssize_t size;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    // 第一次调用获取大小
+    size = vfs_listxattr(&p, NULL, 0);
+    if (size < 0) {
+        path_put(&p);
+        return size;
+    }
+    
+    // 分配内存
+    list = kmalloc(size, GFP_KERNEL);
+    if (!list) {
+        path_put(&p);
+        return -ENOMEM;
+    }
+    
+    // 获取列表
+    ret = vfs_listxattr(&p, list, size);
+    
+    path_put(&p);
+    
+    if (ret < 0) {
+        kfree(list);
+        return ret;
+    }
+    
+    *out_names = list;
+    *out_count = ret;
+    return 0;
+}
+```
+
+5.8 文件锁定
+
+```c
+// fsp/src/fsp_lock.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/lockd/bind.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   文件锁定 (flock)
+   ============================================================ */
+int fsp_flock(const char *path, uint32_t operation) {
+    struct file *filp;
+    int ret;
+    
+    // 打开文件
+    filp = filp_open(path, O_RDWR, 0);
+    if (IS_ERR(filp)) {
+        return PTR_ERR(filp);
+    }
+    
+    // 执行锁定
+    ret = flock_filp(filp, operation);
+    
+    filp_close(filp, NULL);
+    return ret;
+}
+```
+
+5.9 文件系统统计
+
+```c
+// fsp/src/fsp_statfs.c
+
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   获取文件系统统计信息
+   ============================================================ */
+int fsp_statfs(const char *path, fsp_statfs_t *out_stat) {
+    struct path p;
+    struct kstatfs stat;
+    int ret;
+    
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    ret = vfs_statfs(&p, &stat);
+    
+    path_put(&p);
+    
+    if (ret < 0) {
+        return ret;
+    }
+    
+    out_stat->f_type = stat.f_type;
+    out_stat->f_bsize = stat.f_bsize;
+    out_stat->f_blocks = stat.f_blocks;
+    out_stat->f_bfree = stat.f_bfree;
+    out_stat->f_bavail = stat.f_bavail;
+    out_stat->f_files = stat.f_files;
+    out_stat->f_ffree = stat.f_ffree;
+    out_stat->f_namelen = stat.f_namelen;
+    
+    return 0;
+}
+```
+
+5.10 IPC 消息处理
+
+```c
+// fsp/src/fsp_ipc.c
+
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "fsp.h"
+#include "fsp_ipc.h"
+
+/* ============================================================
+   IPC 消息处理入口
+   ============================================================ */
+void fsp_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case FSP_MSG_OPEN: {
+            fsp_open_req_t *req = (fsp_open_req_t *)data;
+            fsp_open_resp_t resp;
+            int ret = fsp_open(req->path, req->flags, req->mode, &resp.fd);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case FSP_MSG_CLOSE: {
+            int32_t fd = *(int32_t *)data;
+            int ret = fsp_close(fd);
+            ipc_reply(from_task, &ret, sizeof(ret));
+            break;
+        }
+        
+        case FSP_MSG_READ: {
+            fsp_rw_req_t *req = (fsp_rw_req_t *)data;
+            fsp_rw_resp_t resp;
+            char *buf = kmalloc(req->count, GFP_KERNEL);
+            if (!buf) {
+                resp.bytes = 0;
+                resp.error = -ENOMEM;
+                ipc_reply(from_task, &resp, sizeof(resp));
+                break;
+            }
+            int ret = fsp_read(req->fd, req->offset, req->count, buf, &resp.bytes);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            // 注意：实际实现中需要将 buf 作为附加数据发送
+            kfree(buf);
+            break;
+        }
+        
+        case FSP_MSG_WRITE: {
+            // 类似 read 的实现
+            break;
+        }
+        
+        case FSP_MSG_STAT: {
+            fsp_stat_req_t *req = (fsp_stat_req_t *)data;
+            fsp_stat_resp_t resp;
+            int ret = fsp_stat(req->path, &resp.stat);
+            resp.error = ret;
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case FSP_MSG_MKDIR: {
+            // 实现 mkdir 处理
+            break;
+        }
+        
+        case FSP_MSG_READDIR: {
+            // 实现 readdir 处理
+            break;
+        }
+        
+        case FSP_MSG_MOUNT: {
+            // 实现 mount 处理
+            break;
+        }
+        
+        case FSP_MSG_UMOUNT: {
+            // 实现 umount 处理
+            break;
+        }
+        
+        case FSP_MSG_CHMOD: {
+            // 实现 chmod 处理
+            break;
+        }
+        
+        case FSP_MSG_SYMLINK: {
+            // 实现 symlink 处理
+            break;
+        }
+        
+        default:
+            printk(KERN_WARNING "HWRun FSP: Unknown IPC message type: %u\n", msg_type);
+            break;
+    }
+}
+```
+
+六、构建与安装
+
+6.1 插件描述文件
+
+```yaml
+# plugins/fsp/plugin.yml
+plugin:
+  id: "fsp"
+  name: "FileSystem Protocol"
+  version: "1.0.0"
+  type: "kernel"
+  
+  description: "HWRun OS 文件系统协议，提供文件、目录、权限、挂载等标准文件系统操作"
+  
+  provides:
+    - protocol: "FSP"
+      version: "1.0"
+  
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+  
+  params:
+    - key: "fsp.max_open_files"
+      type: "int"
+      default: 4096
+      description: "最大打开文件数"
+    - key: "fsp.default_permissions"
+      type: "string"
+      default: "0644"
+      description: "默认文件权限"
+  
+  files:
+    - "/usr/lib/hwrun/plugins/fsp.ko"
+  
+  hooks:
+    post_install: "scripts/post_install.sh"
+    pre_uninstall: "scripts/pre_uninstall.sh"
+```
+
+6.2 构建脚本
+
+```makefile
+# fsp/Makefile
+
+obj-m += fsp.o
+
+fsp-objs := fsp.o fsp_file.o fsp_dir.o fsp_link.o fsp_perm.o \
+            fsp_mount.o fsp_xattr.o fsp_lock.o fsp_statfs.o fsp_ipc.o
+
+KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
+
+install:
+	install -D -m 644 fsp.ko /usr/lib/hwrun/plugins/
+```
+
+七、命令行接口
+
+```bash
+# 文件操作
+hwrun fsp open /etc/hwrun/config.yml
+hwrun fsp read <fd> --offset 0 --count 1024
+hwrun fsp write <fd> --data "hello world"
+hwrun fsp close <fd>
+
+# 文件状态
+hwrun fsp stat /etc/hwrun/config.yml
+hwrun fsp lstat /etc/hwrun/config.yml
+hwrun fsp fstat <fd>
+
+# 目录操作
+hwrun fsp mkdir /tmp/test --mode 0755
+hwrun fsp rmdir /tmp/test
+hwrun fsp readdir /etc/hwrun/
+
+# 链接操作
+hwrun fsp link /etc/hwrun/config.yml /tmp/config.yml
+hwrun fsp unlink /tmp/config.yml
+hwrun fsp symlink /etc/hwrun/config.yml /tmp/config.yml
+hwrun fsp readlink /tmp/config.yml
+
+# 重命名
+hwrun fsp rename /tmp/old.txt /tmp/new.txt
+
+# 权限管理
+hwrun fsp chmod /tmp/file.txt --mode 0644
+hwrun fsp chown /tmp/file.txt --uid 1000 --gid 1000
+
+# 挂载管理
+hwrun fsp mount /dev/sda1 /mnt --fstype ext4
+hwrun fsp umount /mnt
+
+# 扩展属性
+hwrun fsp getxattr /tmp/file.txt --name user.attr
+hwrun fsp setxattr /tmp/file.txt --name user.attr --value "hello"
+
+# 文件锁定
+hwrun fsp flock /tmp/file.txt --operation LOCK_EX
+
+# 文件系统信息
+hwrun fsp statfs /mnt
+```
+
+八、总结
+
+维度 决策
+定位 文件系统协议，所有文件系统操作的统一入口
+实现方式 Linux 内核模块 (.ko)
+代码量 ~2000-2500 行 C
+提供协议 FSP (v1.0)
+依赖 微内核 IPC + METAPROTO + PARAM + LOG + HAP + PMP
+加载时机 在 LOADER、SHELL、PKGMGR 等依赖文件系统的插件之前
+关键功能 open/close/read/write/lseek/stat/mkdir/rmdir/readdir/mount/umount/chmod/chown/symlink/unlink/rename/xattr/flock/statfs
+
+FSP 是 HWRun OS 中第三个加载的硬件相关插件（HAP → PMP → FSP）。它作为内核模块运行，直接操作 Linux 内核的 VFS 层，通过 FSP 协议向上层插件提供完整的文件系统操作功能。上层插件（LOADER、SHELL、PKGMGR、CONFIG、LOG、GIT 等）通过 FSP 协议访问文件系统，不直接操作 VFS。

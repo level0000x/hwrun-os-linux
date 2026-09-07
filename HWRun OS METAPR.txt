@@ -1,0 +1,1030 @@
+﻿HWRun OS METAPROTO 实现文档
+
+模块名称： METAPROTO
+版本： 1.0.0
+状态： 设计冻结
+定位： 协议管理协议，是微内核加载的第一个插件
+实现语言： C
+依赖： 微内核（任务、IPC、内存）
+提供协议： METAPROTO
+
+一、设计哲学
+
+1.1 核心定位
+
+METAPROTO 是"协议的协议"——它是所有协议的管理者。
+
+```
+微内核（~3000行）
+    │ 只做三件事：
+    │ 1. 启动硬件
+    │ 2. 加载第一个插件 → METAPROTO
+    │ 3. 提供最简IPC
+    ▼
+METAPROTO
+    │ 管理所有协议：
+    │ 1. 协议注册（插件启动时注册自己实现的协议）
+    │ 2. 协议发现（查询系统中可用的协议列表）
+    │ 3. 协议解析（根据协议名称找到提供该协议的插件）
+    │ 4. 版本管理（检查协议版本兼容性）
+    │ 5. 协议热更新（同步通知所有消费者协议变更）
+    │ 6. 自举注册（自己注册自己）
+    ▼
+BUS (组件总线)
+    │ 通过 METAPROTO 注册 BUS 协议
+    │ 通过 METAPROTO 发现其他协议
+    ▼
+其他插件 (PARAM, LOG, GIT, HAP, FSP, ...)
+    │ 每个插件启动时都通过 METAPROTO 注册自己的协议
+```
+
+1.2 设计原则
+
+1. 自举优先：METAPROTO 必须能够在自己未被注册的情况下注册自己
+2. 协议驱动：METAPROTO 本身也是一个协议，被其他插件调用
+3. 持久化：协议注册表持久化存储，重启后快速恢复
+4. 同步通知：协议变更时，同步通知所有已订阅的消费者
+5. 最小依赖：只依赖微内核的基础接口（IPC、任务、内存）
+
+1.3 自举方案
+
+METAPROTO 的自举（Bootstrap）采用硬编码初始化方式：
+
+```
+微内核加载 METAPROTO 插件
+    │
+    ▼
+metaproto_init()
+    │
+    ├── 1. 初始化协议注册表（内存结构）
+    ├── 2. 从持久化存储加载已有协议
+    ├── 3. 硬编码注册自己：
+    │    协议名: "METAPROTO"
+    │    版本: "1.0.0"
+    │    提供者: "metaproto"
+    │    状态: "active"
+    ├── 4. 初始化消费者订阅表
+    ├── 5. 注册到微内核的协议路由表
+    └── 6. 就绪，等待其他插件的注册请求
+```
+
+二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    METAPROTO — 协议管理协议                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    METAPROTO 协议接口                                 │  │
+│  │  Register / Unregister / Update / List / Find / Resolve             │  │
+│  │  GetInfo / GetVersion / CheckCompatibility / Subscribe / Notify     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      协议注册表 (Protocol Registry)                   │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
+│  │  │  协议名    │ 版本    │ 提供者插件  │ 状态    │ 订阅者列表     │ │  │
+│  │  ├─────────────────────────────────────────────────────────────────┤ │  │
+│  │  │ METAPROTO │ 1.0.0  │ metaproto   │ active  │ [bus, param, ...]│ │  │
+│  │  │ BUS       │ 1.0.0  │ bus         │ active  │ [param, log, ...]│ │  │
+│  │  │ PARAM     │ 1.0.0  │ param       │ active  │ [log, git, ...]  │ │  │
+│  │  │ LOG       │ 1.0.0  │ log         │ active  │ [bus, ...]       │ │  │
+│  │  │ GIT       │ 1.0.0  │ git         │ active  │ [bus, ...]       │ │  │
+│  │  │ HAP       │ 1.0.0  │ linux-kernel│ active  │ [fsp, pmp, ...]  │ │  │
+│  │  │ ...       │ ...    │ ...         │ ...     │ ...              │ │  │
+│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    持久化存储 (Persistent Storage)                    │  │
+│  │  └── /var/lib/hwrun/metaproto/registry.db                           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    依赖的微内核接口                                    │  │
+│  │  ├── ipc_send()         → 向订阅者发送通知                           │  │
+│  │  ├── ipc_recv()         → 接收其他插件的请求                         │  │
+│  │  ├── kmalloc()          → 内存分配                                   │  │
+│  │  ├── kfree()            → 内存释放                                   │  │
+│  │  └── task_create()      → 为订阅者创建任务（异步通知）               │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+三、核心数据结构
+
+```c
+// metaproto/include/metaproto.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================
+   协议状态
+   ============================================================ */
+typedef enum {
+    PROTOCOL_STATE_ACTIVE = 0,      // 正常可用
+    PROTOCOL_STATE_DEPRECATED,       // 已弃用（仍可使用，但不推荐）
+    PROTOCOL_STATE_DRAFT,            // 草案（实验性）
+    PROTOCOL_STATE_REMOVED,          // 已移除（不可用）
+} protocol_state_t;
+
+/* ============================================================
+   协议信息
+   ============================================================ */
+#define PROTOCOL_NAME_MAX   64
+#define PROTOCOL_VERSION_MAX 16
+#define PROTOCOL_DESC_MAX   256
+#define PROTOCOL_PLUGIN_MAX 64
+
+typedef struct protocol_info {
+    char name[PROTOCOL_NAME_MAX];       // 协议名称，如 "HAP"
+    char version[PROTOCOL_VERSION_MAX]; // 语义化版本，如 "1.2.3"
+    char description[PROTOCOL_DESC_MAX]; // 描述信息
+    char provider_plugin[PROTOCOL_PLUGIN_MAX]; // 提供该协议的插件 ID
+    protocol_state_t state;             // 协议状态
+    uint64_t registered_at;             // 注册时间戳
+    uint64_t updated_at;                // 最后更新时间戳
+    uint32_t ref_count;                 // 引用计数（有多少插件在使用）
+    struct protocol_info *next;         // 链表指针
+} protocol_info_t;
+
+/* ============================================================
+   协议依赖
+   ============================================================ */
+typedef struct protocol_dependency {
+    char protocol[PROTOCOL_NAME_MAX];
+    char version_min[PROTOCOL_VERSION_MAX];
+    char version_max[PROTOCOL_VERSION_MAX];
+    int optional;                       // 是否可选依赖
+    struct protocol_dependency *next;
+} protocol_dependency_t;
+
+/* ============================================================
+   协议消费者订阅
+   ============================================================ */
+typedef struct protocol_subscriber {
+    char plugin_id[PROTOCOL_PLUGIN_MAX];
+    uint64_t task_id;                   // 微内核任务 ID（用于通知）
+    struct protocol_subscriber *next;
+} protocol_subscriber_t;
+
+/* ============================================================
+   协议注册表条目
+   ============================================================ */
+typedef struct registry_entry {
+    protocol_info_t *info;
+    protocol_dependency_t *deps;
+    protocol_subscriber_t *subscribers;
+    struct registry_entry *next;
+} registry_entry_t;
+
+/* ============================================================
+   METAPROTO 上下文
+   ============================================================ */
+typedef struct metaproto_context {
+    registry_entry_t *registry;         // 协议注册表
+    registry_entry_t *registry_tail;    // 注册表尾部（快速插入）
+    uint32_t protocol_count;
+    
+    /* 持久化存储路径 */
+    char storage_path[256];
+    
+    /* 互斥锁（用于并发安全） */
+    void *lock;
+    
+    /* 微内核任务 ID（METAPROTO 自身的任务） */
+    uint64_t metaproto_task_id;
+    
+    /* 是否已初始化 */
+    int initialized;
+} metaproto_context_t;
+
+/* ============================================================
+   METAPROTO 协议定义（通过 IPC 调用的接口）
+   ============================================================ */
+
+/* 注册请求 */
+typedef struct metaproto_register_req {
+    char name[PROTOCOL_NAME_MAX];
+    char version[PROTOCOL_VERSION_MAX];
+    char description[PROTOCOL_DESC_MAX];
+    char provider_plugin[PROTOCOL_PLUGIN_MAX];
+    protocol_state_t state;
+} metaproto_register_req_t;
+
+/* 注册响应 */
+typedef struct metaproto_register_resp {
+    int success;
+    char error[128];
+} metaproto_register_resp_t;
+
+/* 解析请求（根据协议名称找提供者） */
+typedef struct metaproto_resolve_req {
+    char name[PROTOCOL_NAME_MAX];
+    char version[PROTOCOL_VERSION_MAX];  // 可选，为空则返回最新
+} metaproto_resolve_req_t;
+
+/* 解析响应 */
+typedef struct metaproto_resolve_resp {
+    char provider_plugin[PROTOCOL_PLUGIN_MAX];
+    char version[PROTOCOL_VERSION_MAX];
+    int success;
+    char error[128];
+} metaproto_resolve_resp_t;
+
+/* 订阅请求 */
+typedef struct metaproto_subscribe_req {
+    char protocol[PROTOCOL_NAME_MAX];
+    char plugin_id[PROTOCOL_PLUGIN_MAX];
+    uint64_t task_id;
+} metaproto_subscribe_req_t;
+
+/* 订阅响应 */
+typedef struct metaproto_subscribe_resp {
+    int success;
+    char error[128];
+} metaproto_subscribe_resp_t;
+
+/* 协议变更通知（同步发送给所有订阅者） */
+typedef struct metaproto_notify_msg {
+    char protocol[PROTOCOL_NAME_MAX];
+    char old_version[PROTOCOL_VERSION_MAX];
+    char new_version[PROTOCOL_VERSION_MAX];
+    char old_provider[PROTOCOL_PLUGIN_MAX];
+    char new_provider[PROTOCOL_PLUGIN_MAX];
+    uint32_t event_type;                // 0=注册, 1=更新, 2=注销
+    uint64_t timestamp;
+} metaproto_notify_msg_t;
+```
+
+四、METAPROTO 协议定义
+
+```protobuf
+// protocols/metaproto.proto
+syntax = "proto3";
+
+package hwrun.metaproto;
+
+service MetaProtocol {
+    // === 协议注册 ===
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+    rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+    rpc Update(UpdateRequest) returns (UpdateResponse);
+    
+    // === 协议发现 ===
+    rpc List(ListRequest) returns (ListResponse);
+    rpc Find(FindRequest) returns (FindResponse);
+    rpc Resolve(ResolveRequest) returns (ResolveResponse);
+    
+    // === 协议查询 ===
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+    rpc GetDependencies(GetDependenciesRequest) returns (GetDependenciesResponse);
+    rpc GetProviders(GetProvidersRequest) returns (GetProvidersResponse);
+    rpc GetConsumers(GetConsumersRequest) returns (GetConsumersResponse);
+    
+    // === 协议版本管理 ===
+    rpc CheckCompatibility(CompatibilityRequest) returns (CompatibilityResponse);
+    rpc GetVersionHistory(VersionHistoryRequest) returns (VersionHistoryResponse);
+    
+    // === 协议热更新 ===
+    rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+    rpc NotifyChange(NotifyChangeRequest) returns (NotifyChangeResponse);
+}
+
+message ProtocolInfo {
+    string name = 1;
+    string version = 2;
+    string description = 3;
+    string provider_plugin = 4;
+    string state = 5;                 // "active", "deprecated", "draft", "removed"
+    uint64 registered_at = 6;
+    uint64 updated_at = 7;
+}
+
+message ProtocolDependency {
+    string protocol = 1;
+    string version_min = 2;
+    string version_max = 3;
+    bool optional = 4;
+}
+
+message RegisterRequest {
+    ProtocolInfo protocol = 1;
+    string plugin_id = 2;
+    repeated ProtocolDependency deps = 3;
+}
+
+message RegisterResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ResolveRequest {
+    string protocol = 1;
+    string version = 2;               // 可选
+    string requester_plugin = 3;      // 请求者插件ID（用于权限检查）
+}
+
+message ResolveResponse {
+    string provider_plugin = 1;
+    string version = 2;
+    bool success = 3;
+    string error = 4;
+}
+
+message SubscribeRequest {
+    string protocol = 1;
+    string plugin_id = 2;
+    uint64 task_id = 3;
+}
+
+message SubscribeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message NotifyChangeRequest {
+    string protocol = 1;
+    string old_version = 2;
+    string new_version = 3;
+    string new_provider = 4;
+    string event_type = 5;            // "registered", "updated", "unregistered"
+}
+
+message NotifyChangeResponse {
+    bool success = 1;
+    string error = 2;
+}
+```
+
+五、核心函数实现
+
+5.1 初始化与自举
+
+```c
+// metaproto/src/metaproto.c
+
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "metaproto.h"
+#include "kernel_ipc.h"
+#include "kernel_task.h"
+#include "kernel_mm.h"
+#include "storage.h"
+
+/* 全局 METAPROTO 上下文 */
+static metaproto_context_t g_ctx = {0};
+
+/* ============================================================
+   METAPROTO 初始化（被微内核调用）
+   ============================================================ */
+int metaproto_init(uint64_t task_id) {
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    
+    // 1. 记录任务 ID
+    g_ctx.metaproto_task_id = task_id;
+    
+    // 2. 设置存储路径
+    strcpy(g_ctx.storage_path, "/var/lib/hwrun/metaproto/registry.db");
+    
+    // 3. 初始化注册表（内存结构）
+    g_ctx.registry = NULL;
+    g_ctx.registry_tail = NULL;
+    g_ctx.protocol_count = 0;
+    
+    // 4. 从持久化存储加载已有的协议
+    storage_load(&g_ctx);
+    
+    // 5. 硬编码注册自己（自举）
+    protocol_info_t *self = kmalloc(sizeof(protocol_info_t));
+    if (self) {
+        strcpy(self->name, "METAPROTO");
+        strcpy(self->version, "1.0.0");
+        strcpy(self->description, "Protocol Management Protocol");
+        strcpy(self->provider_plugin, "metaproto");
+        self->state = PROTOCOL_STATE_ACTIVE;
+        self->registered_at = get_timestamp();
+        self->updated_at = get_timestamp();
+        self->ref_count = 0;
+        self->next = NULL;
+        
+        // 注册到注册表
+        registry_add(&g_ctx, self);
+        
+        // 立即持久化
+        storage_save(&g_ctx);
+    }
+    
+    // 6. 初始化订阅者表
+    // 已包含在 registry_entry_t 中
+    
+    // 7. 注册到微内核的协议路由表
+    // 使得其他插件可以通过微内核找到 METAPROTO
+    metaproto_register_to_kernel();
+    
+    g_ctx.initialized = 1;
+    metaproto_log("METAPROTO initialized (self-registered)");
+    return 0;
+}
+
+/* ============================================================
+   注册到微内核
+   ============================================================ */
+void metaproto_register_to_kernel(void) {
+    // 通过微内核 API 注册
+    kernel_protocol_route_add("METAPROTO", "1.0.0", "metaproto", NULL);
+}
+```
+
+5.2 协议注册
+
+```c
+// metaproto/src/register.c
+
+/* ============================================================
+   注册协议
+   ============================================================ */
+int metaproto_register(const metaproto_register_req_t *req,
+                       metaproto_register_resp_t *resp) {
+    if (!g_ctx.initialized) {
+        resp->success = 0;
+        strcpy(resp->error, "METAPROTO not initialized");
+        return -1;
+    }
+    
+    // 1. 检查是否已存在同名协议
+    registry_entry_t *existing = registry_find_by_name(req->name);
+    if (existing) {
+        // 检查是否由同一个插件提供
+        if (strcmp(existing->info->provider_plugin, req->provider_plugin) == 0) {
+            // 同一插件更新协议
+            return metaproto_update(req, resp);
+        }
+        resp->success = 0;
+        snprintf(resp->error, sizeof(resp->error),
+                 "Protocol %s already registered by %s",
+                 req->name, existing->info->provider_plugin);
+        return -2;
+    }
+    
+    // 2. 创建协议信息
+    protocol_info_t *info = kmalloc(sizeof(protocol_info_t));
+    if (!info) {
+        resp->success = 0;
+        strcpy(resp->error, "Out of memory");
+        return -3;
+    }
+    
+    strcpy(info->name, req->name);
+    strcpy(info->version, req->version);
+    strcpy(info->description, req->description);
+    strcpy(info->provider_plugin, req->provider_plugin);
+    info->state = req->state;
+    info->registered_at = get_timestamp();
+    info->updated_at = get_timestamp();
+    info->ref_count = 0;
+    info->next = NULL;
+    
+    // 3. 添加到注册表
+    registry_add(&g_ctx, info);
+    
+    // 4. 持久化
+    storage_save(&g_ctx);
+    
+    // 5. 注册到微内核协议路由表
+    kernel_protocol_route_add(req->name, req->version, req->provider_plugin, NULL);
+    
+    // 6. 同步通知所有订阅者（协议变更）
+    if (g_ctx.protocol_count > 1) {  // 排除自己
+        metaproto_notify_subscribers(req->name, NULL, req->version,
+                                     NULL, req->provider_plugin, 0);
+    }
+    
+    resp->success = 1;
+    resp->error[0] = '\0';
+    metaproto_log("Protocol %s v%s registered by %s",
+                  req->name, req->version, req->provider_plugin);
+    return 0;
+}
+```
+
+5.3 协议解析（查找协议提供者）
+
+```c
+// metaproto/src/resolve.c
+
+/* ============================================================
+   解析协议（根据名称查找提供者）
+   ============================================================ */
+int metaproto_resolve(const metaproto_resolve_req_t *req,
+                      metaproto_resolve_resp_t *resp) {
+    if (!g_ctx.initialized) {
+        resp->success = 0;
+        strcpy(resp->error, "METAPROTO not initialized");
+        return -1;
+    }
+    
+    // 1. 查找协议
+    registry_entry_t *entry = registry_find_by_name(req->name);
+    if (!entry) {
+        resp->success = 0;
+        snprintf(resp->error, sizeof(resp->error),
+                 "Protocol %s not found", req->name);
+        return -2;
+    }
+    
+    protocol_info_t *info = entry->info;
+    
+    // 2. 如果指定了版本，检查版本是否匹配
+    if (req->version[0] != '\0') {
+        // 版本匹配算法
+        if (!version_match(info->version, req->version)) {
+            resp->success = 0;
+            snprintf(resp->error, sizeof(resp->error),
+                     "Version %s not available, current version: %s",
+                     req->version, info->version);
+            return -3;
+        }
+    }
+    
+    // 3. 检查协议状态
+    if (info->state == PROTOCOL_STATE_REMOVED) {
+        resp->success = 0;
+        strcpy(resp->error, "Protocol has been removed");
+        return -4;
+    }
+    
+    // 4. 增加引用计数
+    info->ref_count++;
+    
+    // 5. 返回结果
+    strcpy(resp->provider_plugin, info->provider_plugin);
+    strcpy(resp->version, info->version);
+    resp->success = 1;
+    resp->error[0] = '\0';
+    
+    return 0;
+}
+```
+
+5.4 版本兼容性检查
+
+```c
+// metaproto/src/version.c
+
+/* ============================================================
+   语义化版本比较
+   返回值: 1 如果 v1 > v2, -1 如果 v1 < v2, 0 如果相等
+   ============================================================ */
+int version_compare(const char *v1, const char *v2) {
+    int major1, minor1, patch1;
+    int major2, minor2, patch2;
+    
+    sscanf(v1, "%d.%d.%d", &major1, &minor1, &patch1);
+    sscanf(v2, "%d.%d.%d", &major2, &minor2, &patch2);
+    
+    if (major1 != major2) return major1 > major2 ? 1 : -1;
+    if (minor1 != minor2) return minor1 > minor2 ? 1 : -1;
+    if (patch1 != patch2) return patch1 > patch2 ? 1 : -1;
+    return 0;
+}
+
+/* ============================================================
+   版本匹配检查 (required >= provider)
+   返回 1 如果匹配，0 如果不匹配
+   ============================================================ */
+int version_match(const char *provider_version, const char *required_version) {
+    return version_compare(provider_version, required_version) >= 0;
+}
+
+/* ============================================================
+   检查协议兼容性
+   ============================================================ */
+int metaproto_check_compatibility(const char *protocol,
+                                   const char *required_version,
+                                   char *error_buf, size_t buf_size) {
+    registry_entry_t *entry = registry_find_by_name(protocol);
+    if (!entry) {
+        snprintf(error_buf, buf_size, "Protocol %s not found", protocol);
+        return -1;
+    }
+    
+    if (!version_match(entry->info->version, required_version)) {
+        snprintf(error_buf, buf_size,
+                 "Version mismatch: required %s, available %s",
+                 required_version, entry->info->version);
+        return -2;
+    }
+    
+    return 0;
+}
+```
+
+5.5 订阅与同步通知
+
+```c
+// metaproto/src/notify.c
+
+/* ============================================================
+   订阅协议变更
+   ============================================================ */
+int metaproto_subscribe(const metaproto_subscribe_req_t *req,
+                         metaproto_subscribe_resp_t *resp) {
+    registry_entry_t *entry = registry_find_by_name(req->protocol);
+    if (!entry) {
+        resp->success = 0;
+        snprintf(resp->error, sizeof(resp->error),
+                 "Protocol %s not found", req->protocol);
+        return -1;
+    }
+    
+    // 检查是否已订阅
+    protocol_subscriber_t *sub = entry->subscribers;
+    while (sub) {
+        if (strcmp(sub->plugin_id, req->plugin_id) == 0) {
+            resp->success = 1;  // 已经订阅
+            return 0;
+        }
+        sub = sub->next;
+    }
+    
+    // 添加订阅者
+    protocol_subscriber_t *new_sub = kmalloc(sizeof(protocol_subscriber_t));
+    if (!new_sub) {
+        resp->success = 0;
+        strcpy(resp->error, "Out of memory");
+        return -2;
+    }
+    
+    strcpy(new_sub->plugin_id, req->plugin_id);
+    new_sub->task_id = req->task_id;
+    new_sub->next = entry->subscribers;
+    entry->subscribers = new_sub;
+    
+    resp->success = 1;
+    resp->error[0] = '\0';
+    metaproto_log("Plugin %s subscribed to %s", req->plugin_id, req->protocol);
+    return 0;
+}
+
+/* ============================================================
+   同步通知所有订阅者（协议变更）
+   ============================================================ */
+int metaproto_notify_subscribers(const char *protocol,
+                                  const char *old_version,
+                                  const char *new_version,
+                                  const char *old_provider,
+                                  const char *new_provider,
+                                  uint32_t event_type) {
+    registry_entry_t *entry = registry_find_by_name(protocol);
+    if (!entry) {
+        return -1;
+    }
+    
+    protocol_subscriber_t *sub = entry->subscribers;
+    if (!sub) {
+        return 0;  // 没有订阅者
+    }
+    
+    // 构建通知消息
+    metaproto_notify_msg_t msg;
+    strcpy(msg.protocol, protocol);
+    if (old_version) strcpy(msg.old_version, old_version);
+    else msg.old_version[0] = '\0';
+    if (new_version) strcpy(msg.new_version, new_version);
+    else msg.new_version[0] = '\0';
+    if (old_provider) strcpy(msg.old_provider, old_provider);
+    else msg.old_provider[0] = '\0';
+    if (new_provider) strcpy(msg.new_provider, new_provider);
+    else msg.new_provider[0] = '\0';
+    msg.event_type = event_type;
+    msg.timestamp = get_timestamp();
+    
+    // 同步发送给所有订阅者
+    int count = 0;
+    while (sub) {
+        // 通过微内核 IPC 发送通知（同步）
+        int ret = ipc_send(sub->task_id, &msg, sizeof(msg));
+        if (ret == 0) {
+            count++;
+        }
+        sub = sub->next;
+    }
+    
+    metaproto_log("Notified %d subscribers about %s change", count, protocol);
+    return count;
+}
+```
+
+5.6 持久化存储
+
+```c
+// metaproto/src/storage.c
+
+/* ============================================================
+   保存协议注册表到持久化存储
+   ============================================================ */
+int storage_save(metaproto_context_t *ctx) {
+    // 打开存储文件
+    int fd = open(ctx->storage_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        metaproto_log("Failed to open storage file for writing");
+        return -1;
+    }
+    
+    // 写入魔数（验证文件完整性）
+    uint32_t magic = 0x50524f54;  // "PROT"
+    write(fd, &magic, sizeof(magic));
+    
+    // 写入版本
+    uint32_t version = 1;
+    write(fd, &version, sizeof(version));
+    
+    // 写入协议数量
+    uint32_t count = ctx->protocol_count;
+    write(fd, &count, sizeof(count));
+    
+    // 遍历注册表，写入每个协议
+    registry_entry_t *entry = ctx->registry;
+    while (entry) {
+        protocol_info_t *info = entry->info;
+        
+        // 写入协议名称
+        write(fd, info->name, PROTOCOL_NAME_MAX);
+        // 写入版本
+        write(fd, info->version, PROTOCOL_VERSION_MAX);
+        // 写入描述
+        write(fd, info->description, PROTOCOL_DESC_MAX);
+        // 写入提供者
+        write(fd, info->provider_plugin, PROTOCOL_PLUGIN_MAX);
+        // 写入状态
+        write(fd, &info->state, sizeof(info->state));
+        // 写入时间戳
+        write(fd, &info->registered_at, sizeof(info->registered_at));
+        write(fd, &info->updated_at, sizeof(info->updated_at));
+        
+        entry = entry->next;
+    }
+    
+    close(fd);
+    metaproto_log("Saved %d protocols to storage", count);
+    return 0;
+}
+
+/* ============================================================
+   从持久化存储加载协议注册表
+   ============================================================ */
+int storage_load(metaproto_context_t *ctx) {
+    int fd = open(ctx->storage_path, O_RDONLY);
+    if (fd < 0) {
+        metaproto_log("No existing storage, starting fresh");
+        return 0;  // 首次启动，没有存储文件
+    }
+    
+    // 读取并验证魔数
+    uint32_t magic;
+    read(fd, &magic, sizeof(magic));
+    if (magic != 0x50524f54) {
+        metaproto_log("Invalid storage format, ignoring");
+        close(fd);
+        return -1;
+    }
+    
+    // 读取版本
+    uint32_t version;
+    read(fd, &version, sizeof(version));
+    if (version != 1) {
+        metaproto_log("Unsupported storage version, ignoring");
+        close(fd);
+        return -1;
+    }
+    
+    // 读取协议数量
+    uint32_t count;
+    read(fd, &count, sizeof(count));
+    
+    // 读取每个协议
+    for (uint32_t i = 0; i < count; i++) {
+        protocol_info_t *info = kmalloc(sizeof(protocol_info_t));
+        if (!info) break;
+        
+        read(fd, info->name, PROTOCOL_NAME_MAX);
+        read(fd, info->version, PROTOCOL_VERSION_MAX);
+        read(fd, info->description, PROTOCOL_DESC_MAX);
+        read(fd, info->provider_plugin, PROTOCOL_PLUGIN_MAX);
+        read(fd, &info->state, sizeof(info->state));
+        read(fd, &info->registered_at, sizeof(info->registered_at));
+        read(fd, &info->updated_at, sizeof(info->updated_at));
+        info->ref_count = 0;
+        info->next = NULL;
+        
+        registry_add(ctx, info);
+        
+        // 注册到微内核协议路由表
+        kernel_protocol_route_add(info->name, info->version,
+                                  info->provider_plugin, NULL);
+    }
+    
+    close(fd);
+    metaproto_log("Loaded %d protocols from storage", count);
+    return 0;
+}
+```
+
+六、IPC 通信接口
+
+```c
+// metaproto/src/ipc_handler.c
+
+/* ============================================================
+   METAPROTO IPC 消息处理器
+   处理来自其他插件的请求
+   ============================================================ */
+void metaproto_ipc_handler(uint64_t from_task, void *data, size_t len) {
+    uint32_t msg_type = *(uint32_t *)data;
+    
+    switch (msg_type) {
+        case METAPROTO_MSG_REGISTER: {
+            metaproto_register_req_t *req = (metaproto_register_req_t *)data;
+            metaproto_register_resp_t resp;
+            metaproto_register(req, &resp);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case METAPROTO_MSG_RESOLVE: {
+            metaproto_resolve_req_t *req = (metaproto_resolve_req_t *)data;
+            metaproto_resolve_resp_t resp;
+            metaproto_resolve(req, &resp);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case METAPROTO_MSG_LIST: {
+            // 返回所有协议列表
+            char *buf = registry_list_all();
+            ipc_reply(from_task, buf, strlen(buf) + 1);
+            break;
+        }
+        
+        case METAPROTO_MSG_SUBSCRIBE: {
+            metaproto_subscribe_req_t *req = (metaproto_subscribe_req_t *)data;
+            metaproto_subscribe_resp_t resp;
+            metaproto_subscribe(req, &resp);
+            ipc_reply(from_task, &resp, sizeof(resp));
+            break;
+        }
+        
+        case METAPROTO_MSG_CHECK_COMPAT: {
+            // 版本兼容性检查
+            // ...
+            break;
+        }
+        
+        default:
+            metaproto_log("Unknown IPC message type: %d", msg_type);
+            break;
+    }
+}
+```
+
+七、启动流程
+
+```
+微内核 _start()
+    │
+    ├── 1. 硬件初始化
+    ├── 2. 内存分配器初始化
+    ├── 3. 中断/时钟初始化
+    ├── 4. plugin_load("/usr/lib/hwrun/plugins/metaproto.so")
+    ├── 5. task_create("metaproto", entry)
+    ├── 6. task_switch(metaproto)
+    │
+    ▼
+metaproto_init()
+    │
+    ├── 1. 初始化注册表（内存结构）
+    ├── 2. 从持久化存储加载已有协议
+    ├── 3. 硬编码注册自己（自举）
+    │    协议名: "METAPROTO"
+    │    版本: "1.0.0"
+    │    提供者: "metaproto"
+    ├── 4. 初始化订阅者表
+    ├── 5. 注册到微内核协议路由表
+    ├── 6. 就绪
+    │
+    ▼
+METAPROTO 就绪，等待请求
+    │
+    ▼
+微内核加载 BUS 插件
+    │
+    ▼
+BUS 通过 IPC 调用 METAPROTO 注册 BUS 协议
+    │
+    ▼
+其他插件依次通过 METAPROTO 注册协议
+```
+
+八、配置与存储
+
+8.1 配置文件
+
+```yaml
+# /etc/hwrun/metaproto.yml
+metaproto:
+  # 持久化存储路径
+  storage: "/var/lib/hwrun/metaproto/registry.db"
+  
+  # 协议版本策略
+  versioning:
+    # 语义化版本格式: major.minor.patch
+    # major: 不兼容的更改
+    # minor: 向后兼容的新增功能
+    # patch: 向后兼容的修复
+    strict: true
+  
+  # 通知策略
+  notification:
+    # 同步通知所有订阅者
+    sync: true
+    # 超时时间（毫秒）
+    timeout: 1000
+  
+  # 日志
+  log:
+    level: "info"
+    file: "/var/log/hwrun/metaproto.log"
+```
+
+8.2 存储格式
+
+```
+/var/lib/hwrun/metaproto/registry.db
+
+格式:
+┌─────────────────────────────────────────────────────────────┐
+│  魔数 (uint32_t): 0x50524f54 ("PROT")                     │
+│  版本 (uint32_t): 1                                        │
+│  协议数量 (uint32_t): N                                    │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  协议 1:                                                ││
+│  │    名称 (64 bytes): "METAPROTO"                        ││
+│  │    版本 (16 bytes): "1.0.0"                            ││
+│  │    描述 (256 bytes): "..."                             ││
+│  │    提供者 (64 bytes): "metaproto"                      ││
+│  │    状态 (4 bytes): active                              ││
+│  │    注册时间 (8 bytes): timestamp                       ││
+│  │    更新时间 (8 bytes): timestamp                       ││
+│  ├─────────────────────────────────────────────────────────┤│
+│  │  协议 2: ...                                           ││
+│  ├─────────────────────────────────────────────────────────┤│
+│  │  ...                                                   ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+九、代码组织
+
+```
+metaproto/
+├── Makefile
+├── plugin.yml                     # 插件描述文件
+│
+├── include/
+│   ├── metaproto.h                # 核心数据结构
+│   ├── registry.h                 # 注册表操作
+│   ├── version.h                  # 版本管理
+│   ├── notify.h                   # 通知机制
+│   ├── storage.h                  # 持久化存储
+│   └── ipc_handler.h              # IPC 消息处理
+│
+└── src/
+    ├── metaproto.c                # 初始化与自举
+    ├── registry.c                 # 注册表实现
+    ├── version.c                  # 版本管理实现
+    ├── notify.c                   # 通知机制实现
+    ├── storage.c                  # 持久化存储实现
+    ├── ipc_handler.c              # IPC 消息处理
+    └── test.c                     # 单元测试
+```
+
+十、总结
+
+维度 决策
+定位 协议管理协议，所有协议的协议
+自举方式 硬编码注册自己
+注册表存储 内存 + 持久化 (/var/lib/hwrun/metaproto/registry.db)
+协议版本 语义化版本 (major.minor.patch)
+通知机制 同步通知所有订阅者
+通信方式 微内核 IPC
+依赖 仅依赖微内核（任务、IPC、内存）
+
+METAPROTO 是 HWRun OS 中第一个被微内核加载的插件。它通过硬编码自举注册自己，然后管理所有其他协议的注册、发现、版本管理和热更新通知。协议注册表持久化存储，重启后快速恢复。所有协议变更通过同步 IPC 通知所有订阅者，确保系统状态一致性。
