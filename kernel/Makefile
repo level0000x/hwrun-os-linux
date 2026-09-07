@@ -5,7 +5,8 @@
 LINUX_SRC ?= $(CURDIR)/../linux-src
 KBUILD_OUT ?= $(CURDIR)/build/linux
 MODULE_DIR := $(CURDIR)/modules
-CONFIG_FRAGMENT := $(CURDIR)/hwrun.config
+PROFILE ?= minimal
+CONFIG_FRAGMENT := $(CURDIR)/config/$(PROFILE).config
 JOBS ?= 1
 
 .PHONY: all config prune kernel modules menuconfig oldconfig clean help
@@ -40,4 +41,4 @@ clean:
 	rm -rf $(KBUILD_OUT)
 
 help:
-	@echo "Usage: make -C kernel [LINUX_SRC=/path/to/linux-src] [kernel|modules|all]"
+	@echo "Usage: make -C kernel PROFILE=minimal|host [LINUX_SRC=/path/to/linux-src] [kernel|modules|all]"

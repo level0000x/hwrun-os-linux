@@ -10,12 +10,24 @@ make -C kernel LINUX_SRC=/path/to/linux -j4 kernel
 make -C kernel LINUX_SRC=/path/to/linux modules
 ```
 
-The default configuration starts from Linux `allnoconfig` and merges
-`hwrun.config`, so disabled subsystems stay out unless they are explicitly
-added to the fragment. To regenerate the pruned configuration only:
+The default `minimal` profile starts from Linux `allnoconfig` and merges
+`config/minimal.config`. It keeps only mechanisms that cannot be ordinary
+HWRun plugins: boot, address spaces, scheduling, syscalls, ELF entry,
+initramfs, module loading and basic event primitives.
+
+Build the current POSIX plugin stack with the `host` profile:
 
 ```sh
-make -C kernel LINUX_SRC=/path/to/linux prune
+make -C kernel PROFILE=host LINUX_SRC=/path/to/linux -j4 kernel
+```
+
+The host profile retains the Linux mechanisms currently consumed by the
+existing plugins, such as VFS, ELF, `/proc`, `/sys`, sockets and namespaces.
+
+To regenerate the minimal configuration only:
+
+```sh
+make -C kernel PROFILE=minimal LINUX_SRC=/path/to/linux prune
 ```
 
 The first module is `modules/hwrun_core.ko`. It exposes `/dev/hwrun` and the UAPI in `include/uapi/hwrun.h`.
