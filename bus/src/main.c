@@ -15,6 +15,7 @@
  */
 
 #include "bus.h"
+#include "kctl.h"
 
 #include <getopt.h>
 #include <unistd.h>
@@ -132,11 +133,68 @@ static int cmd_protocols(void) {
     return HWRUN_OK;
 }
 
+/* ---------- kctl (内核边界客户端) ---------- */
+static int cmd_kctl(int argc, char **argv) {
+    hwrun_kctl_t c;
+    int rc = hwrun_kctl_open(&c);
+    if (rc != HWRUN_OK) {
+        printf("kctl: no kernel boundary (/dev/hwrun): %d\n", rc);
+        return rc;
+    }
+
+    if (argc < 1) {               /* 默认 ping + abi */
+        uint32_t abi = 0, ping = 0x12345678, orig = ping;
+        rc = hwrun_kctl_get_abi(&c, &abi);
+        printf("kctl: open %s: %s\n", c.device, rc==HWRUN_OK?"ok":"failed");
+        if (rc == HWRUN_OK) printf("kctl: abi version = %u\n", abi);
+        if (hwrun_kctl_ping(&c, &ping) == HWRUN_OK)
+            printf("kctl: ping 0x%08x -> 0x%08x\n", orig, ping);
+        hwrun_kctl_close(&c);
+        return rc;
+    }
+
+    if (hw_str_eq(argv[0], "abi")) {
+        uint32_t abi = 0;
+        rc = hwrun_kctl_get_abi(&c, &abi);
+        printf("abi: %s (%u)\n", rc==HWRUN_OK?"ok":"failed", abi);
+    } else if (hw_str_eq(argv[0], "ping") && argc >= 2) {
+        uint32_t v = (uint32_t)strtoul(argv[1], NULL, 0), orig = v;
+        rc = hwrun_kctl_ping(&c, &v);
+        printf("ping 0x%08x -> 0x%08x: %s\n", orig, v, rc==HWRUN_OK?"ok":"failed");
+    } else if (hw_str_eq(argv[0], "list")) {
+        const char *proto[] = {
+            "METAPROTO","BUS","PARAM","LOG","GIT","HAP","PMP","FSP",
+            "NP","SP","CRYPTO","LOADER", NULL
+        };
+        printf("%-24s %-12s %-24s\n", "PROTOCOL", "VERSION", "PROVIDER");
+        for (int i = 0; proto[i]; i++) {
+            hwrun_kctl_desc_t d;
+            if (hwrun_kctl_protocol_resolve(&c, proto[i], &d) != HWRUN_OK) continue;
+            printf("%-24s %-12s %-24s\n", d.protocol, d.version, d.provider);
+        }
+        rc = HWRUN_OK;
+    } else if (hw_str_eq(argv[0], "resolve") && argc >= 2) {
+        hwrun_kctl_desc_t d;
+        rc = hwrun_kctl_protocol_resolve(&c, argv[1], &d);
+        if (rc == HWRUN_OK)
+            printf("%s -> v%s by %s (impl=%llu)\n", d.protocol, d.version,
+                   d.provider, (unsigned long long)d.implementation);
+        else printf("resolve %s: %s\n", argv[1], rc==-2?"not found":"failed");
+    } else {
+        rc = HWRUN_EINVAL;
+        printf("usage: hwrun kctl [abi|ping <hex>|list|resolve <proto>]\n");
+    }
+
+    hwrun_kctl_close(&c);
+    return rc;
+}
+
 void hw_bus_cli_usage(const char *what) {
     (void)what;
     printf("usage: hwrun plugins list|load <id>|stop <id>|remove <id>\n"
            "       hwrun params list|get <key>|set <key> <val>\n"
            "       hwrun protocols list\n"
+           "       hwrun kctl [abi|ping <hex>|list|resolve <proto>]\n"
            "       hwrun status\n");
 }
 
@@ -149,6 +207,7 @@ int hw_bus_cli(int argc, char **argv) {
     if (hw_str_eq(cmd, "params"))            return cmd_params(argc-1, argv+1);
     if (hw_str_eq(cmd, "param"))             return cmd_params(argc-1, argv+1);
     if (hw_str_eq(cmd, "protocols"))         return cmd_protocols();
+    if (hw_str_eq(cmd, "kctl"))              return cmd_kctl(argc-1, argv+1);
     if (hw_str_eq(cmd, "scan"))              return hw_bus_scan(&g_bus);
     hw_bus_cli_usage(NULL);
     return HWRUN_EINVAL;
@@ -157,7 +216,7 @@ int hw_bus_cli(int argc, char **argv) {
 int main(int argc, char **argv) {
     /* 默认启动模式：无子命令或第一个参数不是 CLI 命令时，按依赖链启动 */
     static char *cli_cmds[] = {
-        "plugins", "params", "param", "protocols", "status", "scan", NULL
+        "plugins", "params", "param", "protocols", "status", "scan", "kctl", NULL
     };
     int is_cli = 0;
     if (argc > 1) {

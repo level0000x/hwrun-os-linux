@@ -27,6 +27,7 @@ BUS_SRCS := bus/src/hwrun.c \
             bus/src/log.c \
             bus/src/yml.c \
             bus/src/loader.c \
+            bus/src/kctl.c \
             bus/src/bus.c \
             bus/src/main.c
 BUS_OBJS := $(BUS_SRCS:.c=.o)

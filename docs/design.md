@@ -1,6 +1,6 @@
  # HWRun OS 设计与实现基线
 
-版本：0.1
+版本：0.2
 状态：当前实现基线
 更新时间：2026-09-08
 
@@ -176,12 +176,15 @@ HWRun OS booted (8 plugins, 13 protocols)
 
 - Linux v6.1 源码工作区准备
 - Linux kbuild 适配层
-- minimal/host 内核 profile
-- `bzImage` 构建
-- `hwrun_core.ko` 构建
+- minimal/host 内核 profile（均在 WSL Ubuntu 2 环境以多核固化构建，产物验证通过）
+- `bzImage` 构建（minimal 1.6MB / host 2.8MB）
+- `hwrun_core.ko` 构建（vermagic 6.1.0）
 - `hwrun_core` 基础协议注册表和 ioctl UAPI
 - 顶层插件构建编排修复
 - 8 个现有用户态插件通过 BUS 启动链验证
+- BUS 内核边界客户端 `kctl`（bus/src/kctl.{c,h}），封装 `/dev/hwrun` ioctl，无设备时降级返回
+- 真协议调用自测 `tests/`：dlopen 插件 → metaproto 解析 → 真实调用 HAP/PMP/FSP/NP/LOADER ops，38 项断言全部通过
+- CRYPTO 插件 Makefile 支持双平台（MSYS2/mingw64 与 Linux/系统 OpenSSL），Linux 下产出 ELF `.so`
 
 当前 `hwrun_core.ko` 提供：
 
@@ -192,7 +195,7 @@ HWRun OS booted (8 plugins, 13 protocols)
 - 协议注销
 - 协议解析
 
-它目前是内核边界桥接模块，不是现有 BUS 的强依赖。现有 BUS 继续使用进程内 METAPROTO 路由，这是当前可运行的主路径。
+它目前是内核边界桥接模块，不是现有 BUS 的强依赖。现有 BUS 继续使用进程内 METAPROTO 路由，这是当前可运行的主路径。`kctl` 客户端是面向该桥接的可选调用路径，且与用户态 METAPROTO 解耦。
 
 ## 7. 已知差异
 
@@ -203,16 +206,18 @@ HWRun OS booted (8 plugins, 13 protocols)
 5. 参数注入和 Git 状态管理尚未覆盖所有插件。
 6. 文档中的协议版本兼容规则还没有完全统一到所有插件。
 7. 内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接。
+8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 尚未装入真实 Linux 内核做 ioctl 运行级验证（需引导 6.1 内核）。
 
 ## 8. 后续实施顺序
 
-1. 固化 `minimal` 和 `host` profile 的构建、产物和启动测试。
-2. 为 BUS 增加稳定的内核边界客户端，按需访问 `/dev/hwrun`。
+1. ~~固化 `minimal` 和 `host` profile 的构建、产物和启动测试~~（已在 WSL 完成构建固化）
+2. ~~为 BUS 增加稳定的内核边界客户端，按需访问 `/dev/hwrun`~~（`kctl` 已实现）
 3. 统一 `plugin.yml`、`hw_plugin_entry()`、协议版本和错误码。
 4. 将 PARAM、LOG、GIT 接口注入现有插件生命周期。
-5. 为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动。
+5. ~~为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动~~（`tests/` 38 项断言通过）
 6. 对确实需要内核权限的能力增加薄 `.ko`，避免重复实现用户态插件逻辑。
-7. 最后再推进 bootloader、rootfs、ISO 和完整发行版构建。
+7. 将 `hwrun_core.ko` 装入引导的 minimal 内核，完成 `kctl` 客户端在内核边界的运行级验证。
+8. 最后再推进 bootloader、rootfs、ISO 和完整发行版构建。
 
 ## 9. 基线提交
 
