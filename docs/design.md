@@ -254,7 +254,7 @@ HWRun OS booted (8 plugins, 13 protocols)
 4. ~~将 PARAM、LOG、GIT 接口注入现有插件生命周期~~（已注入，见 6.1）
 5. ~~为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动~~（CMocka 体系，6 组用例通过）
 6. 对确实需要内核权限的能力增加薄 `.ko`，避免重复实现用户态插件逻辑。
-7. 将 `hwrun_core.ko` 装入引导的 minimal 内核，完成 `kctl` 客户端在内核边界的运行级验证。
+7. ~~将 `hwrun_core.ko` 装入引导的 minimal 内核，完成 `kctl` 客户端在内核边界的运行级验证。~~（已在 QEMU qemu profile 内核内跑通，见 6.3）
 8. 最后再推进 bootloader、rootfs、ISO 和完整发行版构建。
 9. ~~底层工程化重构（构建/错误码/并发/内存/信号/测试/门禁）~~（0.3 已完成并验证）
 
