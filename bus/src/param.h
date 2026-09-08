@@ -9,6 +9,7 @@
 #define HWRUN_PARAM_H
 
 #include "hwrun.h"
+#include "hwlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +41,7 @@ typedef struct hw_param_watcher {
 typedef struct hw_param_context {
     hw_param_t *root;                     /* 参数树根 */
     hw_param_watcher_t *watchers;         /* 监听器   */
+    hw_locker_t lock;                     /* HWLOCK_RW：保护参数树与 watchers */
     char dirs[HWPARAM_SRC_MAX][256];      /* 各来源目录 */
     char git_state_file[256];             /* git 状态文件 */
     int  initialized;

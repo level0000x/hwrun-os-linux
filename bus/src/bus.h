@@ -9,6 +9,7 @@
 #define HWRUN_BUS_H
 
 #include "hwrun.h"
+#include "hwlock.h"
 #include "metaproto.h"
 #include "param.h"
 #include "log.h"
@@ -23,6 +24,7 @@ extern "C" {
 /* 组件总线上下文 */
 typedef struct hw_bus {
     hw_plugin_t          *plugins;         /* 插件链表           */
+    hw_locker_t           plugins_lock;    /* HWLOCK_RW：保护 plugins 链表结构 */
     hw_metaproto_registry_t meta;          /* METAPROTO 注册表   */
     hw_param_context_t    params;          /* 参数系统           */
     hw_log_ctx_t          log;             /* 日志系统           */
@@ -77,6 +79,7 @@ extern int          hw_bus_plugin_count(hw_bus_t *bus);
  * plugin.yml 解析（bus/yml.c）
  * ============================================================ */
 extern int  hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d);
+extern void hw_plugin_discovery_clear(hw_plugin_discovery_t *d);
 extern void hw_plugin_discovery_free(hw_plugin_discovery_t *d);
 extern int  hw_type_from_str(const char *s);
 extern const char *hw_type_to_str(int type);
@@ -88,6 +91,15 @@ extern int  hw_plugin_load_so(hw_bus_t *bus, hw_plugin_t *p);
 extern int  hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p);
 extern int  hw_plugin_stop(hw_bus_t *bus, hw_plugin_t *p);
 extern int  hw_plugin_unload(hw_bus_t *bus, hw_plugin_t *p);
+extern void hw_plugin_free_meta(hw_plugin_t *p);   /* 释放节点动态元数据 */
+
+/* ============================================================
+ * 运行时注入（bus/runtime.c）
+ * ============================================================ */
+extern void  hw_runtime_bus_bind(hw_bus_t *bus);
+extern void  hw_runtime_fill(hw_runtime_t *rt);
+extern void  hw_plugin_inject_runtime(hw_bus_t *bus, hw_plugin_t *p);
+extern hw_bus_t *hw_runtime_bus(void);
 
 /* ============================================================
  * CLI

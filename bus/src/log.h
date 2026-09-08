@@ -8,6 +8,7 @@
 #define HWRUN_LOG_H
 
 #include "hwrun.h"
+#include "hwlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,7 @@ typedef struct hw_log_ops {
 
 /* 日志实现入口 */
 typedef struct hw_log_ctx {
+    hw_locker_t lock;         /* HWLOCK_MTX：串行化写日志（rd/wr 均走 mutex） */
     int   level;              /* 当前日志级别 */
     FILE *out;                /* 输出流       */
     char  output_path[256];
@@ -43,6 +45,8 @@ typedef struct hw_log_ctx {
 
 extern int  hw_log_init(hw_log_ctx_t *ctx, const char *path, int level);
 extern void hw_log_shutdown(hw_log_ctx_t *ctx);
+extern void hw_log_vwrite(hw_log_ctx_t *ctx, int level, const char *plugin_id,
+                          const char *fmt, va_list ap);
 extern void hw_log_write(hw_log_ctx_t *ctx, int level, const char *plugin_id,
                          const char *fmt, ...)
 #ifdef __GNUC__

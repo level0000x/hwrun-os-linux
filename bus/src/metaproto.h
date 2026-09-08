@@ -9,6 +9,7 @@
 #define HWRUN_METAPROTO_H
 
 #include "hwrun.h"
+#include "hwlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,7 @@ typedef struct hw_metaproto_api {
 typedef struct hw_metaproto_registry {
     hw_protocol_route_t *routes;          /* 路由表链表    */
     hw_protocol_sub_t   *subscribers;     /* 订阅者链表    */
+    hw_locker_t          lock;            /* HWLOCK_RW：保护 routes/subscribers */
     char                 state_file[256]; /* 持久化路径   */
     int                  initialized;
 } hw_metaproto_registry_t;
