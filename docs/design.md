@@ -224,13 +224,13 @@ HWRun OS booted (8 plugins, 13 protocols)
 6. 文档中的协议版本兼容规则还没有完全统一到所有插件。
 7. 内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接。
 8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 尚未装入真实 Linux 内核做 ioctl 运行级验证（需引导 6.1 内核）。
-9. plugin.yml 仍有嵌套 map 与扁平纯字符串两种形态并存，单一样式收敛（统一嵌套 `plugin:` 根 + protocol/version map）列为遗留项。
+9. ~~plugin.yml 仍有嵌套 map 与扁平纯字符串两种形态并存，单一样式收敛（统一嵌套 `plugin:` 根 + protocol/version map）~~（已收敛：8 个 yml 统一格式，解析器缩进感知修复子键覆盖问题）。
 
 ## 8. 后续实施顺序
 
 1. ~~固化 `minimal` 和 `host` profile 的构建、产物和启动测试~~（已在 WSL 完成构建固化）
 2. ~~为 BUS 增加稳定的内核边界客户端，按需访问 `/dev/hwrun`~~（`kctl` 已实现）
-3. ~~统一 `plugin.yml`、`hw_plugin_entry()`、协议版本和错误码~~（0.3：SDK 宏统一入口 + 负 errno 收敛；plugin.yml 单一样式收敛为遗留项，见第 7.9）
+3. ~~统一 `plugin.yml`、`hw_plugin_entry()`、协议版本和错误码~~（0.3：SDK 宏统一入口 + 负 errno 收敛；plugin.yml 单一样式已收敛）
 4. ~~将 PARAM、LOG、GIT 接口注入现有插件生命周期~~（已注入，见 6.1）
 5. ~~为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动~~（CMocka 体系，6 组用例通过）
 6. 对确实需要内核权限的能力增加薄 `.ko`，避免重复实现用户态插件逻辑。
