@@ -70,6 +70,29 @@ foreach(_t IN LISTS _cmocka_unit_tests)
 endforeach()
 
 # ----------------------------------------------------------------
+# dlopen 型协议集成单测：加载插件 .so 后经 METAPROTO 真调 ops。
+# 与 test_proto 同构（需 ENABLE_EXPORTS 供插件解析宿主符号；
+# add_dependencies 保证 .so 先构建；dlopen 用相对路径故 WORKING_DIRECTORY=tests）。
+# ----------------------------------------------------------------
+set(_dlopen_tests test_hap test_pmp test_git test_crypto)
+foreach(_t IN LISTS _dlopen_tests)
+  add_executable(${_t} ${_t}.c)
+  target_link_libraries(${_t} PRIVATE
+    hwrun-core
+    hwrun_includes
+    PkgConfig::CMOCKA)
+  set_target_properties(${_t} PROPERTIES ENABLE_EXPORTS ON)
+  add_dependencies(${_t} hap pmp git crypto)
+  if(HWRUN_PLUGIN_ROOT)
+    target_compile_definitions(${_t} PRIVATE
+      HWRUN_PLUGIN_ROOT="${HWRUN_PLUGIN_ROOT}")
+  endif()
+  add_test(NAME ${_t} COMMAND ${_t})
+  set_tests_properties(${_t} PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endforeach()
+
+# ----------------------------------------------------------------
 # gcov 覆盖率：test_proto 与全部 CMocka 单测目标统一加 --coverage
 # （hwrun-core 的 --coverage 已在 bus/CMakeLists.txt 由同一 option 控制）
 # ----------------------------------------------------------------
