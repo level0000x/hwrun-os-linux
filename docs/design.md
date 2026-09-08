@@ -231,6 +231,7 @@ HWRun OS booted (8 plugins, 13 protocols)
   # 报告：build-cov/coverage/index.html
   ```
   基线（WSL，2026-09）：行覆盖 46.2%（1500/3245）、函数 49.8%（164/329），覆盖范围 bus/hwrun-core + 8 插件源码（测试桩代码已排除）。
+- **kernel 模块真编译**：本地 `linux-src/`（Linux 6.1.0）执行 `make -C kernel PROFILE=minimal JOBS=4 modules`，`hwrun_core.o` 编译通过——uapi desc 的 6 条 ABI `_Static_assert`（152B/各字段偏移）在真实 kbuild 下生效，产出 `hwrun_core.ko`（编译级验证；运行级 ioctl 验证仍需装入真实内核）。
 
 ## 7. 已知差异
 
