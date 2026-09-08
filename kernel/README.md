@@ -1,49 +1,45 @@
-# HWRun Linux Kernel Layer
+# HWRun Linux 内核层
 
-HWRun now uses Linux as the kernel implementation. The project does not copy or vendor the Linux source tree. `LINUX_SRC` points to an external Linux checkout, and this directory owns the HWRun configuration plus kernel modules.
+`kernel/` 目录收敛为面向 Linux kbuild 的集成层。项目使用 Linux 作为内核实现，
+不再维护自研 i386 微内核；Linux 源码位于外部 `linux-src/`（不入库），本目录只
+持有 HWRun 的配置、内核模块与所需头文件。
 
-## Build
+## 目录结构
+
+- `config/`：Linux 内核 profile——`minimal.config`（机制最小化）与 `host.config`
+  （当前 POSIX 用户态插件链所需机制）
+- `Makefile`：面向外部 `LINUX_SRC` 的 kbuild 编排（config / kernel / modules）
+- `modules/`：HWRun 内核边界模块，`hwrun_core.ko` 提供 `/dev/hwrun` 与协议
+  注册/注销/解析 ioctl
+- `include/`：模块构建所需头——`hwrun_kernel.h`（内核侧模块 API）、
+  `uapi/hwrun.h`（用户态 ioctl ABI，`bus/src/kctl.c` 对齐用）
+
+自研 i386 微内核残留（`src/`、`boot/boot.S`、`linker.ld` 及配套内核头）已废弃并
+从仓库移除，不再参与任何构建。
+
+## 构建
 
 ```sh
 make -C kernel LINUX_SRC=/path/to/linux oldconfig
-make -C kernel LINUX_SRC=/path/to/linux -j4 kernel
-make -C kernel LINUX_SRC=/path/to/linux modules
+make -C kernel PROFILE=minimal LINUX_SRC=/path/to/linux -j4 kernel
+make -C kernel PROFILE=host LINUX_SRC=/path/to/linux modules
 ```
 
-The default `minimal` profile starts from Linux `allnoconfig` and merges
-`config/minimal.config`. It keeps only mechanisms that cannot be ordinary
-HWRun plugins: boot, address spaces, scheduling, syscalls, ELF entry,
-initramfs, module loading and basic event primitives.
+`minimal` profile 从 Linux `allnoconfig` 起步合并 `config/minimal.config`，只保留
+不可插件化的机制（启动、地址空间、调度、系统调用、ELF、initramfs、模块装载、
+基础事件原语）；`host` profile 追加 VFS、ext4/overlayfs、`/proc`、`/sys`、
+socket、namespace、cgroup、seccomp 等现有插件所需的机制。
 
-Build the current POSIX plugin stack with the `host` profile:
+构建产物输出到 `kernel/build/`（不入库），模块产物留在 `modules/`（均被
+`.gitignore` 覆盖，不入库）。
 
-```sh
-make -C kernel PROFILE=host LINUX_SRC=/path/to/linux -j4 kernel
-```
+## 边界
 
-The host profile retains the Linux mechanisms currently consumed by the
-existing plugins, such as VFS, ELF, `/proc`, `/sys`, sockets and namespaces.
+- Linux 提供进程、虚拟内存、调度、驱动、文件系统、ELF 执行、namespace 等机制。
+- `bus/` 用户态组件总线仍按 `hw_plugin_entry()` ABI 加载 `.so` 插件。
+- 需要内核权限的边界能力以薄 `.ko` 放于 `modules/`，通过 UAPI 或协议注册接入。
 
-To regenerate the minimal configuration only:
+## 依赖
 
-```sh
-make -C kernel PROFILE=minimal LINUX_SRC=/path/to/linux prune
-```
-
-The first module is `modules/hwrun_core.ko`. It exposes `/dev/hwrun` and the UAPI in `include/uapi/hwrun.h`.
-
-The pruned x86_64 build produces `build/linux/arch/x86/boot/bzImage`.
-
-## Architecture
-
-- Linux supplies process management, virtual memory, scheduling, IPC primitives, drivers, filesystems, ELF execution, namespaces and security mechanisms.
-- `bus/` remains the user-space component bus and continues to load `.so` plugins through the existing `hw_plugin_entry()` ABI.
-- HAP, PMP, LOADER and later hardware-facing components should be implemented as Linux kernel modules under `kernel/modules/` and registered through explicit UAPI or protocol adapters.
-- The previous freestanding i386 prototype sources remain in `boot/` and `src/` for reference only; they are not part of the default build anymore.
-
-## Requirements
-
-- Linux kernel source matching the target build environment
-- GCC and GNU Make
-- Kernel build dependencies required by the selected Linux version
-- Root privileges only when installing modules or booting the resulting kernel
+- 与目标构建环境匹配的 Linux 内核源码（`LINUX_SRC`）
+- GCC、GNU Make 及所选 Linux 版本要求的内核构建依赖
