@@ -30,6 +30,12 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+/* 插件 .so 根目录：默认相对源树（WORKING_DIRECTORY=tests，故 "../"=仓库根）。
+ * sanitizer/coverage 隔离构建时 CMake 定义 HWRUN_PLUGIN_ROOT=构建树 plugins/（绝对，尾带 /）。 */
+#ifndef HWRUN_PLUGIN_ROOT
+#define HWRUN_PLUGIN_ROOT "../"
+#endif
+
 /* ---- 统一断言 ---- */
 static int g_fail = 0;
 static int g_pass = 0;
@@ -111,11 +117,16 @@ int main(void) {
     tr = NULL;
     CHECK(hw_metaproto_resolve(&bus.meta, "LOG", NULL, &tr) == HWRUN_OK && tr, "内置 LOG 可解析");
 
-    const char *plugin_sos[] = {
-        "../hap/build/hap.so", "../pmp/build/pmp.so",       "../fsp/build/fsp.so",
-        "../np/build/np.so",   "../loader/build/loader.so",
-    };
-    int sos = (int)(sizeof(plugin_sos) / sizeof(plugin_sos[0]));
+    /* 插件 .so 路径：默认相对 "../"（WORKING_DIRECTORY=tests 源目录，指到源树各插件 build/）。
+     * sanitizer/coverage 隔离构建时由 CMake 传 HWRUN_PLUGIN_ROOT=构建树 plugins/（绝对）。 */
+    const char *names[] = { "hap", "pmp", "fsp", "np", "loader" };
+    int sos = (int)(sizeof(names) / sizeof(names[0]));
+    char paths[5][512];
+    for (int i = 0; i < sos; i++)
+        snprintf(paths[i], sizeof(paths[i]), HWRUN_PLUGIN_ROOT "%s/build/%s.so",
+                 names[i], names[i]);
+    const char *plugin_sos[5];
+    for (int i = 0; i < sos; i++) plugin_sos[i] = paths[i];
 
     printf("[1/5] 插件加载与注册\n");
     for (int i = 0; i < sos; i++) {

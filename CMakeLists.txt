@@ -99,6 +99,28 @@ add_subdirectory(sp)
 add_subdirectory(crypto)
 add_subdirectory(loader)
 
+# ---------------------------------------------------------------
+# 插件产物目录隔离
+#
+# 默认：插件 .so 落源树 <p>/build/（与 plugin.yml files 相对路径、
+# hwrun-bus 运行时扫描、test_proto 相对 dlopen 约定一致）。
+#
+# sanitizer / coverage 开启时：产物改指构建树 plugins/<p>/build/，
+# 避免与普通构建共用源树产物目录互相污染（ASan 版 .so 覆盖正常版）。
+# 此时 test_proto 经 HWRUN_PLUGIN_ROOT 宏指到构建树 plugins/。
+# ---------------------------------------------------------------
+if(HWRUN_ENABLE_SANITIZER OR HWRUN_ENABLE_COVERAGE)
+  set(_hw_iso_root "${CMAKE_BINARY_DIR}/plugins")
+  foreach(_p git hap pmp fsp np sp crypto loader)
+    set_target_properties(${_p} PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${_hw_iso_root}/${_p}/build")
+  endforeach()
+  set(HWRUN_PLUGIN_ROOT "${_hw_iso_root}/")
+  message(STATUS "HWRun isolated plugin output: ${_hw_iso_root}")
+else()
+  set(HWRUN_PLUGIN_ROOT "")   # 非隔离：test_proto 用默认 "../" 前缀
+endif()
+
 if(HWRUN_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
