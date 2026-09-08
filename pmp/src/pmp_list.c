@@ -18,15 +18,28 @@
 /* 进程状态字母 -> pmp 枚举 */
 static pmp_task_state_t map_state(char c) {
     switch (c) {
-    case 'R': return PMP_TASK_RUNNING;
-    case 'S': return PMP_TASK_INTERRUPTIBLE;
-    case 'D': return PMP_TASK_UNINTERRUPTIBLE;
-    case 'Z': return PMP_TASK_ZOMBIE;
-    case 'T': return PMP_TASK_STOPPED;
-    case 't': return PMP_TASK_TRACING;
-    case 'X': case 'x': return PMP_TASK_DEAD;
-    case 'K': case 'W': case 'P': case 'I': return PMP_TASK_WAKEKILL;
-    default:  return PMP_TASK_UNKNOWN;
+    case 'R':
+        return PMP_TASK_RUNNING;
+    case 'S':
+        return PMP_TASK_INTERRUPTIBLE;
+    case 'D':
+        return PMP_TASK_UNINTERRUPTIBLE;
+    case 'Z':
+        return PMP_TASK_ZOMBIE;
+    case 'T':
+        return PMP_TASK_STOPPED;
+    case 't':
+        return PMP_TASK_TRACING;
+    case 'X':
+    case 'x':
+        return PMP_TASK_DEAD;
+    case 'K':
+    case 'W':
+    case 'P':
+    case 'I':
+        return PMP_TASK_WAKEKILL;
+    default:
+        return PMP_TASK_UNKNOWN;
     }
 }
 
@@ -51,13 +64,16 @@ static void parse_stat(const char *buf, pmp_process_info_t *info) {
     if (lp) info->pid = (uint32_t)atoi(buf);
     const char *p = rp ? rp + 1 : buf;
     /* 跳过空白 */
-    while (*p && isspace((unsigned char)*p)) p++;
+    while (*p && isspace((unsigned char)*p))
+        p++;
     if (!*p) return;
     char state_ch = *p;
     info->state = map_state(state_ch);
-    while (*p && !isspace((unsigned char)*p)) p++;
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (*p) info->ppid = (uint32_t)atoi(p);      /* field 4 ppid */
+    while (*p && !isspace((unsigned char)*p))
+        p++;
+    while (*p && isspace((unsigned char)*p))
+        p++;
+    if (*p) info->ppid = (uint32_t)atoi(p); /* field 4 ppid */
 }
 
 /* 解析 /proc/<pid>/statm：第一列虚拟页，第二列常驻页 */
@@ -71,7 +87,7 @@ static void parse_statm(int pid, uint64_t *rss_kb, uint64_t *virt_kb) {
         long page = sysconf(_SC_PAGESIZE);
         if (page <= 0) page = 4096;
         if (virt_kb) *virt_kb = (uint64_t)vsz * (uint64_t)page / 1024;
-        if (rss_kb)  *rss_kb  = (uint64_t)rss * (uint64_t)page / 1024;
+        if (rss_kb) *rss_kb = (uint64_t)rss * (uint64_t)page / 1024;
     }
     fclose(f);
 }
@@ -86,11 +102,16 @@ static pmp_sched_policy_t read_policy(int pid) {
     pmp_sched_policy_t policy = PMP_SCHED_OTHER;
     /* 第二行形如：# (C, #threads: 1) 或策略名 */
     if (fgets(line, sizeof(line), f) && fgets(line, sizeof(line), f)) {
-        if (strstr(line, "SCHED_FIFO"))      policy = PMP_SCHED_FIFO;
-        else if (strstr(line, "SCHED_RR"))   policy = PMP_SCHED_RR;
-        else if (strstr(line, "SCHED_BATCH"))policy = PMP_SCHED_BATCH;
-        else if (strstr(line, "SCHED_IDLE")) policy = PMP_SCHED_IDLE;
-        else if (strstr(line, "SCHED_DEADLINE")) policy = PMP_SCHED_DEADLINE;
+        if (strstr(line, "SCHED_FIFO"))
+            policy = PMP_SCHED_FIFO;
+        else if (strstr(line, "SCHED_RR"))
+            policy = PMP_SCHED_RR;
+        else if (strstr(line, "SCHED_BATCH"))
+            policy = PMP_SCHED_BATCH;
+        else if (strstr(line, "SCHED_IDLE"))
+            policy = PMP_SCHED_IDLE;
+        else if (strstr(line, "SCHED_DEADLINE"))
+            policy = PMP_SCHED_DEADLINE;
     }
     fclose(f);
     return policy;
@@ -105,7 +126,10 @@ static int fill_info(int pid, pmp_process_info_t *info) {
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE *f = fopen(path, "r");
     if (!f) return -errno;
-    if (fgets(buf, sizeof(buf), f) == NULL) { fclose(f); return -errno; }
+    if (fgets(buf, sizeof(buf), f) == NULL) {
+        fclose(f);
+        return -errno;
+    }
     fclose(f);
 
     info->pid = (uint32_t)pid;
@@ -124,9 +148,9 @@ static int fill_info(int pid, pmp_process_info_t *info) {
             if (strncmp(l, "Cpus_allowed_list:", 18) == 0) {
                 /* 取第一个 CPU 号 */
                 const char *v = l + 18;
-                while (*v && !isdigit((unsigned char)*v)) v++;
-                if (isdigit((unsigned char)*v))
-                    info->cpu_affinity = (uint32_t)atoi(v);
+                while (*v && !isdigit((unsigned char)*v))
+                    v++;
+                if (isdigit((unsigned char)*v)) info->cpu_affinity = (uint32_t)atoi(v);
                 break;
             }
         }
@@ -142,37 +166,38 @@ static int fill_info(int pid, pmp_process_info_t *info) {
  * 获取进程列表：遍历 /proc 下数字目录
  * ============================================================ */
 int pmp_get_process_list(pmp_process_info_t **out_list, uint32_t *out_count) {
-    if (!out_list || !out_count) return -1;   /* HWRUN_EINVAL */
+    if (!out_list || !out_count) return -1; /* HWRUN_EINVAL */
 
     DIR *dir = opendir("/proc");
-    if (!dir) return -errno;                  /* 无 /proc，优雅降级 */
+    if (!dir) return -errno; /* 无 /proc，优雅降级 */
 
     uint32_t cap = 64, count = 0;
-    pmp_process_info_t *list =
-        (pmp_process_info_t *)calloc(cap, sizeof(*list));
-    if (!list) { closedir(dir); return -3; }  /* HWRUN_ENOMEM */
+    pmp_process_info_t *list = (pmp_process_info_t *)calloc(cap, sizeof(*list));
+    if (!list) {
+        closedir(dir);
+        return -3;
+    } /* HWRUN_ENOMEM */
 
     struct dirent *ent;
     errno = 0;
     while ((ent = readdir(dir)) != NULL) {
         const char *name = ent->d_name;
-        if (name[0] < '0' || name[0] > '9') continue;   /* 数字目录才是进程 */
+        if (name[0] < '0' || name[0] > '9') continue; /* 数字目录才是进程 */
         int pid = atoi(name);
         if (pid <= 0) continue;
         if (count >= cap) {
-            pmp_process_info_t *nl = (pmp_process_info_t *)
-                realloc(list, (cap * 2) * sizeof(*list));
-            if (!nl) break;                  /* 空间不足，交付已收集部分 */
-            list = nl; cap *= 2;
+            pmp_process_info_t *nl = (pmp_process_info_t *)realloc(list, (cap * 2) * sizeof(*list));
+            if (!nl) break; /* 空间不足，交付已收集部分 */
+            list = nl;
+            cap *= 2;
         }
-        if (fill_info(pid, &list[count]) == 0)
-            count++;
+        if (fill_info(pid, &list[count]) == 0) count++;
     }
     closedir(dir);
 
     *out_list = list;
     *out_count = count;
-    return 0;                                 /* HWRUN_OK */
+    return 0; /* HWRUN_OK */
 }
 
 void pmp_free_process_list(pmp_process_info_t *list, uint32_t count) {
@@ -181,7 +206,7 @@ void pmp_free_process_list(pmp_process_info_t *list, uint32_t count) {
 }
 
 int pmp_get_process_info(int32_t pid, pmp_process_info_t *out_info) {
-    if (!out_info || pid <= 0) return -1;     /* HWRUN_EINVAL */
+    if (!out_info || pid <= 0) return -1; /* HWRUN_EINVAL */
     return fill_info(pid, out_info);
 }
 

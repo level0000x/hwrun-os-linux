@@ -18,12 +18,11 @@
  * 结果写入 res, stdout_buf/stderr_buf 为 malloc 分配，调用方
  * 用 git_result_free() 释放。 */
 extern git_result_t *git_exec(const char *cwd, const char *cmd);
-extern void          git_result_free(git_result_t *r);
+extern void git_result_free(git_result_t *r);
 
 /* 带审计日志地执行 Git 命令（先记录请求、后记录结果） */
-extern git_result_t *git_exec_audit(const char *cwd, const char *cmd,
-                                    const char *user, const char *operation,
-                                    const char *target);
+extern git_result_t *git_exec_audit(const char *cwd, const char *cmd, const char *user,
+                                    const char *operation, const char *target);
 
 /* ============================================================
    Git 上下文（全局单例，各子模块共享）
@@ -41,9 +40,8 @@ extern int git_config_load(git_context_t *ctx);
    审计日志
    ============================================================ */
 /* 追加一条审计记录到审计仓库 audit.log（JSON Lines 格式） */
-extern void git_audit_write(git_context_t *ctx, const char *user,
-                            const char *operation, const char *target,
-                            const char *message, int success);
+extern void git_audit_write(git_context_t *ctx, const char *user, const char *operation,
+                            const char *target, const char *message, int success);
 
 /* ============================================================
    文本工具

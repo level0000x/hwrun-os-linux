@@ -26,12 +26,12 @@ int np_close_impl(int fd);
 int np_shutdown_impl(int fd, int how);
 ssize_t np_send_impl(int fd, const void *data, size_t len, int flags);
 ssize_t np_recv_impl(int fd, void *buf, size_t len, int flags);
-ssize_t np_sendto_impl(int fd, const void *data, size_t len, int flags,
-                       const struct sockaddr *dest, socklen_t addrlen);
-ssize_t np_recvfrom_impl(int fd, void *buf, size_t len, int flags,
-                         struct sockaddr *src, socklen_t *addrlen);
-int np_resolve_impl(const char *host, unsigned port,
-                    struct sockaddr_storage *out, int max, int *out_count);
+ssize_t np_sendto_impl(int fd, const void *data, size_t len, int flags, const struct sockaddr *dest,
+                       socklen_t addrlen);
+ssize_t np_recvfrom_impl(int fd, void *buf, size_t len, int flags, struct sockaddr *src,
+                         socklen_t *addrlen);
+int np_resolve_impl(const char *host, unsigned port, struct sockaddr_storage *out, int max,
+                    int *out_count);
 int np_host_to_ip_impl(const char *host, char *ip, size_t cap);
 int np_gethostname_impl(char *out, size_t cap);
 int np_get_interfaces_impl(np_interface_t *ifaces, int cap, int *out_count);
@@ -46,10 +46,14 @@ static int np_stats_impl(np_stats_t *out) {
     if (np_conn_list(conns, 256, &n) != 0) n = 0;
     for (int i = 0; i < n; i++) {
         switch (conns[i].domain) {
-        case AF_UNIX:   out->unix_sockets++; break;
-        default:        /* IPv4/IPv6 按类型区分 */
-            if (conns[i].type == SOCK_STREAM) out->tcp_sockets++;
-            else if (conns[i].type == SOCK_DGRAM) out->udp_sockets++;
+        case AF_UNIX:
+            out->unix_sockets++;
+            break;
+        default: /* IPv4/IPv6 按类型区分 */
+            if (conns[i].type == SOCK_STREAM)
+                out->tcp_sockets++;
+            else if (conns[i].type == SOCK_DGRAM)
+                out->udp_sockets++;
             break;
         }
     }
@@ -60,8 +64,8 @@ static int np_stats_impl(np_stats_t *out) {
     if (np_get_interfaces_impl(ifs, 128, &c) == 0) {
         out->iface_count = (uint64_t)c;
         for (int i = 0; i < c; i++) {
-            out->rx_bytes   += ifs[i].rx_bytes;
-            out->tx_bytes   += ifs[i].tx_bytes;
+            out->rx_bytes += ifs[i].rx_bytes;
+            out->tx_bytes += ifs[i].tx_bytes;
             out->rx_packets += ifs[i].rx_packets;
             out->tx_packets += ifs[i].tx_packets;
         }
@@ -71,26 +75,26 @@ static int np_stats_impl(np_stats_t *out) {
 
 /* ---- 协议接口转发（薄封装，供 get_interface 返回） ---- */
 static hw_np_ops_t g_np_ops = {
-    .socket        = np_socket_impl,
-    .bind          = np_bind_impl,
-    .bind_addr     = np_bind_addr_impl,
-    .listen        = np_listen_impl,
-    .accept        = np_accept_impl,
-    .connect       = np_connect_impl,
-    .connect_addr  = np_connect_addr_impl,
-    .close         = np_close_impl,
-    .shutdown      = np_shutdown_impl,
-    .send          = np_send_impl,
-    .recv          = np_recv_impl,
-    .sendto        = np_sendto_impl,
-    .recvfrom      = np_recvfrom_impl,
-    .resolve       = np_resolve_impl,
-    .host_to_ip    = np_host_to_ip_impl,
-    .gethostname   = np_gethostname_impl,
+    .socket = np_socket_impl,
+    .bind = np_bind_impl,
+    .bind_addr = np_bind_addr_impl,
+    .listen = np_listen_impl,
+    .accept = np_accept_impl,
+    .connect = np_connect_impl,
+    .connect_addr = np_connect_addr_impl,
+    .close = np_close_impl,
+    .shutdown = np_shutdown_impl,
+    .send = np_send_impl,
+    .recv = np_recv_impl,
+    .sendto = np_sendto_impl,
+    .recvfrom = np_recvfrom_impl,
+    .resolve = np_resolve_impl,
+    .host_to_ip = np_host_to_ip_impl,
+    .gethostname = np_gethostname_impl,
     .get_interfaces = np_get_interfaces_impl,
-    .conn_get      = np_conn_get,
-    .conn_list     = np_conn_list,
-    .get_stats     = np_stats_impl,
+    .conn_get = np_conn_get,
+    .conn_list = np_conn_list,
+    .get_stats = np_stats_impl,
 };
 
 /* 插件私有上下文 */
@@ -112,8 +116,7 @@ static int np_init(hw_plugin_t *self) {
 
     /* 清空连接跟踪表，避免宿主重用本插件实例时的脏状态 */
     np_conn_clear();
-    HWAPI_LOGI("np", "init: backlog=%d",
-               HWAPI_PARAM_GET_INT("np.listen_backlog", 16));
+    HWAPI_LOGI("np", "init: backlog=%d", HWAPI_PARAM_GET_INT("np.listen_backlog", 16));
     return HWRUN_OK;
 }
 
@@ -149,7 +152,9 @@ static int np_destroy(hw_plugin_t *self) {
 
 /* 参数变更回调：本插件暂无可配置参数，一律接受 */
 static int np_configure(hw_plugin_t *self, const char *key, const char *value) {
-    (void)self; (void)key; (void)value;
+    (void)self;
+    (void)key;
+    (void)value;
     return HWRUN_OK;
 }
 
@@ -163,22 +168,19 @@ static void *np_get_interface(const char *protocol) {
 
 /* 生命周期 ops 表：由 SDK 宏装配进描述符 */
 static hw_plugin_ops_t g_ops = {
-    .init          = np_init,
-    .start         = np_start,
-    .stop          = np_stop,
-    .destroy       = np_destroy,
-    .configure     = np_configure,
+    .init = np_init,
+    .start = np_start,
+    .stop = np_stop,
+    .destroy = np_destroy,
+    .configure = np_configure,
     .get_interface = np_get_interface,
 };
 
 /* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据） */
-static const char *const g_provides[] = { "NP", NULL };
-static const char *const g_requires[] = {
-    "HAP", "LOG", "PARAM", "METAPROTO", NULL
-};
+static const char *const g_provides[] = {"NP", NULL};
+static const char *const g_requires[] = {"HAP", "LOG", "PARAM", "METAPROTO", NULL};
 
 HWRUN_PLUGIN_BIND()
-HWRUN_PLUGIN_DEFINE(
-    "np", "Network Protocol", "1.0.0", HWPLUGIN_TYPE_NETWORK,
-    "HWRun OS 网络协议：socket、TCP/UDP/UNIX、名称解析、网络接口枚举的统一抽象",
-    &g_ops, g_provides, g_requires)
+HWRUN_PLUGIN_DEFINE("np", "Network Protocol", "1.0.0", HWPLUGIN_TYPE_NETWORK,
+                    "HWRun OS 网络协议：socket、TCP/UDP/UNIX、名称解析、网络接口枚举的统一抽象",
+                    &g_ops, g_provides, g_requires)

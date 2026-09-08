@@ -9,11 +9,11 @@
 #include "../include/hap.h"
 #include "hap_util.h"
 
-#define PROC_CPUINFO    "/proc/cpuinfo"
-#define PROC_LOADAVG    "/proc/loadavg"
-#define SYS_CPU_CUR     "%s/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq"
-#define SYS_CPU_MAX     "%s/devices/system/cpu/cpu%u/cpufreq/scaling_max_freq"
-#define SYS_CPU_MIN     "%s/devices/system/cpu/cpu%u/cpufreq/scaling_min_freq"
+#define PROC_CPUINFO "/proc/cpuinfo"
+#define PROC_LOADAVG "/proc/loadavg"
+#define SYS_CPU_CUR "%s/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq"
+#define SYS_CPU_MAX "%s/devices/system/cpu/cpu%u/cpufreq/scaling_max_freq"
+#define SYS_CPU_MIN "%s/devices/system/cpu/cpu%u/cpufreq/scaling_min_freq"
 
 /* 解析负载均值：/proc/loadavg 形如 "0.52 0.58 0.59 1/4 2061" */
 static void hap_cpu_loadavg(hap_cpu_info_t *info) {
@@ -21,8 +21,8 @@ static void hap_cpu_loadavg(hap_cpu_info_t *info) {
     char a[16], b[16], c[16];
     if (hap_read_file(PROC_LOADAVG, buf, sizeof(buf)) > 0) {
         if (sscanf(buf, "%15s %15s %15s", a, b, c) == 3) {
-            info->load1m  = atof(a);
-            info->load5m  = atof(b);
+            info->load1m = atof(a);
+            info->load5m = atof(b);
             info->load15m = atof(c);
         }
     }
@@ -51,7 +51,8 @@ int hap_cpu_probe(hap_cpu_info_t *out) {
         strncpy(out->vendor, val, sizeof(out->vendor) - 1);
         if (out->model[0] == '\0') {
             /* 退而求其次使用 Hardware */
-            if (hap_line_value(cfg, "Hardware", out->model, sizeof(out->model))) {}
+            if (hap_line_value(cfg, "Hardware", out->model, sizeof(out->model))) {
+            }
         }
 
         /* 2) 逻辑核心数：统计 "processor" 关键字出现次数 */
@@ -62,7 +63,7 @@ int hap_cpu_probe(hap_cpu_info_t *out) {
                 count++;
                 p += 10;
             }
-            if (count == 0) count = 1;  /* 至少 1 核 */
+            if (count == 0) count = 1; /* 至少 1 核 */
             out->cores = count;
         }
     } else {
@@ -92,8 +93,7 @@ int hap_cpu_probe(hap_cpu_info_t *out) {
 
     /* 5) 组装 ident：例如 "8 CPU / Intel Core i7-..." */
     if (out->model[0]) {
-        snprintf(out->ident, sizeof(out->ident), "%u CPU / %s",
-                 out->cores, out->model);
+        snprintf(out->ident, sizeof(out->ident), "%u CPU / %s", out->cores, out->model);
     } else {
         snprintf(out->ident, sizeof(out->ident), "%u CPU", out->cores);
     }

@@ -21,8 +21,8 @@ int np_conn_register(const np_socket_t *c);
 int np_conn_update_state(int fd, np_sock_state_t st);
 
 /* 登记某个 fd 的对端与本端地址；成功返回 0 */
-int np_conn_set_addresses(int fd, const char *remote_ip, unsigned remote_port,
-                          const char *local_ip, unsigned local_port);
+int np_conn_set_addresses(int fd, const char *remote_ip, unsigned remote_port, const char *local_ip,
+                          unsigned local_port);
 
 /* 更新某个 fd 的本地地址（bind 之后） */
 int np_conn_set_local(int fd, const char *local_ip, unsigned local_port);

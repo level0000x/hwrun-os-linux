@@ -19,9 +19,9 @@
 
 #include "git_internal.h"
 
-#define PLUGIN_ID  "git"
-#define GIT_BIN    "git"
-#define GIT_CONF   "git.conf"
+#define PLUGIN_ID "git"
+#define GIT_BIN "git"
+#define GIT_CONF "git.conf"
 
 /* 全局上下文单例 */
 git_context_t git_g_ctx;
@@ -38,8 +38,7 @@ git_result_t *git_exec(const char *cwd, const char *cmd) {
 
     /* 命令 = cd <dir> && git <cmd> 2>&1 */
     char full[4096];
-    snprintf(full, sizeof(full), "cd \"%s\" 2>/dev/null && %s %s 2>&1",
-             work, GIT_BIN, cmd);
+    snprintf(full, sizeof(full), "cd \"%s\" 2>/dev/null && %s %s 2>&1", work, GIT_BIN, cmd);
 
     FILE *fp = popen(full, "r");
     if (!fp) {
@@ -72,8 +71,7 @@ git_result_t *git_exec(const char *cwd, const char *cmd) {
     r->exit_code = exit_code;
     r->success = (exit_code == 0);
     if (!r->success) {
-        snprintf(r->error, sizeof(r->error),
-                 "git 命令失败, exit_code=%d", exit_code);
+        snprintf(r->error, sizeof(r->error), "git 命令失败, exit_code=%d", exit_code);
     }
     return r;
 }
@@ -85,24 +83,21 @@ void git_result_free(git_result_t *r) {
     free(r);
 }
 
-git_result_t *git_exec_audit(const char *cwd, const char *cmd,
-                             const char *user, const char *operation,
-                             const char *target) {
+git_result_t *git_exec_audit(const char *cwd, const char *cmd, const char *user,
+                             const char *operation, const char *target) {
     /* 操作前记录 */
     git_audit_write(&git_g_ctx, user, operation, target, cmd, 0);
     git_result_t *r = git_exec(cwd, cmd);
     /* 操作结果记录 */
-    git_audit_write(&git_g_ctx, user, operation, target, cmd,
-                    r ? r->success : 0);
+    git_audit_write(&git_g_ctx, user, operation, target, cmd, r ? r->success : 0);
     return r;
 }
 
 /* ============================================================
    审计日志
    ============================================================ */
-void git_audit_write(git_context_t *ctx, const char *user,
-                     const char *operation, const char *target,
-                     const char *message, int success) {
+void git_audit_write(git_context_t *ctx, const char *user, const char *operation,
+                     const char *target, const char *message, int success) {
     if (!ctx) return;
     struct stat st;
     /* 确保审计目录存在 */
@@ -120,12 +115,8 @@ void git_audit_write(git_context_t *ctx, const char *user,
     snprintf(line, sizeof(line),
              "{\"ts\":%ld,\"user\":\"%s\",\"op\":\"%s\",\"target\":\"%s\","
              "\"msg\":\"%s\",\"result\":\"%s\"}\n",
-             (long)now,
-             user      ? user      : "system",
-             operation ? operation : "unknown",
-             target    ? target    : "",
-             message   ? message   : "",
-             success   ? "success" : "failed");
+             (long)now, user ? user : "system", operation ? operation : "unknown",
+             target ? target : "", message ? message : "", success ? "success" : "failed");
 
     FILE *fp = fopen(path, "a");
     if (fp) {
@@ -142,14 +133,14 @@ int git_config_load(git_context_t *ctx) {
     git_config_t *cfg = &ctx->config;
 
     /* 内置默认值 */
-    snprintf(cfg->repo_path,  sizeof(cfg->repo_path),  "%s", "/var/lib/hwrun/git");
+    snprintf(cfg->repo_path, sizeof(cfg->repo_path), "%s", "/var/lib/hwrun/git");
     snprintf(cfg->audit_path, sizeof(cfg->audit_path), "%s", "/var/lib/hwrun/git-audit");
-    snprintf(cfg->branch,     sizeof(cfg->branch),     "%s", "main");
+    snprintf(cfg->branch, sizeof(cfg->branch), "%s", "main");
     cfg->remote_url[0] = '\0';
-    cfg->auto_commit  = 1;
-    cfg->auto_push    = 0;
+    cfg->auto_commit = 1;
+    cfg->auto_push = 0;
     cfg->auto_compact = 1;
-    cfg->max_size     = 1024ULL * 1024ULL * 1024ULL;   /* 1GB */
+    cfg->max_size = 1024ULL * 1024ULL * 1024ULL; /* 1GB */
 
     /* 允许通过环境变量覆盖状态目录 */
     char conf_path[512] = {0};
@@ -178,11 +169,11 @@ int git_config_load(git_context_t *ctx) {
                 else if (!strcmp(key, "branch"))
                     snprintf(cfg->branch, sizeof(cfg->branch), "%s", val);
                 else if (!strcmp(key, "auto_commit"))
-                    cfg->auto_commit  = (!strcmp(val, "1")  || !strcmp(val, "true"));
+                    cfg->auto_commit = (!strcmp(val, "1") || !strcmp(val, "true"));
                 else if (!strcmp(key, "auto_push"))
-                    cfg->auto_push    = (!strcmp(val, "1")  || !strcmp(val, "true"));
+                    cfg->auto_push = (!strcmp(val, "1") || !strcmp(val, "true"));
                 else if (!strcmp(key, "auto_compact"))
-                    cfg->auto_compact = (!strcmp(val, "1")  || !strcmp(val, "true"));
+                    cfg->auto_compact = (!strcmp(val, "1") || !strcmp(val, "true"));
                 else if (!strcmp(key, "max_size")) {
                     char *end = NULL;
                     unsigned long long v = strtoull(val, &end, 10);
@@ -198,7 +189,7 @@ int git_config_load(git_context_t *ctx) {
     }
 
     /* 同步上下文 */
-    snprintf(ctx->repo_path,  sizeof(ctx->repo_path),  "%s", cfg->repo_path);
+    snprintf(ctx->repo_path, sizeof(ctx->repo_path), "%s", cfg->repo_path);
     snprintf(ctx->audit_path, sizeof(ctx->audit_path), "%s", cfg->audit_path);
     return 0;
 }
@@ -209,10 +200,11 @@ int git_config_load(git_context_t *ctx) {
 char *git_strtrim(char *s) {
     if (!s) return NULL;
     char *p = s;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
     char *e = p + strlen(p);
-    while (e > p && (e[-1] == ' ' || e[-1] == '\t' ||
-                     e[-1] == '\r' || e[-1] == '\n')) e--;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'))
+        e--;
     *e = '\0';
     return p;
 }

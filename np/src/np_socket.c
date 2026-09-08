@@ -137,8 +137,7 @@ int np_listen_impl(int fd, int backlog) {
     return 0;
 }
 
-int np_accept_impl(int fd, int *out_fd, char *remote_ip, size_t ipcap,
-                   unsigned *remote_port) {
+int np_accept_impl(int fd, int *out_fd, char *remote_ip, size_t ipcap, unsigned *remote_port) {
     if (!out_fd) return -EINVAL;
     struct sockaddr_in sin;
     socklen_t len = sizeof(sin);
@@ -256,8 +255,8 @@ ssize_t np_recv_impl(int fd, void *buf, size_t len, int flags) {
     return n;
 }
 
-ssize_t np_sendto_impl(int fd, const void *data, size_t len, int flags,
-                       const struct sockaddr *dest, socklen_t addrlen) {
+ssize_t np_sendto_impl(int fd, const void *data, size_t len, int flags, const struct sockaddr *dest,
+                       socklen_t addrlen) {
     if (len == 0) return 0;
     if (!data) return -EINVAL;
     ssize_t n = sendto(fd, data, len, flags, dest, addrlen);
@@ -265,8 +264,8 @@ ssize_t np_sendto_impl(int fd, const void *data, size_t len, int flags,
     return n;
 }
 
-ssize_t np_recvfrom_impl(int fd, void *buf, size_t len, int flags,
-                         struct sockaddr *src, socklen_t *addrlen) {
+ssize_t np_recvfrom_impl(int fd, void *buf, size_t len, int flags, struct sockaddr *src,
+                         socklen_t *addrlen) {
     if (len == 0) return 0;
     if (!buf) return -EINVAL;
     ssize_t n = recvfrom(fd, buf, len, flags, src, addrlen);

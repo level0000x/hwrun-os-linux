@@ -59,7 +59,7 @@ char *sp_tmp_path(char *buf, size_t cap) {
     if (fd < 0) return NULL;
     /* 立即关闭；调用方会用 fopen/重定向覆盖写 */
     close(fd);
-    unlink(buf);  /* 使得路径存在但未创建，需再次以 O_CREAT 打开 */
+    unlink(buf); /* 使得路径存在但未创建，需再次以 O_CREAT 打开 */
     return buf;
 }
 
@@ -142,7 +142,7 @@ int sp_sh(const char *cmd, const char *stdout_file, const char *stderr_file) {
 void sp_to_hex(const uint8_t *in, size_t in_len, char *out) {
     static const char d[] = "0123456789abcdef";
     for (size_t i = 0; i < in_len; i++) {
-        out[i * 2]     = d[in[i] >> 4];
+        out[i * 2] = d[in[i] >> 4];
         out[i * 2 + 1] = d[in[i] & 0x0f];
     }
     out[in_len * 2] = 0;
@@ -160,14 +160,22 @@ int sp_from_hex(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len) 
     for (size_t i = 0; i < n; i++) {
         unsigned int hi = 0, lo = 0;
         char a = hex[i * 2], b = hex[i * 2 + 1];
-        if      (a >= '0' && a <= '9') hi = a - '0';
-        else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10;
-        else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
-        else return SP_EINVAL;
-        if      (b >= '0' && b <= '9') lo = b - '0';
-        else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10;
-        else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
-        else return SP_EINVAL;
+        if (a >= '0' && a <= '9')
+            hi = a - '0';
+        else if (a >= 'a' && a <= 'f')
+            hi = a - 'a' + 10;
+        else if (a >= 'A' && a <= 'F')
+            hi = a - 'A' + 10;
+        else
+            return SP_EINVAL;
+        if (b >= '0' && b <= '9')
+            lo = b - '0';
+        else if (b >= 'a' && b <= 'f')
+            lo = b - 'a' + 10;
+        else if (b >= 'A' && b <= 'F')
+            lo = b - 'A' + 10;
+        else
+            return SP_EINVAL;
         out[i] = (uint8_t)((hi << 4) | lo);
     }
     if (out_len) *out_len = n;
@@ -179,11 +187,11 @@ int sp_from_hex(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len) 
  * ============================================================ */
 int sp_b64_encode(const uint8_t *in, size_t in_len, char *out, size_t cap) {
     if (!in || !out || cap == 0) return SP_EINVAL;
-    if (in_len > 0x3ffff) return SP_ENOMEM;  /* 上限 256KB，防临时文件滥用 */
+    if (in_len > 0x3ffff) return SP_ENOMEM; /* 上限 256KB，防临时文件滥用 */
 
     char pip[8192], pout[8192], qbuf[8192];
     if (in_len > sizeof(pip) - 1) return SP_ENOMEM;
-    memcpy(pip, in, in_len);           /* 备用输入，避免命令读取未定文件 */
+    memcpy(pip, in, in_len); /* 备用输入，避免命令读取未定文件 */
     char *inpath = sp_tmp_path(pip, sizeof(pip));
     if (!inpath) return SP_EIO;
     if (sp_write_all(inpath, in, in_len) != SP_OK) return SP_EIO;
@@ -193,13 +201,18 @@ int sp_b64_encode(const uint8_t *in, size_t in_len, char *out, size_t cap) {
     snprintf(cmd, sizeof(cmd), "openssl base64 -A -in %s", qq);
     char *outpath = sp_tmp_path(pout, sizeof(pout));
     int rc = sp_sh(cmd, outpath, NULL);
-    if (rc != 0) { unlink(inpath); return SP_EIO; }
+    if (rc != 0) {
+        unlink(inpath);
+        return SP_EIO;
+    }
 
     char enc[8192];
     ssize_t n = sp_read_text(outpath, enc, sizeof(enc));
-    unlink(inpath); unlink(outpath);
+    unlink(inpath);
+    unlink(outpath);
     if (n <= 0) return SP_EIO;
-    while (n > 0 && (enc[n-1] == '\n' || enc[n-1] == '\r' || enc[n-1] == ' ')) enc[--n] = 0;
+    while (n > 0 && (enc[n - 1] == '\n' || enc[n - 1] == '\r' || enc[n - 1] == ' '))
+        enc[--n] = 0;
     if ((size_t)n + 1 >= cap) return SP_ENOMEM;
     memcpy(out, enc, (size_t)n + 1);
     return SP_OK;
@@ -222,9 +235,13 @@ int sp_b64_decode(const char *b64, uint8_t *out, size_t cap, size_t *out_len) {
     snprintf(cmd, sizeof(cmd), "openssl base64 -d -A -in %s", qq);
     char *outpath = sp_tmp_path(pout, sizeof(pout));
     int rc = sp_sh(cmd, outpath, NULL);
-    if (rc != 0) { unlink(inpath); return SP_EIO; }
+    if (rc != 0) {
+        unlink(inpath);
+        return SP_EIO;
+    }
     ssize_t n = sp_read_text(outpath, (char *)out, cap);
-    unlink(inpath); unlink(outpath);
+    unlink(inpath);
+    unlink(outpath);
     if (n < 0) return SP_EIO;
     if (out_len) *out_len = (size_t)n;
     return SP_OK;
@@ -235,6 +252,7 @@ int sp_b64_decode(const char *b64, uint8_t *out, size_t cap, size_t *out_len) {
  * ============================================================ */
 int sp_ct_eq(const uint8_t *a, const uint8_t *b, size_t n) {
     uint8_t diff = 0;
-    for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    for (size_t i = 0; i < n; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
     return diff == 0 ? 0 : 1;
 }

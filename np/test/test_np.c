@@ -17,24 +17,31 @@
 #include "np.h"
 
 static int failures = 0;
-#define CHECK(cond, msg) do { \
-    if (cond) printf("  [ok] %s\n", msg); \
-    else { printf("  [FAIL] %s\n", msg); failures++; } \
-} while (0)
+#define CHECK(cond, msg)                                                                           \
+    do {                                                                                           \
+        if (cond)                                                                                  \
+            printf("  [ok] %s\n", msg);                                                            \
+        else {                                                                                     \
+            printf("  [FAIL] %s\n", msg);                                                          \
+            failures++;                                                                            \
+        }                                                                                          \
+    } while (0)
 
 int main(void) {
     void *h = dlopen("build/np.so", RTLD_NOW | RTLD_LOCAL);
-    if (!h) { printf("dlopen failed: %s\n", dlerror()); return 1; }
+    if (!h) {
+        printf("dlopen failed: %s\n", dlerror());
+        return 1;
+    }
     printf("dlopen np.so ok\n");
 
-    hw_plugin_t *(*entry)(void) = (hw_plugin_t *(*)(void))dlsym(h, "hw_plugin_entry");
+    hw_plugin_t *(*entry)(void) = (hw_plugin_t * (*)(void)) dlsym(h, "hw_plugin_entry");
     CHECK(entry != NULL, "导出 hw_plugin_entry()");
 
     hw_plugin_t *p = entry();
     CHECK(p != NULL, "hw_plugin_entry() 非空");
-    printf("  plugin id=%s ver=%s type=%d provides=%s requires=%s/%s/%s/%s\n",
-           p->id, p->version, (int)p->type,
-           p->provides ? p->provides[0] : "?",
+    printf("  plugin id=%s ver=%s type=%d provides=%s requires=%s/%s/%s/%s\n", p->id, p->version,
+           (int)p->type, p->provides ? p->provides[0] : "?",
            p->requires && p->requires_count > 0 ? p->requires[0] : "?",
            p->requires && p->requires_count > 1 ? p->requires[1] : "?",
            p->requires && p->requires_count > 2 ? p->requires[2] : "?",
@@ -50,8 +57,8 @@ int main(void) {
     hw_np_ops_t *n = (hw_np_ops_t *)p->ops.get_interface("NP");
     CHECK(n != NULL, "get_interface(\"NP\") 非空");
     CHECK(p->ops.get_interface("XXX") == NULL, "get_interface(\"XXX\") == NULL");
-    CHECK(n->socket && n->bind && n->listen && n->connect && n->accept &&
-          n->send && n->recv && n->close && n->shutdown,
+    CHECK(n->socket && n->bind && n->listen && n->connect && n->accept && n->send && n->recv &&
+              n->close && n->shutdown,
           "socket 基础接口齐备");
     CHECK(n->sendto && n->recvfrom, "sendto/recvfrom 齐备");
     CHECK(n->resolve && n->host_to_ip && n->gethostname, "名称解析接口齐备");
@@ -86,8 +93,8 @@ int main(void) {
                     inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr);
 
                     const char *msg = "HWRun-NP-echo";
-                    ssize_t sn = n->sendto(sfd, msg, strlen(msg), 0,
-                                           (struct sockaddr *)&peer, sizeof(peer));
+                    ssize_t sn =
+                        n->sendto(sfd, msg, strlen(msg), 0, (struct sockaddr *)&peer, sizeof(peer));
                     if (sn >= 0) {
                         char buf[128];
                         ssize_t rn = n->recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
@@ -115,11 +122,9 @@ int main(void) {
         printf("  get_interfaces rc=%d count=%d\n", rc, c);
         CHECK(rc == 0, "get_interfaces 成功");
         for (int i = 0; i < c && i < 3; i++) {
-            printf("    iface[%d] %-8s up=%d mtu=%u mac=%s ip=%s gw=%s rx=%llu tx=%llu\n",
-                   i, ifs[i].name, ifs[i].up, ifs[i].mtu, ifs[i].mac,
-                   ifs[i].ipv4, ifs[i].gateway,
-                   (unsigned long long)ifs[i].rx_bytes,
-                   (unsigned long long)ifs[i].tx_bytes);
+            printf("    iface[%d] %-8s up=%d mtu=%u mac=%s ip=%s gw=%s rx=%llu tx=%llu\n", i,
+                   ifs[i].name, ifs[i].up, ifs[i].mtu, ifs[i].mac, ifs[i].ipv4, ifs[i].gateway,
+                   (unsigned long long)ifs[i].rx_bytes, (unsigned long long)ifs[i].tx_bytes);
         }
     }
 
@@ -135,13 +140,11 @@ int main(void) {
         }
         np_stats_t st;
         if (n->get_stats(&st) == 0) {
-            printf("    stats: iface_count=%llu tcp=%llu udp=%llu unix=%llu total=%llu rx=%llu tx=%llu\n",
-                   (unsigned long long)st.iface_count,
-                   (unsigned long long)st.tcp_sockets,
-                   (unsigned long long)st.udp_sockets,
-                   (unsigned long long)st.unix_sockets,
-                   (unsigned long long)st.total_sockets,
-                   (unsigned long long)st.rx_bytes,
+            printf("    stats: iface_count=%llu tcp=%llu udp=%llu unix=%llu total=%llu rx=%llu "
+                   "tx=%llu\n",
+                   (unsigned long long)st.iface_count, (unsigned long long)st.tcp_sockets,
+                   (unsigned long long)st.udp_sockets, (unsigned long long)st.unix_sockets,
+                   (unsigned long long)st.total_sockets, (unsigned long long)st.rx_bytes,
                    (unsigned long long)st.tx_bytes);
         }
     }

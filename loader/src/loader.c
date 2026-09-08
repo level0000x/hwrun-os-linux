@@ -14,11 +14,11 @@
 
 /* ---- 协议接口转发（供 get_interface 返回） ---- */
 static hw_loader_ops_t g_loader_ops = {
-    .detect      = loader_detect_impl,
-    .elf_parse   = loader_elf_impl,
-    .load        = loader_load_impl,
-    .run         = loader_run_impl,
-    .unload      = loader_unload_impl,
+    .detect = loader_detect_impl,
+    .elf_parse = loader_elf_impl,
+    .load = loader_load_impl,
+    .run = loader_run_impl,
+    .unload = loader_unload_impl,
     .get_formats = loader_formats_impl,
 };
 
@@ -38,8 +38,7 @@ static int loader_init(hw_plugin_t *self) {
     if (!pd) return HWRUN_ENOMEM;
     pd->started = 0;
     self->private_data = pd;
-    HWAPI_LOGI("loader", "init: formats=%d",
-               HWAPI_PARAM_GET_INT("loader.formats", 0));
+    HWAPI_LOGI("loader", "init: formats=%d", HWAPI_PARAM_GET_INT("loader.formats", 0));
     return HWRUN_OK;
 }
 
@@ -72,9 +71,10 @@ static int loader_destroy(hw_plugin_t *self) {
 }
 
 /* 参数变更回调：本插件暂无可配置参数，一律接受 */
-static int loader_configure(hw_plugin_t *self, const char *key,
-                            const char *value) {
-    (void)self; (void)key; (void)value;
+static int loader_configure(hw_plugin_t *self, const char *key, const char *value) {
+    (void)self;
+    (void)key;
+    (void)value;
     return HWRUN_OK;
 }
 
@@ -88,22 +88,19 @@ static void *loader_get_interface(const char *protocol) {
 
 /* 生命周期 ops 表：由 SDK 宏装配进描述符 */
 static hw_plugin_ops_t g_ops = {
-    .init          = loader_init,
-    .start         = loader_start,
-    .stop          = loader_stop,
-    .destroy       = loader_destroy,
-    .configure     = loader_configure,
+    .init = loader_init,
+    .start = loader_start,
+    .stop = loader_stop,
+    .destroy = loader_destroy,
+    .configure = loader_configure,
     .get_interface = loader_get_interface,
 };
 
 /* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据） */
-static const char *const g_provides[] = { "LOADER", NULL };
-static const char *const g_requires[] = {
-    "HAP", "PMP", "FSP", "LOG", "PARAM", "METAPROTO", NULL
-};
+static const char *const g_provides[] = {"LOADER", NULL};
+static const char *const g_requires[] = {"HAP", "PMP", "FSP", "LOG", "PARAM", "METAPROTO", NULL};
 
 HWRUN_PLUGIN_BIND()
-HWRUN_PLUGIN_DEFINE(
-    "loader", "Executable Loader Protocol", "1.0.0", HWPLUGIN_TYPE_LOADER,
-    "HWRun OS 可执行文件加载协议：检测 / 加载 / 运行各类可执行格式",
-    &g_ops, g_provides, g_requires)
+HWRUN_PLUGIN_DEFINE("loader", "Executable Loader Protocol", "1.0.0", HWPLUGIN_TYPE_LOADER,
+                    "HWRun OS 可执行文件加载协议：检测 / 加载 / 运行各类可执行格式", &g_ops,
+                    g_provides, g_requires)

@@ -16,17 +16,17 @@
 
 /* 结构体 stat -> fsp_stat */
 static void stat_to_fsp(const struct stat *s, fsp_stat_t *o) {
-    o->dev     = (uint64_t)s->st_dev;
-    o->ino     = (uint64_t)s->st_ino;
-    o->mode    = (uint32_t)s->st_mode;
-    o->nlink   = (uint32_t)s->st_nlink;
-    o->uid     = (uint32_t)s->st_uid;
-    o->gid     = (uint32_t)s->st_gid;
-    o->size    = (uint64_t)s->st_size;
-    o->atime   = (uint64_t)s->st_atime;
-    o->mtime   = (uint64_t)s->st_mtime;
-    o->ctime   = (uint64_t)s->st_ctime;
-    o->blocks  = (uint64_t)s->st_blocks;
+    o->dev = (uint64_t)s->st_dev;
+    o->ino = (uint64_t)s->st_ino;
+    o->mode = (uint32_t)s->st_mode;
+    o->nlink = (uint32_t)s->st_nlink;
+    o->uid = (uint32_t)s->st_uid;
+    o->gid = (uint32_t)s->st_gid;
+    o->size = (uint64_t)s->st_size;
+    o->atime = (uint64_t)s->st_atime;
+    o->mtime = (uint64_t)s->st_mtime;
+    o->ctime = (uint64_t)s->st_ctime;
+    o->blocks = (uint64_t)s->st_blocks;
     o->blksize = (uint32_t)s->st_blksize;
 }
 
@@ -35,16 +35,14 @@ static int fsp_open(const char *path, int flags, mode_t mode) {
     return open(path, flags, mode);
 }
 
-static int fsp_openat(const char *dirpath, const char *path,
-                      int flags, mode_t mode) {
+static int fsp_openat(const char *dirpath, const char *path, int flags, mode_t mode) {
     /* 相对路径基于 dirpath 解析；绝对路径或空 dirpath 直接按原样打开 */
     if (!path || path[0] == '\0') return -EINVAL;
-    if (!dirpath || dirpath[0] == '\0' || path[0] == '/')
-        return open(path, flags, mode);
+    if (!dirpath || dirpath[0] == '\0' || path[0] == '/') return open(path, flags, mode);
 
     char full[4096];
-    if (snprintf(full, sizeof(full), "%s/%s", dirpath, path)
-        >= (int)sizeof(full)) return -ENAMETOOLONG;
+    if (snprintf(full, sizeof(full), "%s/%s", dirpath, path) >= (int)sizeof(full))
+        return -ENAMETOOLONG;
     return open(full, flags, mode);
 }
 
@@ -116,34 +114,34 @@ static int fsp_access(const char *path, int amode) {
 static int fsp_statfs(const char *path, fsp_statfs_t *fs) {
     struct statfs s;
     if (statfs(path, &s) != 0) return -errno;
-    fs->f_type    = (uint64_t)s.f_type;
-    fs->f_bsize   = (uint64_t)s.f_bsize;
-    fs->f_blocks  = (uint64_t)s.f_blocks;
-    fs->f_bfree   = (uint64_t)s.f_bfree;
-    fs->f_bavail  = (uint64_t)s.f_bavail;
-    fs->f_files   = (uint64_t)s.f_files;
-    fs->f_ffree   = (uint64_t)s.f_ffree;
+    fs->f_type = (uint64_t)s.f_type;
+    fs->f_bsize = (uint64_t)s.f_bsize;
+    fs->f_blocks = (uint64_t)s.f_blocks;
+    fs->f_bfree = (uint64_t)s.f_bfree;
+    fs->f_bavail = (uint64_t)s.f_bavail;
+    fs->f_files = (uint64_t)s.f_files;
+    fs->f_ffree = (uint64_t)s.f_ffree;
     fs->f_namelen = (uint64_t)s.f_namelen;
     return 0;
 }
 
 /* 组装文件操作组 */
 void hw_fsp_ops_file_init(hw_fsp_ops_t *ops) {
-    ops->open     = fsp_open;
-    ops->openat   = fsp_openat;
-    ops->close    = fsp_close;
-    ops->read     = fsp_read;
-    ops->write    = fsp_write;
-    ops->pread    = fsp_pread;
-    ops->pwrite   = fsp_pwrite;
-    ops->seek     = fsp_seek;
-    ops->rename   = fsp_rename;
-    ops->remove   = fsp_remove;
-    ops->unlink   = fsp_unlink;
+    ops->open = fsp_open;
+    ops->openat = fsp_openat;
+    ops->close = fsp_close;
+    ops->read = fsp_read;
+    ops->write = fsp_write;
+    ops->pread = fsp_pread;
+    ops->pwrite = fsp_pwrite;
+    ops->seek = fsp_seek;
+    ops->rename = fsp_rename;
+    ops->remove = fsp_remove;
+    ops->unlink = fsp_unlink;
 
-    ops->stat     = fsp_stat;
-    ops->lstat    = fsp_lstat;
-    ops->fstat    = fsp_fstat;
-    ops->access   = fsp_access;
-    ops->statfs   = fsp_statfs;
+    ops->stat = fsp_stat;
+    ops->lstat = fsp_lstat;
+    ops->fstat = fsp_fstat;
+    ops->access = fsp_access;
+    ops->statfs = fsp_statfs;
 }

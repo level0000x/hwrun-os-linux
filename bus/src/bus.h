@@ -36,9 +36,9 @@ typedef struct hw_bus {
     char git_remote[256];
     char state_dir[256]; /* /var/lib/hwrun     */
 
-    int   initialized;
-    int   running;
-    int   param_git_committing;  /* mark_revision->GIT commit 重入守卫 */
+    int initialized;
+    int running;
+    int param_git_committing; /* mark_revision->GIT commit 重入守卫 */
 } hw_bus_t;
 
 /* 插件发现信息（从 plugin.yml 解析） */

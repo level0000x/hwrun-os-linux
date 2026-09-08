@@ -30,7 +30,7 @@ static void read_txt(const char *path, char *out, size_t cap) {
     close(fd);
     if (n < 0) n = 0;
     out[n] = '\0';
-    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' '))
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' '))
         out[--n] = '\0';
 }
 
@@ -48,8 +48,14 @@ static void proc_dev_stats(const char *name, np_interface_t *o) {
     if (!fp) return;
     char line[640];
     /* 跳过两行表头 */
-    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return; }
-    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return; }
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return;
+    }
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return;
+    }
 
     while (fgets(line, sizeof(line), fp)) {
         char *colon = strchr(line, ':');
@@ -59,7 +65,8 @@ static void proc_dev_stats(const char *name, np_interface_t *o) {
         char ifn[IFNAMSIZ + 1];
         memcpy(ifn, line, nl);
         ifn[nl] = '\0';
-        while (nl > 0 && ifn[nl-1] == ' ') ifn[--nl] = '\0';
+        while (nl > 0 && ifn[nl - 1] == ' ')
+            ifn[--nl] = '\0';
         if (strcmp(ifn, name) != 0) continue;
 
         /* 读取头 16 个数字：0-7 接收，8-15 发送 */
@@ -67,12 +74,15 @@ static void proc_dev_stats(const char *name, np_interface_t *o) {
         char *p = colon + 1;
         int c = 0;
         while (c < 16) {
-            while (*p == ' ') p++;
+            while (*p == ' ')
+                p++;
             if (!*p) break;
             if (sscanf(p, "%llu", &nums[c]) == 1) {
                 c++;
-                while (*p && *p != ' ') p++;
-            } else break;
+                while (*p && *p != ' ')
+                    p++;
+            } else
+                break;
         }
         if (c >= 1) o->rx_bytes = nums[0];
         if (c >= 2) o->rx_packets = nums[1];
@@ -89,12 +99,15 @@ static void proc_default_gateway(char *gw, size_t cap) {
     FILE *fp = fopen("/proc/net/route", "r");
     if (!fp) return;
     char line[512];
-    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return; } /* 跳过表头 */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return;
+    } /* 跳过表头 */
     while (fgets(line, sizeof(line), fp)) {
         char iface[IFNAMSIZ + 1];
         unsigned long dest = 0, gateway = 0, mask = 0, metric = 0;
-        if (sscanf(line, "%15s %lx %lx %*x %*d %*d %lu %lx", iface,
-                   &dest, &gateway, &metric, &mask) == 5) {
+        if (sscanf(line, "%15s %lx %lx %*x %*d %*d %lu %lx", iface, &dest, &gateway, &metric,
+                   &mask) == 5) {
             /* 0.0.0.0 目标即默认路由 */
             if (dest == 0 && gateway != 0) {
                 uint32_t g = ntohl((uint32_t)gateway);
@@ -133,17 +146,14 @@ int np_get_interfaces_impl(np_interface_t *ifaces, int cap, int *out_count) {
 
         if (ifa->ifa_addr->sa_family == AF_INET) {
             const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
-            inet_ntop(AF_INET, &sin->sin_addr, ifaces[idx].ipv4,
-                      sizeof(ifaces[idx].ipv4));
+            inet_ntop(AF_INET, &sin->sin_addr, ifaces[idx].ipv4, sizeof(ifaces[idx].ipv4));
             if (ifa->ifa_netmask) {
                 const struct sockaddr_in *sn = (const struct sockaddr_in *)ifa->ifa_netmask;
-                inet_ntop(AF_INET, &sn->sin_addr, ifaces[idx].netmask,
-                          sizeof(ifaces[idx].netmask));
+                inet_ntop(AF_INET, &sn->sin_addr, ifaces[idx].netmask, sizeof(ifaces[idx].netmask));
             }
         } else if (ifa->ifa_addr->sa_family == AF_INET6) {
             const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ifa->ifa_addr;
-            inet_ntop(AF_INET6, &sin6->sin6_addr, ifaces[idx].ipv6,
-                      sizeof(ifaces[idx].ipv6));
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ifaces[idx].ipv6, sizeof(ifaces[idx].ipv6));
             /* 去掉 scoped 地址的 %iface 后缀 */
             char *pct = strchr(ifaces[idx].ipv6, '%');
             if (pct) *pct = '\0';

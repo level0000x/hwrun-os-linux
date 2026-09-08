@@ -25,7 +25,7 @@
 
 /* ---- ELF 常量（与 elf.h 一致）---- */
 #define ET_EXEC 2
-#define ET_DYN  3
+#define ET_DYN 3
 
 static int loader_is_library(const loader_elf_info_t *info) {
     /* ET_DYN 且不含 PT_INTERP，通常视为位置无关的共享库 */
@@ -41,21 +41,21 @@ static int run_script(const char *path, char **argv) {
     char **child_argv;
     int argc = 0, i;
 
-    if (loader_detect_impl(path, &fmt, NULL, 0, interp, sizeof(interp)) < 0)
-        return -ENOEXEC;
-    if (fmt != LOADER_FORMAT_SCRIPT || interp[0] == '\0')
-        return -ENOEXEC;
+    if (loader_detect_impl(path, &fmt, NULL, 0, interp, sizeof(interp)) < 0) return -ENOEXEC;
+    if (fmt != LOADER_FORMAT_SCRIPT || interp[0] == '\0') return -ENOEXEC;
 
     /* argv = [interp, path, 用户参数...] */
-    while (argv && argv[argc]) argc++;
+    while (argv && argv[argc])
+        argc++;
     child_argv = calloc((size_t)argc + 3, sizeof(char *));
     if (!child_argv) return -ENOMEM;
     child_argv[0] = interp;
     child_argv[1] = (char *)path;
-    for (i = 0; i < argc; i++) child_argv[i + 2] = argv[i];
+    for (i = 0; i < argc; i++)
+        child_argv[i + 2] = argv[i];
 
     execvp(interp, child_argv);
-    return -errno;   /* 仅当 exec 失败时返回 */
+    return -errno; /* 仅当 exec 失败时返回 */
 }
 
 /* ============================================================
@@ -71,11 +71,11 @@ static int run_exec(const char *path, char **argv, int wait, int *exit_code) {
 
     if (pid == 0) {
         /* 子进程：替换为可执行程序 */
-        execvp(path, argv ? argv : (char *[]){ (char *)path, NULL });
-        _exit(126);   /* exec 失败 */
+        execvp(path, argv ? argv : (char *[]){(char *)path, NULL});
+        _exit(126); /* exec 失败 */
     }
 
-    if (!wait) return (int)pid;   /* 后台运行，返回 PID */
+    if (!wait) return (int)pid; /* 后台运行，返回 PID */
 
     if (waitpid(pid, &status, 0) < 0) return -errno;
     if (WIFEXITED(status)) {
@@ -99,8 +99,7 @@ int loader_run_impl(const char *path, char **argv, int wait, int *exit_code) {
     if (!path) return -EINVAL;
     if (exit_code) *exit_code = 0;
 
-    if (loader_detect_impl(path, &fmt, NULL, 0, NULL, 0) < 0)
-        return -ENOEXEC;
+    if (loader_detect_impl(path, &fmt, NULL, 0, NULL, 0) < 0) return -ENOEXEC;
 
     switch (fmt) {
     case LOADER_FORMAT_SCRIPT:
@@ -108,8 +107,7 @@ int loader_run_impl(const char *path, char **argv, int wait, int *exit_code) {
         return run_script(path, argv);
 
     case LOADER_FORMAT_ELF:
-        if (loader_elf_impl(path, &info) < 0)
-            return -ENOEXEC;
+        if (loader_elf_impl(path, &info) < 0) return -ENOEXEC;
         if (loader_is_library(&info)) {
             /* 共享库：应由 load 用 dlopen 驻留，run 不负责执行 */
             return HWRUN_ENOTSUP;
@@ -135,8 +133,7 @@ int loader_load_impl(const char *path, loader_handle_t *h) {
     if (!path || !h) return -EINVAL;
     memset(h, 0, sizeof(*h));
 
-    if (loader_detect_impl(path, &fmt, NULL, 0,
-                           h->interpreter, sizeof(h->interpreter)) < 0)
+    if (loader_detect_impl(path, &fmt, NULL, 0, h->interpreter, sizeof(h->interpreter)) < 0)
         return -ENOEXEC;
 
     h->id = next_id++;
@@ -146,26 +143,25 @@ int loader_load_impl(const char *path, loader_handle_t *h) {
 
     switch (fmt) {
     case LOADER_FORMAT_ELF:
-        if (loader_elf_impl(path, &info) < 0)
-            return -ENOEXEC;
+        if (loader_elf_impl(path, &info) < 0) return -ENOEXEC;
         if (loader_is_library(&info)) {
             h->dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
             if (!h->dl) {
-                (void)dlerror();      /* 是真库但本机无法加载才失败 */
+                (void)dlerror(); /* 是真库但本机无法加载才失败 */
                 return -ENOENT;
             }
             h->mode = LOADER_MODE_DLOPEN;
         } else {
-            h->mode = LOADER_MODE_INFO;   /* 可执行：仅登记信息 */
+            h->mode = LOADER_MODE_INFO; /* 可执行：仅登记信息 */
         }
         return 0;
 
     case LOADER_FORMAT_SCRIPT:
         h->mode = LOADER_MODE_INFO;
-        return 0;                          /* 脚本：登记解释器即可 */
+        return 0; /* 脚本：登记解释器即可 */
 
     default:
-        h->mode = LOADER_MODE_INFO;        /* 其他格式仅登记类型 */
+        h->mode = LOADER_MODE_INFO; /* 其他格式仅登记类型 */
         return 0;
     }
 }

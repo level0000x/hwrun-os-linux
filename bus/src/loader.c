@@ -120,14 +120,12 @@ static void plugin_unregister_provides(hw_bus_t *bus, hw_plugin_t *p, int n) {
 int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
     if (!bus || !p) return HWRUN_EINVAL;
 
-    int rc = hw_metaproto_check_deps(&bus->meta,
-                                     (const char *const *)p->requires,
+    int rc = hw_metaproto_check_deps(&bus->meta, (const char *const *)p->requires,
                                      p->requires_count, NULL, 0);
     if (rc != HWRUN_OK) {
         char miss[64] = "";
-        hw_metaproto_check_deps(&bus->meta,
-                                (const char *const *)p->requires,
-                                p->requires_count, miss, sizeof(miss));
+        hw_metaproto_check_deps(&bus->meta, (const char *const *)p->requires, p->requires_count,
+                                miss, sizeof(miss));
         HWLOG_ERRF(&bus->log, p->id, "missing dependency: %s", miss);
         p->state = HWPLUGIN_ERROR;
         return HWRUN_EILSEQ;
@@ -137,11 +135,8 @@ int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
      * 拒绝启动，防止互斥能力共存。检查须先于 inject/init（无副作用）。 */
     for (int i = 0; i < p->conflicts_count; i++) {
         hw_protocol_route_t *r = NULL;
-        if (hw_metaproto_resolve(&bus->meta, p->conflicts[i], NULL, &r) ==
-                HWRUN_OK &&
-            r) {
-            HWLOG_WARNF(&bus->log, p->id,
-                        "conflict: %s already registered by %s, refuse to start",
+        if (hw_metaproto_resolve(&bus->meta, p->conflicts[i], NULL, &r) == HWRUN_OK && r) {
+            HWLOG_WARNF(&bus->log, p->id, "conflict: %s already registered by %s, refuse to start",
                         p->conflicts[i], r->plugin_id);
             p->state = HWPLUGIN_ERROR;
             return HWRUN_ECONFLICT;

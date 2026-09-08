@@ -12,9 +12,9 @@
 #include <time.h>
 #include <sys/stat.h>
 
-static int  check_add_path(hw_bus_t *bus, const char *path);
-static int  scan_dir(hw_bus_t *bus, const char *dir);
-static int  scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub);
+static int check_add_path(hw_bus_t *bus, const char *path);
+static int scan_dir(hw_bus_t *bus, const char *dir);
+static int scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub);
 static char **copy_str_arr(char *const *src, int count);
 
 /* ---- 参数变更 -> GIT 自动 commit（mark_revision 钩子） ---- */
@@ -27,41 +27,41 @@ static char **copy_str_arr(char *const *src, int count);
 static void bus_on_param_revision(void *userdata, const char *reason) {
     hw_bus_t *bus = (hw_bus_t *)userdata;
     if (!bus || !bus->initialized || !bus->running) return;
-    if (bus->param_git_committing) return;       /* 重入守卫 */
+    if (bus->param_git_committing) return; /* 重入守卫 */
     bus->param_git_committing = 1;
 
     hw_protocol_route_t *route = NULL;
-    if (hw_bus_resolve(bus, HWPROTO_GIT, &route) != HWRUN_OK || !route ||
-        !route->implementation) {
+    if (hw_bus_resolve(bus, HWPROTO_GIT, &route) != HWRUN_OK || !route || !route->implementation) {
         bus->param_git_committing = 0;
-        return;                                  /* git 未就绪：静默跳过 */
+        return; /* git 未就绪：静默跳过 */
     }
     hw_git_ops_t *g = (hw_git_ops_t *)route->implementation;
-    if (!g->add || !g->commit) { bus->param_git_committing = 0; return; }
+    if (!g->add || !g->commit) {
+        bus->param_git_committing = 0;
+        return;
+    }
 
     git_config_t *cfg = g->get_config ? g->get_config() : NULL;
-    if (cfg && !cfg->auto_commit) { bus->param_git_committing = 0; return; }
+    if (cfg && !cfg->auto_commit) {
+        bus->param_git_committing = 0;
+        return;
+    }
 
     /* 参数状态文件置于 <state>/git/（默认即 git 插件仓库目录），保证
      * git add 命中工作区；状态目录未配置时静默跳过。 */
     char state_file[512] = "";
     if (bus->params.dirs[HWPARAM_GIT][0])
-        snprintf(state_file, sizeof(state_file), "%s/params.state",
-                 bus->params.dirs[HWPARAM_GIT]);
-    if (!state_file[0] ||
-        hw_param_save_file(&bus->params, state_file) != HWRUN_OK) {
-        HWLOG_DEBUGF(&bus->log, "bus",
-                     "param state persist skipped (git/state dir not ready)");
+        snprintf(state_file, sizeof(state_file), "%s/params.state", bus->params.dirs[HWPARAM_GIT]);
+    if (!state_file[0] || hw_param_save_file(&bus->params, state_file) != HWRUN_OK) {
+        HWLOG_DEBUGF(&bus->log, "bus", "param state persist skipped (git/state dir not ready)");
         bus->param_git_committing = 0;
         return;
     }
 
     char msg[192];
-    snprintf(msg, sizeof(msg), "param: %s",
-             (reason && reason[0]) ? reason : "tree changed");
+    snprintf(msg, sizeof(msg), "param: %s", (reason && reason[0]) ? reason : "tree changed");
     if (g->add(state_file) != HWRUN_OK) {
-        HWLOG_DEBUGF(&bus->log, "bus", "param auto-commit add failed: %s",
-                     state_file);
+        HWLOG_DEBUGF(&bus->log, "bus", "param auto-commit add failed: %s", state_file);
     } else {
         char oid[64] = "";
         if (g->commit(msg, oid, sizeof(oid)) == HWRUN_OK)
@@ -319,15 +319,12 @@ int hw_bus_load(hw_bus_t *bus, const char *id) {
 
 /* 依赖链标准启动顺序 */
 static const char *boot_order[] = {
-    "metaproto", "bus", "param", "log", "git",
-    "hap", "pmp", "fsp", "np", "sp", "crypto", "loader",
-    "cluster", "instance", "sandbox", "input", "display",
-    "audio", "power", "storage", "permission", "consensus",
-    "fs_transfer", "node_discovery", "driver", "hotplug",
-    "terminal", "audit", "packages", "monitor",
-    "ui", "console", "desktop", "shell",
-    NULL
-};
+    "metaproto", "bus",      "param",      "log",       "git",         "hap",
+    "pmp",       "fsp",      "np",         "sp",        "crypto",      "loader",
+    "cluster",   "instance", "sandbox",    "input",     "display",     "audio",
+    "power",     "storage",  "permission", "consensus", "fs_transfer", "node_discovery",
+    "driver",    "hotplug",  "terminal",   "audit",     "packages",    "monitor",
+    "ui",        "console",  "desktop",    "shell",     NULL};
 
 /* 插件 id 是否在 boot_order 表内（决定是否会被 boot_chain 自动启动） */
 static int in_boot_order(const char *id) {
@@ -343,15 +340,14 @@ int hw_bus_boot_chain(hw_bus_t *bus) {
     for (int i = 0; boot_order[i]; i++) {
         hw_plugin_t *p = hw_bus_find(bus, boot_order[i]);
         if (!p) {
-            HWLOG_DEBUGF(&bus->log, "bus", "boot: %s not present (skipped)",
-                        boot_order[i]);
+            HWLOG_DEBUGF(&bus->log, "bus", "boot: %s not present (skipped)", boot_order[i]);
             continue;
         }
         if (p->state == HWPLUGIN_STARTED) continue;
         int rc = hw_plugin_start(bus, p);
         if (rc != HWRUN_OK) {
-            HWLOG_WARNF(&bus->log, "bus", "boot: %s failed to start (%s)",
-                        boot_order[i], hw_strerror(rc));
+            HWLOG_WARNF(&bus->log, "bus", "boot: %s failed to start (%s)", boot_order[i],
+                        hw_strerror(rc));
         }
     }
 
@@ -360,11 +356,10 @@ int hw_bus_boot_chain(hw_bus_t *bus) {
         if (p->state == HWPLUGIN_STARTED) continue;
         if (in_boot_order(p->id)) continue;
         HWLOG_WARNF(&bus->log, "bus",
-                    "boot: %s 未纳入启动序，不会自动启动 (需要时请 plugins load %s)",
-                    p->id, p->id);
+                    "boot: %s 未纳入启动序，不会自动启动 (需要时请 plugins load %s)", p->id, p->id);
     }
 
-    hw_bus_config_route(bus);   /* 启动完成后：参数变更 -> 插件 configure 路由 */
+    hw_bus_config_route(bus); /* 启动完成后：参数变更 -> 插件 configure 路由 */
     return HWRUN_OK;
 }
 

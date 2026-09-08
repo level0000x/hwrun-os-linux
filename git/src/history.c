@@ -63,8 +63,13 @@ git_commit_t *git_ops_log(int limit, const char *since) {
                     }
                 }
             }
-            if (tail) { tail->next = c; tail = c; }
-            else      { head = c;       tail = c; }
+            if (tail) {
+                tail->next = c;
+                tail = c;
+            } else {
+                head = c;
+                tail = c;
+            }
         }
 
         line = nl ? nl + 1 : NULL;
@@ -88,8 +93,7 @@ void git_ops_free_commits(git_commit_t *head) {
 git_blame_t *git_ops_blame(const char *file) {
     if (!file) return NULL;
     char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "blame --line-porcelain -c -- %s", file);
+    snprintf(cmd, sizeof(cmd), "blame --line-porcelain -c -- %s", file);
 
     git_result_t *r = git_exec(NULL, cmd);
     if (!r || !r->success) {
@@ -106,13 +110,11 @@ git_blame_t *git_ops_blame(const char *file) {
         if (nl) *nl = '\0';
 
         /* 形如 <hash> <orig_line> <final_line> <num> */
-        if ((line[0] >= '0' && line[0] <= '9') ||
-            (line[0] >= 'a' && line[0] <= 'f')) {
+        if ((line[0] >= '0' && line[0] <= '9') || (line[0] >= 'a' && line[0] <= 'f')) {
             char *sp = strchr(line, ' ');
             if (sp) {
                 size_t hlen = (size_t)(sp - line);
-                if (hlen > sizeof(cur_hash) - 1)
-                    hlen = sizeof(cur_hash) - 1;
+                if (hlen > sizeof(cur_hash) - 1) hlen = sizeof(cur_hash) - 1;
                 memcpy(cur_hash, line, hlen);
                 cur_hash[hlen] = '\0';
                 line_no++;
@@ -128,8 +130,7 @@ git_blame_t *git_ops_blame(const char *file) {
                 if (n > 0 && d[n - 1] == '\n') d[n - 1] = '\0';
                 snprintf(cur_date, sizeof(cur_date), "%s", d);
             }
-        } else if (!strncmp(line, "filename ", 9) ||
-                   !strncmp(line, "summary ", 8) ||
+        } else if (!strncmp(line, "filename ", 9) || !strncmp(line, "summary ", 8) ||
                    !strncmp(line, "\t", 1)) {
             if (line[0] == '\t') {
                 /* 实际内容行：汇出一条 blame 记录 */
@@ -137,11 +138,16 @@ git_blame_t *git_ops_blame(const char *file) {
                 if (b) {
                     b->line_no = line_no;
                     snprintf(b->commit_id, sizeof(b->commit_id), "%s", cur_hash);
-                    snprintf(b->author,   sizeof(b->author),   "%s", cur_author);
-                    snprintf(b->date,     sizeof(b->date),     "%s", cur_date);
-                    snprintf(b->content,  sizeof(b->content),  "%s", line + 1);
-                    if (tail) { tail->next = b; tail = b; }
-                    else      { head = b;       tail = b; }
+                    snprintf(b->author, sizeof(b->author), "%s", cur_author);
+                    snprintf(b->date, sizeof(b->date), "%s", cur_date);
+                    snprintf(b->content, sizeof(b->content), "%s", line + 1);
+                    if (tail) {
+                        tail->next = b;
+                        tail = b;
+                    } else {
+                        head = b;
+                        tail = b;
+                    }
                 }
                 cur_hash[0] = cur_author[0] = cur_date[0] = '\0';
             }

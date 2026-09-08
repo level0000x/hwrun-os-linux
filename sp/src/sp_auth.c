@@ -25,7 +25,7 @@
 #include "sp_internal.h"
 
 #define SP_PASS_SALT_LEN 16
-#define SP_HASH_HEX_LEN  64
+#define SP_HASH_HEX_LEN 64
 
 /* ============================================================
  * 角色 -> 允许动作前缀（RBAC 矩阵，"*" 后缀表示前缀通配）
@@ -36,12 +36,11 @@ typedef struct sp_role_perms {
 } sp_role_perms_t;
 
 static const sp_role_perms_t sp_role_matrix[] = {
-    { "admin",    { "*" } },
-    { "operator", { "fs.write", "fs.read", "task.submit", "task.read",
-                    "key.sign", "net.config" } },
-    { "viewer",   { "fs.read", "task.read", "log.read" } },
-    { "security", { "key.*", "user.*", "auth.*", "fs.read", "log.read" } },
-    { NULL,       { NULL } },
+    {"admin", {"*"}},
+    {"operator", {"fs.write", "fs.read", "task.submit", "task.read", "key.sign", "net.config"}},
+    {"viewer", {"fs.read", "task.read", "log.read"}},
+    {"security", {"key.*", "user.*", "auth.*", "fs.read", "log.read"}},
+    {NULL, {NULL}},
 };
 
 /* 前缀匹配：token 形如 "fs.write" / "key.*" / "*" */
@@ -79,8 +78,8 @@ static sp_user_t *sp_user_find_locked(const char *user) {
 /* ============================================================
  * 密码哈希：SHA-256(盐字节 || 密码) -> hex
  * ============================================================ */
-static int sp_password_hash(const char *password, const char *salt_hex,
-                            char *hash_hex, size_t hash_cap) {
+static int sp_password_hash(const char *password, const char *salt_hex, char *hash_hex,
+                            size_t hash_cap) {
     uint8_t salt[SP_PASS_SALT_LEN];
     size_t slen = 0;
     if (sp_from_hex(salt_hex, salt, sizeof(salt), &slen) != SP_OK) return SP_EINVAL;
@@ -94,8 +93,7 @@ static int sp_password_hash(const char *password, const char *salt_hex,
 
     uint8_t digest[32];
     uint32_t dlen = 32;
-    if (sp_hash_compute(SP_HASH_SHA256, buf, (uint32_t)tot, digest, &dlen) != SP_OK)
-        return SP_EIO;
+    if (sp_hash_compute(SP_HASH_SHA256, buf, (uint32_t)tot, digest, &dlen) != SP_OK) return SP_EIO;
     if (hash_cap < SP_HASH_HEX_LEN + 1) return SP_ENOMEM;
     sp_to_hex(digest, 32, hash_hex);
     return SP_OK;
@@ -109,8 +107,7 @@ static int sp_users_save(void) {
     snprintf(path, sizeof(path), "%s/sp_users.conf", g_sp_ctx.state_dir);
 
     struct stat st;
-    if (stat(g_sp_ctx.state_dir, &st) != 0)
-        mkdir(g_sp_ctx.state_dir, 0700);
+    if (stat(g_sp_ctx.state_dir, &st) != 0) mkdir(g_sp_ctx.state_dir, 0700);
 
     char tmp[1100];
     snprintf(tmp, sizeof(tmp), "%s/sp_users.conf.tmp", g_sp_ctx.state_dir);
@@ -120,19 +117,22 @@ static int sp_users_save(void) {
     fprintf(f, "# HWRun SP user table (salted sha256)\n");
     pthread_mutex_lock(&g_sp_ctx.lock);
     for (sp_user_t *u = g_sp_ctx.users; u; u = u->next) {
-        if (strpbrk(u->user, ":\n") ||
-            strpbrk(u->roles, ":\n") ||
-            strpbrk(u->salt_hex, ":\n") ||
+        if (strpbrk(u->user, ":\n") || strpbrk(u->roles, ":\n") || strpbrk(u->salt_hex, ":\n") ||
             strpbrk(u->hash_hex, ":\n"))
-            continue;   /* 跳过含分隔符的异常条目 */
-        fprintf(f, "%s:%s:%s:%s:%d\n",
-                u->user, u->salt_hex, u->hash_hex, u->roles[0] ? u->roles : "viewer",
-                u->enabled);
+            continue; /* 跳过含分隔符的异常条目 */
+        fprintf(f, "%s:%s:%s:%s:%d\n", u->user, u->salt_hex, u->hash_hex,
+                u->roles[0] ? u->roles : "viewer", u->enabled);
     }
     pthread_mutex_unlock(&g_sp_ctx.lock);
-    if (fclose(f) != 0) { unlink(tmp); return SP_EIO; }
+    if (fclose(f) != 0) {
+        unlink(tmp);
+        return SP_EIO;
+    }
     chmod(tmp, 0600);
-    if (rename(tmp, path) != 0) { unlink(tmp); return SP_EIO; }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return SP_EIO;
+    }
     return SP_OK;
 }
 
@@ -141,7 +141,7 @@ static int sp_users_load(void) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/sp_users.conf", g_sp_ctx.state_dir);
     FILE *f = fopen(path, "r");
-    if (!f) return SP_OK;   /* 无文件即空表，非错误 */
+    if (!f) return SP_OK; /* 无文件即空表，非错误 */
 
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
@@ -191,7 +191,11 @@ int sp_auth_init(void) {
 
 int sp_auth_cleanup(void) {
     sp_user_t *u = g_sp_ctx.users;
-    while (u) { sp_user_t *t = u; u = u->next; free(t); }
+    while (u) {
+        sp_user_t *t = u;
+        u = u->next;
+        free(t);
+    }
     g_sp_ctx.users = NULL;
     return SP_OK;
 }
@@ -219,7 +223,10 @@ int sp_add_user(const char *user, const char *password, const char *roles, int e
         return SP_EEXIST; /* 既有用户，请 del 后重建 */
     }
     sp_user_t *u = calloc(1, sizeof(*u));
-    if (!u) { pthread_mutex_unlock(&g_sp_ctx.lock); return SP_ENOMEM; }
+    if (!u) {
+        pthread_mutex_unlock(&g_sp_ctx.lock);
+        return SP_ENOMEM;
+    }
     snprintf(u->user, sizeof(u->user), "%s", user);
     snprintf(u->salt_hex, sizeof(u->salt_hex), "%s", salt_hex);
     snprintf(u->hash_hex, sizeof(u->hash_hex), "%s", hash_hex);
@@ -239,8 +246,11 @@ int sp_del_user(const char *user) {
     int found = 0;
     while (*pp) {
         if (strcmp((*pp)->user, user) == 0) {
-            sp_user_t *t = *pp; *pp = t->next; free(t);
-            found = 1; break;
+            sp_user_t *t = *pp;
+            *pp = t->next;
+            free(t);
+            found = 1;
+            break;
         }
         pp = &(*pp)->next;
     }
@@ -252,8 +262,7 @@ int sp_del_user(const char *user) {
 /* ============================================================
  * 身份认证
  * ============================================================ */
-int sp_authenticate(const char *user, const char *password,
-                    char *session_id, uint32_t id_cap) {
+int sp_authenticate(const char *user, const char *password, char *session_id, uint32_t id_cap) {
     if (!user || !password) return SP_EINVAL;
 
     pthread_mutex_lock(&g_sp_ctx.lock);
@@ -271,8 +280,10 @@ int sp_authenticate(const char *user, const char *password,
     if (session_id && id_cap) {
         uint8_t rnd[16];
         char hex[40];
-        if (sp_random(rnd, 16) == SP_OK) sp_to_hex(rnd, 16, hex);
-        else snprintf(hex, sizeof(hex), "%llu", (unsigned long long)sp_now_ms());
+        if (sp_random(rnd, 16) == SP_OK)
+            sp_to_hex(rnd, 16, hex);
+        else
+            snprintf(hex, sizeof(hex), "%llu", (unsigned long long)sp_now_ms());
         snprintf(session_id, id_cap, "sess-%s-%s", hex, user);
     }
     return SP_OK;
@@ -281,8 +292,7 @@ int sp_authenticate(const char *user, const char *password,
 /* ============================================================
  * 授权检查（RBAC）：allowed 输出是否允许
  * ============================================================ */
-int sp_check_acl(const char *user, const char *action, const char *target,
-                 int *allowed) {
+int sp_check_acl(const char *user, const char *action, const char *target, int *allowed) {
     (void)target;
     if (!user || !action || !allowed) return SP_EINVAL;
     *allowed = 0;
@@ -295,8 +305,12 @@ int sp_check_acl(const char *user, const char *action, const char *target,
         snprintf(roles, sizeof(roles), "%s", u->roles);
         char *save = NULL;
         for (char *tok = strtok_r(roles, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-            while (*tok == ' ' || *tok == '\t') tok++;
-            if (sp_role_allows(tok, action)) { *allowed = 1; break; }
+            while (*tok == ' ' || *tok == '\t')
+                tok++;
+            if (sp_role_allows(tok, action)) {
+                *allowed = 1;
+                break;
+            }
         }
     }
     pthread_mutex_unlock(&g_sp_ctx.lock);
@@ -317,8 +331,8 @@ int sp_authorize(const char *user, const char *action, const char *target) {
 void sp_auth_bind(hw_sp_ops_t *ops) {
     if (!ops) return;
     ops->authenticate = sp_authenticate;
-    ops->authorize    = sp_authorize;
-    ops->add_user     = sp_add_user;
-    ops->del_user     = sp_del_user;
-    ops->check_acl    = sp_check_acl;
+    ops->authorize = sp_authorize;
+    ops->add_user = sp_add_user;
+    ops->del_user = sp_del_user;
+    ops->check_acl = sp_check_acl;
 }

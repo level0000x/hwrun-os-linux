@@ -24,59 +24,59 @@ extern "C" {
  * HAP 返回码（复用 HWRun 错误码语义，0 表示成功）
  * ============================================================ */
 enum {
-    HAP_OK       = 0,
-    HAP_USERES   = 1,   /* HAP 插件尚未就绪 */
+    HAP_OK = 0,
+    HAP_USERES = 1, /* HAP 插件尚未就绪 */
 };
 
 /* ============================================================
  * CPU 信息
  * ============================================================ */
 typedef struct hap_cpu_info {
-    char  vendor[64];          /* "GenuineIntel" / "AuthenticAMD" / "" */
-    char  model[128];          /* "Intel Core i7-12700K" 等 */
+    char vendor[64];           /* "GenuineIntel" / "AuthenticAMD" / "" */
+    char model[128];           /* "Intel Core i7-12700K" 等 */
     uint32_t cores;            /* 逻辑 CPU 数量（可在线核心数） */
     uint32_t sockets;          /* 物理插槽数（降级时取 1） */
     uint64_t freq_current_mhz; /* 当前频率（近似） */
     uint64_t freq_min_mhz;     /* 最低频率 */
     uint64_t freq_max_mhz;     /* 最高频率 */
     /* 负载均值（来自 /proc/loadavg），单位：运行队列中的任务数 */
-    double   load1m;
-    double   load5m;
-    double   load15m;
+    double load1m;
+    double load5m;
+    double load15m;
     /* 串行化的 CPU 标识，供 log 使用 */
-    char  ident[256];
+    char ident[256];
 } hap_cpu_info_t;
 
 /* ============================================================
  * 内存信息
  * ============================================================ */
 typedef struct hap_memory_info {
-    uint64_t total_kb;         /* 物理内存总量 */
-    uint64_t free_kb;          /* 空闲内存 */
-    uint64_t available_kb;     /* 可用内存（考虑缓存回收） */
-    uint64_t used_kb;          /* 已用内存 = total - available */
-    uint64_t swap_total_kb;    /* 交换分区总量 */
-    uint64_t swap_free_kb;     /* 交换分区空闲 */
-    char  memory_type[32];     /* 内存类型（降级环境下未知） */
+    uint64_t total_kb;      /* 物理内存总量 */
+    uint64_t free_kb;       /* 空闲内存 */
+    uint64_t available_kb;  /* 可用内存（考虑缓存回收） */
+    uint64_t used_kb;       /* 已用内存 = total - available */
+    uint64_t swap_total_kb; /* 交换分区总量 */
+    uint64_t swap_free_kb;  /* 交换分区空闲 */
+    char memory_type[32];   /* 内存类型（降级环境下未知） */
 } hap_memory_info_t;
 
 /* ============================================================
  * 磁盘设备信息
  * ============================================================ */
 typedef struct hap_disk_device {
-    char     name[64];          /* 设备名：sda / nvme0n1 / /dev/... */
-    char     model[128];        /* 型号（可为空） */
-    uint64_t capacity_mb;       /* 总容量（MB） */
-    uint64_t used_mb;           /* 已用（MB，有挂载点时有效） */
-    uint64_t free_mb;           /* 可用（MB，有挂载点时有效） */
-    double   use_pct;           /* 使用率（0-100，无数据时 0） */
-    char     mount_point[256];  /* 挂载点（可为空） */
-    char     fs_type[32];       /* 文件系统类型（可为空） */
-    int      available;         /* 是否有容量/使用数据 */
+    char name[64];         /* 设备名：sda / nvme0n1 / /dev/... */
+    char model[128];       /* 型号（可为空） */
+    uint64_t capacity_mb;  /* 总容量（MB） */
+    uint64_t used_mb;      /* 已用（MB，有挂载点时有效） */
+    uint64_t free_mb;      /* 可用（MB，有挂载点时有效） */
+    double use_pct;        /* 使用率（0-100，无数据时 0） */
+    char mount_point[256]; /* 挂载点（可为空） */
+    char fs_type[32];      /* 文件系统类型（可为空） */
+    int available;         /* 是否有容量/使用数据 */
 } hap_disk_device_t;
 
 typedef struct hap_disk_info {
-    uint32_t device_count;      /* 实际设备数 */
+    uint32_t device_count; /* 实际设备数 */
     hap_disk_device_t devices[32];
 } hap_disk_info_t;
 
@@ -84,15 +84,15 @@ typedef struct hap_disk_info {
  * 网络接口信息
  * ============================================================ */
 typedef struct hap_net_iface {
-    char     name[64];          /* 接口名：eth0 / wlan0 / lo */
-    int      is_up;             /* admin up */
-    int      is_running;        /* carrier running */
+    char name[64];  /* 接口名：eth0 / wlan0 / lo */
+    int is_up;      /* admin up */
+    int is_running; /* carrier running */
     uint32_t mtu;
-    char     mac[32];           /* 硬件地址（可为空） */
-    char     ip[64];            /* 首个 IPv4 地址（可为空） */
+    char mac[32]; /* 硬件地址（可为空） */
+    char ip[64];  /* 首个 IPv4 地址（可为空） */
     uint64_t rx_bytes;
     uint64_t tx_bytes;
-    uint32_t flags;             /* 原始 IFF_* 标志位 */
+    uint32_t flags; /* 原始 IFF_* 标志位 */
 } hap_net_iface_t;
 
 typedef struct hap_net_info {
@@ -104,12 +104,12 @@ typedef struct hap_net_info {
  * 系统信息
  * ============================================================ */
 typedef struct hap_system_info {
-    char     hostname[128];        /* 主机名 */
-    char     kernel_release[256];  /* 内核版本（uname -r） */
-    char     kernel_version[256];  /* 完整内核版本（uname -v） */
-    char     machine[64];          /* 架构：x86_64 / aarch64 */
-    char     os_name[256];         /* 操作系统名称（/etc/os-release） */
-    uint64_t uptime_seconds;       /* 运行时长（秒） */
+    char hostname[128];       /* 主机名 */
+    char kernel_release[256]; /* 内核版本（uname -r） */
+    char kernel_version[256]; /* 完整内核版本（uname -v） */
+    char machine[64];         /* 架构：x86_64 / aarch64 */
+    char os_name[256];        /* 操作系统名称（/etc/os-release） */
+    uint64_t uptime_seconds;  /* 运行时长（秒） */
 } hap_system_info_t;
 
 /* ============================================================

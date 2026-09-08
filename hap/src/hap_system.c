@@ -8,10 +8,10 @@
 #include "../include/hap.h"
 #include "hap_util.h"
 
-#define FILE_HOSTNAME   "/etc/hostname"
-#define FILE_UPTIME     "/proc/uptime"
-#define FILE_VERSION    "/proc/version"
-#define FILE_OSRELEASE  "/etc/os-release"
+#define FILE_HOSTNAME "/etc/hostname"
+#define FILE_UPTIME "/proc/uptime"
+#define FILE_VERSION "/proc/version"
+#define FILE_OSRELEASE "/etc/os-release"
 
 int hap_system_probe(hap_system_info_t *out) {
     char buf[1024];
@@ -22,7 +22,10 @@ int hap_system_probe(hap_system_info_t *out) {
     /* 主机名 */
     if (hap_read_file(FILE_HOSTNAME, out->hostname, sizeof(out->hostname)) > 0) {
         char *p = out->hostname + strlen(out->hostname);
-        while (p > out->hostname && isspace((unsigned char)p[-1])) { p--; *p = '\0'; }
+        while (p > out->hostname && isspace((unsigned char)p[-1])) {
+            p--;
+            *p = '\0';
+        }
     }
 
     /* 注册主机名 getenv/HOSTNAME 兜底（无 /etc/hostname 时） */
@@ -48,7 +51,8 @@ int hap_system_probe(hap_system_info_t *out) {
         if (sp) sp = strchr(sp + 1, ' ');
         if (sp) {
             char *end = sp + 1;
-            while (*end && !isspace((unsigned char)*end)) end++;
+            while (*end && !isspace((unsigned char)*end))
+                end++;
             *end = '\0';
             snprintf(out->kernel_release, sizeof(out->kernel_release), "%s", sp + 1);
         }
@@ -60,8 +64,8 @@ int hap_system_probe(hap_system_info_t *out) {
         if (hap_line_value(buf, "PRETTY_NAME", val, sizeof(val))) {
             /* 去掉引号 */
             size_t vlen = strlen(val);
-            if (vlen >= 2 && val[0] == '"' && val[vlen-1] == '"') {
-                val[vlen-1] = '\0';
+            if (vlen >= 2 && val[0] == '"' && val[vlen - 1] == '"') {
+                val[vlen - 1] = '\0';
                 memmove(val, val + 1, vlen);
             }
             strncpy(out->os_name, val, sizeof(out->os_name) - 1);

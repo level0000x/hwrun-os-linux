@@ -70,17 +70,16 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   # ---------------------------------------------------------------
-  # 3) 静态门禁：clang-format 格式校验
+  # 3) 静态门禁：clang-format 格式校验（硬门禁）
   #
-  # 现状：存量代码尚未全量格式化，直接 fail 会让 CI 一开始就红。
-  # 处置：本 job 设 continue-on-error，作为提示性门禁；
-  #       待存量代码按 .clang-format 收敛后，去掉 continue-on-error 收紧为硬门禁。
   # 校验范围：git 跟踪的 *.c/*.h（天然排除 build/、linux-src/ 等非入库目录）。
+  # 排除 kernel/：内核模块遵循 kbuild/tab 风格（如 kernel/modules/hwrun_core.c），
+  # 不受 .clang-format 约束，详见 docs/coding-style.md。
+  # 用户态范围须按 .clang-format 全量合规，违规即 fail（不再 continue-on-error）。
   # ---------------------------------------------------------------
   static:
     name: Format check (clang-format)
     runs-on: ubuntu-latest
-    continue-on-error: true # 待存量格式化后收紧（删除本行即硬门禁）
     steps:
       - uses: actions/checkout@v4
 
@@ -91,8 +90,8 @@ jobs:
 
       - name: clang-format --dry-run --Werror
         run: |
-          files=$(git ls-files '*.c' '*.h')
-          echo "checking $(echo "$files" | wc -l) files"
+          files=$(git ls-files '*.c' '*.h' | grep -v '^kernel/')
+          echo "checking $(echo "$files" | wc -l) files (user-space, kernel/ excluded)"
           # shellcheck disable=SC2086
           clang-format --dry-run --Werror $files
 

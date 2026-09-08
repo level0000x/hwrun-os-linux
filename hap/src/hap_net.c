@@ -16,11 +16,11 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 
-#define SYS_NET        "/sys/class/net"
-#define SYS_NET_OP     "%s/%s/operstate"
-#define SYS_NET_MTU    "%s/%s/mtu"
-#define SYS_NET_MAC    "%s/%s/address"
-#define PROC_NET_DEV   "/proc/net/dev"
+#define SYS_NET "/sys/class/net"
+#define SYS_NET_OP "%s/%s/operstate"
+#define SYS_NET_MTU "%s/%s/mtu"
+#define SYS_NET_MAC "%s/%s/address"
+#define PROC_NET_DEV "/proc/net/dev"
 
 /* 用 getifaddrs 取该接口首个 IPv4 地址 */
 static void hap_net_ip(const char *ifname, char *out, size_t cap) {
@@ -43,7 +43,8 @@ static int hap_net_octets(const char *ifname, uint64_t *rx, uint64_t *tx) {
     char data[8192];
     const char *p;
     size_t n = strlen(ifname);
-    *rx = 0; *tx = 0;
+    *rx = 0;
+    *tx = 0;
     if (hap_read_file(PROC_NET_DEV, data, sizeof(data)) == 0) return 0;
     p = data;
     while (p && *p) {
@@ -53,8 +54,8 @@ static int hap_net_octets(const char *ifname, uint64_t *rx, uint64_t *tx) {
             const char *v = p + n + 1;
             /* 格式：rx_bytes ... tx_bytes ...*/
             uint64_t a = 0, t = 0;
-            if (sscanf(v, " %llu %*u %*u %*u %*u %*u %*u %*u %*u %llu",
-                       (unsigned long long *)&a, (unsigned long long *)&t) >= 1) {
+            if (sscanf(v, " %llu %*u %*u %*u %*u %*u %*u %*u %*u %llu", (unsigned long long *)&a,
+                       (unsigned long long *)&t) >= 1) {
                 *rx = a;
                 *tx = t;
                 return 1;
@@ -78,8 +79,7 @@ int hap_net_probe(hap_net_info_t *out) {
     d = opendir(SYS_NET);
     if (!d) return HAP_OK;
 
-    while ((e = readdir(d)) != NULL &&
-           idx < sizeof(out->ifaces)/sizeof(out->ifaces[0])) {
+    while ((e = readdir(d)) != NULL && idx < sizeof(out->ifaces) / sizeof(out->ifaces[0])) {
         if (e->d_name[0] == '.') continue;
 
         hap_net_iface_t *nic = &out->ifaces[idx];
@@ -89,12 +89,12 @@ int hap_net_probe(hap_net_info_t *out) {
         /* 运行状态 */
         snprintf(path, sizeof(path), SYS_NET_OP, SYS_NET, e->d_name);
         if (hap_read_file(path, val, sizeof(val)) > 0) {
-            while (val[strlen(val)-1] == '\n') val[strlen(val)-1] = '\0';
-            if (strstr(val, "up") || strstr(val, "unknown"))
-                nic->is_running = 1;
+            while (val[strlen(val) - 1] == '\n')
+                val[strlen(val) - 1] = '\0';
+            if (strstr(val, "up") || strstr(val, "unknown")) nic->is_running = 1;
         }
         /* 管理状态：IFF_UP 通过 ioctl 获取 */
-        nic->is_up = 1;   /* 简化判断：不为 down 即认为可用 */
+        nic->is_up = 1; /* 简化判断：不为 down 即认为可用 */
 
         /* MTU */
         snprintf(path, sizeof(path), SYS_NET_MTU, SYS_NET, e->d_name);
@@ -105,13 +105,17 @@ int hap_net_probe(hap_net_info_t *out) {
         snprintf(path, sizeof(path), SYS_NET_MAC, SYS_NET, e->d_name);
         if (hap_read_file(path, val, sizeof(val)) > 0) {
             char *p = val + strlen(val);
-            while (p > val && isspace((unsigned char)p[-1])) { p--; *p = '\0'; }
+            while (p > val && isspace((unsigned char)p[-1])) {
+                p--;
+                *p = '\0';
+            }
             strncpy(nic->mac, val, sizeof(nic->mac) - 1);
         }
         /* IP */
         hap_net_ip(e->d_name, nic->ip, sizeof(nic->ip));
         /* 收发字节 */
-        if (hap_net_octets(e->d_name, &nic->rx_bytes, &nic->tx_bytes)) {}
+        if (hap_net_octets(e->d_name, &nic->rx_bytes, &nic->tx_bytes)) {
+        }
 
         idx++;
     }

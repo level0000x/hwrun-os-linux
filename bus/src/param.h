@@ -38,12 +38,12 @@ typedef struct hw_param_watcher {
 
 /* 参数上下文 */
 typedef struct hw_param_context {
-    hw_param_t *root;                     /* 参数树根 */
-    hw_param_watcher_t *watchers;         /* 监听器   */
-    hw_locker_t lock;                     /* HWLOCK_RW：保护参数树与 watchers */
-    char dirs[HWPARAM_SRC_MAX][256];      /* 各来源目录 */
-    char git_state_file[256];             /* git 状态文件 */
-    int  initialized;
+    hw_param_t *root;                /* 参数树根 */
+    hw_param_watcher_t *watchers;    /* 监听器   */
+    hw_locker_t lock;                /* HWLOCK_RW：保护参数树与 watchers */
+    char dirs[HWPARAM_SRC_MAX][256]; /* 各来源目录 */
+    char git_state_file[256];        /* git 状态文件 */
+    int initialized;
 
     /* 参数树变更钩子（bus 在 init 后装配，用于 GIT 自动 commit 等）。
      * param 属第 1 环，不依赖 GIT，只把"参数被改动"事件在此转发出去；

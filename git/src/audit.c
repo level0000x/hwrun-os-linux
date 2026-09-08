@@ -14,17 +14,17 @@
 #define PLUGIN_ID "git"
 
 /* 简单提取 JSON 字段值 */
-static void extract_field(const char *text, const char *key,
-                          char *out, size_t cap) {
+static void extract_field(const char *text, const char *key, char *out, size_t cap) {
     size_t klen = strlen(key);
     const char *p = text;
     while ((p = strstr(p, key)) != NULL) {
         /* 匹配 "key": 前缀，避免误配子串 */
-        if ((p == text || p[-1] == '{' || p[-1] == ',' || p[-1] == '[') &&
-            p[klen] == '"' && p[klen + 1] == ':') {
+        if ((p == text || p[-1] == '{' || p[-1] == ',' || p[-1] == '[') && p[klen] == '"' &&
+            p[klen + 1] == ':') {
             const char *v = p + klen + 2;
             const char *q = v;
-            while (*q && *q != '"') q++;
+            while (*q && *q != '"')
+                q++;
             size_t n = (size_t)(q - v);
             if (n >= cap) n = cap - 1;
             memcpy(out, v, n);
@@ -57,8 +57,11 @@ git_audit_entry_t *git_ops_audit(int limit, const char *user, uint64_t since) {
     char ch;
     int prev_nl = 1;
     while ((ch = (char)fgetc(fp)) != EOF) {
-        if (ch == '\n') { total++; prev_nl = 1; }
-        else prev_nl = 0;
+        if (ch == '\n') {
+            total++;
+            prev_nl = 1;
+        } else
+            prev_nl = 0;
     }
     if (!prev_nl) total++;
     if (limit > 0 && total > limit) {
@@ -101,14 +104,18 @@ git_audit_entry_t *git_ops_audit(int limit, const char *user, uint64_t since) {
         extract_field(line, "result", e->result, sizeof(e->result));
 
         /* 过滤 */
-        if ((user && user[0] && strcmp(e->user, user) != 0) ||
-            (since && e->timestamp < since)) {
+        if ((user && user[0] && strcmp(e->user, user) != 0) || (since && e->timestamp < since)) {
             free(e);
             continue;
         }
 
-        if (tail) { tail->next = e; tail = e; }
-        else      { head = e;       tail = e; }
+        if (tail) {
+            tail->next = e;
+            tail = e;
+        } else {
+            head = e;
+            tail = e;
+        }
     }
     fclose(fp);
     return head;

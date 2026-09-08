@@ -29,8 +29,7 @@ static inline size_t hap_read_file(const char *path, char *buf, size_t cap) {
 
 /* 在某配置文件中查找 "key" 并将其对应值（跳过空白到行尾）填入 out。
  * 返回 1 找到，0 未找到。 */
-static inline int hap_line_value(const char *cfg, const char *key,
-                                 char *out, size_t cap) {
+static inline int hap_line_value(const char *cfg, const char *key, char *out, size_t cap) {
     const char *p = cfg;
     size_t klen = strlen(key);
     char *val;
@@ -43,14 +42,18 @@ static inline int hap_line_value(const char *cfg, const char *key,
         if (linelen > klen && strncmp(p, key, klen) == 0 &&
             (p[klen] == ':' || p[klen] == '=' || isspace((unsigned char)p[klen]))) {
             const char *vp = p + klen;
-            while (*vp == ':' || *vp == '=' || isspace((unsigned char)*vp)) vp++;
+            while (*vp == ':' || *vp == '=' || isspace((unsigned char)*vp))
+                vp++;
             val = out;
             while (*vp && *vp != '\n' && (size_t)(val - out) < cap - 1) {
                 *val++ = *vp++;
             }
             *val = '\0';
             /* 去掉尾部空白 */
-            while (val > out && isspace((unsigned char)val[-1])) { val--; *val = '\0'; }
+            while (val > out && isspace((unsigned char)val[-1])) {
+                val--;
+                *val = '\0';
+            }
             return 1;
         }
         if (!nl) break;

@@ -214,7 +214,7 @@ static void test_param_file_roundtrip(void **state) {
 
 /* ---- mark_revision 钩子：装配 on_revision 后 set_value 触发，带 reason ---- */
 typedef struct rev_rec {
-    int  calls;
+    int calls;
     char last_reason[128];
 } rev_rec_t;
 
@@ -232,15 +232,15 @@ static void test_param_revision_hook(void **state) {
     assert_int_equal(hw_param_init(&ctx, NULL), HWRUN_OK);
 
     /* 未装配钩子：set_value 正常，不崩 */
-    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v1",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v1", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
 
     /* 装配后：每次成功 set_value 回调一次，reason = 变更 key */
     memset(&rec, 0, sizeof(rec));
     ctx.on_revision = rev_cb;
     ctx.revision_userdata = &rec;
-    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v2",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v2", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
     assert_int_equal(rec.calls, 1);
     assert_string_equal(rec.last_reason, "rev.key");
 

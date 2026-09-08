@@ -33,8 +33,7 @@ static int crypto_plugin_init(hw_plugin_t *self) {
     (void)self;
     g_plugin_state = HWPLUGIN_LOADED;
     HWAPI_LOGI("crypto", "init: provider=%s",
-               HWAPI_PARAM_GET("crypto.provider") ? HWAPI_PARAM_GET("crypto.provider")
-                                                  : "openssl");
+               HWAPI_PARAM_GET("crypto.provider") ? HWAPI_PARAM_GET("crypto.provider") : "openssl");
     return HWRUN_OK;
 }
 
@@ -57,38 +56,37 @@ static int crypto_plugin_destroy(hw_plugin_t *self) {
 }
 
 /* 参数变更回调：当前无配置项，返回 0 表示接受 */
-static int crypto_plugin_configure(hw_plugin_t *self,
-                                   const char *key, const char *value) {
-    (void)self; (void)key; (void)value;
+static int crypto_plugin_configure(hw_plugin_t *self, const char *key, const char *value) {
+    (void)self;
+    (void)key;
+    (void)value;
     return HWRUN_OK;
 }
 
 /* get_interface：对外提供 CRYPTO 协议接口指针 */
 static void *crypto_plugin_get_interface(const char *protocol) {
     if (!protocol) return NULL;
-    if (strcmp(protocol, HWPROTO_CRYPTO) == 0)
-        return &hw_crypto_ops;
+    if (strcmp(protocol, HWPROTO_CRYPTO) == 0) return &hw_crypto_ops;
     return NULL;
 }
 
 /* 生命周期 ops 表：由 SDK 宏装配进描述符 */
 static hw_plugin_ops_t g_ops = {
-    .init          = crypto_plugin_init,
-    .start         = crypto_plugin_start,
-    .stop          = crypto_plugin_stop,
-    .destroy       = crypto_plugin_destroy,
-    .configure     = crypto_plugin_configure,
+    .init = crypto_plugin_init,
+    .start = crypto_plugin_start,
+    .stop = crypto_plugin_stop,
+    .destroy = crypto_plugin_destroy,
+    .configure = crypto_plugin_configure,
     .get_interface = crypto_plugin_get_interface,
 };
 
 /* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据，与 plugin.yml 一致） */
-static const char *const g_provides[] = { "CRYPTO", NULL };
-static const char *const g_requires[] = { "SP", "PARAM", "LOG", "METAPROTO", NULL };
+static const char *const g_provides[] = {"CRYPTO", NULL};
+static const char *const g_requires[] = {"SP", "PARAM", "LOG", "METAPROTO", NULL};
 
 HWRUN_PLUGIN_BIND()
 HWRUN_PLUGIN_DEFINE(
-    "crypto", "Cryptographic Protocol (SP submodule)", "1.0.0",
-    HWPLUGIN_TYPE_CRYPTO,
+    "crypto", "Cryptographic Protocol (SP submodule)", "1.0.0", HWPLUGIN_TYPE_CRYPTO,
     "HWRun OS CRYPTO protocol: symmetric/asymmetric encryption, hash, HMAC, sign, key mgmt, RNG",
     &g_ops, g_provides, g_requires)
 

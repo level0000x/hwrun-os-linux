@@ -18,19 +18,19 @@
 #include <sys/types.h>
 
 /* pmp_proc.c 提供的 spawn 封装（fork+exec / CreateProcess 兜底） */
-extern int pmp_spawn(const char *path, char * const argv[], int *out_pid);
+extern int pmp_spawn(const char *path, char *const argv[], int *out_pid);
 
-#define PMP_TASK_TABLE_MAX   1024
+#define PMP_TASK_TABLE_MAX 1024
 
 /* 内部任务表条目 */
 typedef struct pmp_task_entry {
-    int             used;
-    uint64_t        id;               /* 全局唯一任务 ID       */
-    char            name[64];
-    char            path[256];
-    int32_t         pid;              /* 操作系统 PID          */
-    pmp_task_status_t state;          /* 任务状态              */
-    int             exit_status;      /* 退出状态              */
+    int used;
+    uint64_t id; /* 全局唯一任务 ID       */
+    char name[64];
+    char path[256];
+    int32_t pid;             /* 操作系统 PID          */
+    pmp_task_status_t state; /* 任务状态              */
+    int exit_status;         /* 退出状态              */
     struct pmp_task_entry *next;
 } pmp_task_entry_t;
 
@@ -40,7 +40,11 @@ static uint64_t g_task_seq = 0;
 /* 内部：创建/销毁任务表头 */
 void pmp_task_deinit(void) {
     pmp_task_entry_t *e = g_task_table, *nx;
-    while (e) { nx = e->next; free(e); e = nx; }
+    while (e) {
+        nx = e->next;
+        free(e);
+        e = nx;
+    }
     g_task_table = NULL;
 }
 
@@ -61,10 +65,10 @@ static void task_reap(void) {
     if (r <= 0) return;
     for (pmp_task_entry_t *e = g_task_table; e; e = e->next) {
         if (e->used && (int32_t)r == e->pid) {
-            e->state = (WIFEXITED(st) && WEXITSTATUS(st) == 0)
-                           ? PMP_TASK_STATUS_FINISHED : PMP_TASK_STATUS_FAILED;
-            e->exit_status = WIFEXITED(st) ? WEXITSTATUS(st)
-                                           : (WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+            e->state = (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? PMP_TASK_STATUS_FINISHED
+                                                               : PMP_TASK_STATUS_FAILED;
+            e->exit_status =
+                WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? WTERMSIG(st) : -1);
             break;
         }
     }
@@ -73,10 +77,12 @@ static void task_reap(void) {
 /* ============================================================
  * 提交任务：后台运行 path，返回任务 ID
  * ============================================================ */
-uint64_t pmp_task_submit(const char *name, const char *path,
-                         char * const argv[], int *out_err) {
+uint64_t pmp_task_submit(const char *name, const char *path, char *const argv[], int *out_err) {
     int pid;
-    if (!path) { if (out_err) *out_err = -1; return 0; }
+    if (!path) {
+        if (out_err) *out_err = -1;
+        return 0;
+    }
 
     int rc = pmp_spawn(path, argv, &pid);
     if (rc != 0 || pid < 0) {
@@ -86,14 +92,19 @@ uint64_t pmp_task_submit(const char *name, const char *path,
 
     /* 登记进任务表 */
     pmp_task_entry_t *e = (pmp_task_entry_t *)calloc(1, sizeof(*e));
-    if (!e) { if (out_err) *out_err = -3; return 0; }
+    if (!e) {
+        if (out_err) *out_err = -3;
+        return 0;
+    }
     e->used = 1;
     e->id = ++g_task_seq;
     e->pid = (int32_t)pid;
     e->state = PMP_TASK_STATUS_RUNNING;
     e->exit_status = 0;
-    if (name) snprintf(e->name, sizeof(e->name), "%s", name);
-    else      snprintf(e->name, sizeof(e->name), "%s", path);
+    if (name)
+        snprintf(e->name, sizeof(e->name), "%s", name);
+    else
+        snprintf(e->name, sizeof(e->name), "%s", path);
     snprintf(e->path, sizeof(e->path), "%s", path);
     e->next = g_task_table;
     g_task_table = e;
@@ -104,9 +115,9 @@ uint64_t pmp_task_submit(const char *name, const char *path,
 
 int pmp_task_cancel(uint64_t task_id) {
     pmp_task_entry_t *e = task_find(task_id);
-    if (!e) return -2;                 /* HWRUN_ENOENT */
+    if (!e) return -2; /* HWRUN_ENOENT */
     if (e->state != PMP_TASK_STATUS_RUNNING && e->state != PMP_TASK_STATUS_PENDING)
-        return -1;                     /* HWRUN_EINVAL（已结束） */
+        return -1; /* HWRUN_EINVAL（已结束） */
     if (e->pid > 0) {
         kill((pid_t)e->pid, SIGTERM);
         /* 轻微等待，避免立即回收（非阻塞） */
@@ -117,8 +128,11 @@ int pmp_task_cancel(uint64_t task_id) {
 
 int pmp_task_status(uint64_t task_id, pmp_task_info_t *out) {
     pmp_task_entry_t *e = task_find(task_id);
-    if (!e) { if (out) memset(out, 0, sizeof(*out)); return -ENOENT; }
-    task_reap();                        /* 惰性回收 */
+    if (!e) {
+        if (out) memset(out, 0, sizeof(*out));
+        return -ENOENT;
+    }
+    task_reap(); /* 惰性回收 */
     if (out) {
         memset(out, 0, sizeof(*out));
         out->id = e->id;

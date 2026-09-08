@@ -18,18 +18,29 @@
 #include <sys/stat.h>
 
 static int failures = 0;
-#define CHECK(cond, msg) do { \
-    if (cond) printf("[OK]   %s\n", msg); \
-    else { printf("[FAIL] %s\n", msg); failures++; } \
-} while (0)
+#define CHECK(cond, msg)                                                                           \
+    do {                                                                                           \
+        if (cond)                                                                                  \
+            printf("[OK]   %s\n", msg);                                                            \
+        else {                                                                                     \
+            printf("[FAIL] %s\n", msg);                                                            \
+            failures++;                                                                            \
+        }                                                                                          \
+    } while (0)
 
 int main(void) {
-    setbuf(stdout, NULL);   /* 逐行输出，便于定位崩溃点 */
+    setbuf(stdout, NULL); /* 逐行输出，便于定位崩溃点 */
     void *h = dlopen("./build/fsp.so", RTLD_NOW);
-    if (!h) { printf("dlopen failed: %s\n", dlerror()); return 1; }
+    if (!h) {
+        printf("dlopen failed: %s\n", dlerror());
+        return 1;
+    }
 
     hw_plugin_t *(*entry)(void) = (void *)dlsym(h, "hw_plugin_entry");
-    if (!entry) { printf("no hw_plugin_entry: %s\n", dlerror()); return 1; }
+    if (!entry) {
+        printf("no hw_plugin_entry: %s\n", dlerror());
+        return 1;
+    }
 
     hw_plugin_t *self = entry();
     CHECK(self != NULL, "hw_plugin_entry() 返回非空");
@@ -53,7 +64,8 @@ int main(void) {
     CHECK(w == (ssize_t)strlen(msg), "write 写入全部字节");
     ops->close(fd);
 
-    fsp_stat_t st; memset(&st, 0, sizeof(st));
+    fsp_stat_t st;
+    memset(&st, 0, sizeof(st));
     CHECK(ops->stat(path, &st) == 0, "stat 成功");
     CHECK(st.size == strlen(msg), "stat.size == 写入字节数");
 

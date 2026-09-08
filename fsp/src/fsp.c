@@ -40,7 +40,7 @@ static int fsp_init(hw_plugin_t *self) {
                HWAPI_PARAM_GET("fsp.root") ? HWAPI_PARAM_GET("fsp.root") : "/");
 
     self->state = HWPLUGIN_LOADED;
-    return HWRUN_OK;   /* 成功 */
+    return HWRUN_OK; /* 成功 */
 }
 
 static int fsp_start(hw_plugin_t *self) {
@@ -76,19 +76,18 @@ static int fsp_destroy(hw_plugin_t *self) {
 
 /* 取得对外提供的协议接口实现指针 */
 static void *fsp_get_interface(const char *protocol) {
-    if (protocol && strcmp(protocol, HWPROTO_FSP) == 0)
-        return &g_fsp_ops;
+    if (protocol && strcmp(protocol, HWPROTO_FSP) == 0) return &g_fsp_ops;
     return NULL;
 }
 
 /* 生命周期回调表（SDK 宏将其拷贝进描述符 g_hwplugin.ops） */
 static hw_plugin_ops_t fsp_ops = {
-    .init         = fsp_init,
-    .start        = fsp_start,
-    .stop         = fsp_stop,
-    .destroy      = fsp_destroy,
-    .configure    = fsp_configure,
-    .get_interface= fsp_get_interface,
+    .init = fsp_init,
+    .start = fsp_start,
+    .stop = fsp_stop,
+    .destroy = fsp_destroy,
+    .configure = fsp_configure,
+    .get_interface = fsp_get_interface,
 };
 
 /* ============================================================
@@ -97,12 +96,11 @@ static hw_plugin_ops_t fsp_ops = {
 HWRUN_PLUGIN_BIND()
 
 /* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
-static const char *const g_provides[] = { HWPROTO_FSP, NULL };
+static const char *const g_provides[] = {HWPROTO_FSP, NULL};
 static const char *const g_requires[] = {
-    HWPROTO_HAP, HWPROTO_PMP, HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO,
-    NULL,
+    HWPROTO_HAP, HWPROTO_PMP, HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO, NULL,
 };
 
 HWRUN_PLUGIN_DEFINE("fsp", "FileSystem Protocol", "1.0.0", HWPLUGIN_TYPE_FS,
-                    "HWRun OS 文件系统协议：文件/目录/权限/路径/挂载操作",
-                    &fsp_ops, g_provides, g_requires)
+                    "HWRun OS 文件系统协议：文件/目录/权限/路径/挂载操作", &fsp_ops, g_provides,
+                    g_requires)

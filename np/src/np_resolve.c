@@ -16,8 +16,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
-int np_resolve_impl(const char *host, unsigned port,
-                    struct sockaddr_storage *out, int max, int *out_count) {
+int np_resolve_impl(const char *host, unsigned port, struct sockaddr_storage *out, int max,
+                    int *out_count) {
     if (!host || !out || !out_count) return -EINVAL;
     if (max <= 0) return -EINVAL;
 
@@ -27,11 +27,11 @@ int np_resolve_impl(const char *host, unsigned port,
     snprintf(serv, sizeof(serv), "%u", port);
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;      /* 同时解析 IPv4/IPv6 */
+    hints.ai_family = AF_UNSPEC; /* 同时解析 IPv4/IPv6 */
     hints.ai_socktype = SOCK_STREAM;
 
     int rc = getaddrinfo(host, serv, &hints, &res);
-    if (rc != 0) return -EINVAL;      /* EAI_* 与 errno 不通用，统一映射 */
+    if (rc != 0) return -EINVAL; /* EAI_* 与 errno 不通用，统一映射 */
 
     int n = 0;
     for (ai = res; ai && n < max; ai = ai->ai_next) {

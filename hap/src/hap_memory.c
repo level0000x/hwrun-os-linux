@@ -26,17 +26,17 @@ int hap_memory_probe(hap_memory_info_t *out) {
     memset(out, 0, sizeof(hap_memory_info_t));
 
     if (hap_read_file(PROC_MEMINFO, meminfo, sizeof(meminfo)) > 0) {
-        out->total_kb     = hap_mem_key_kb(meminfo, "MemTotal");
-        out->free_kb      = hap_mem_key_kb(meminfo, "MemFree");
+        out->total_kb = hap_mem_key_kb(meminfo, "MemTotal");
+        out->free_kb = hap_mem_key_kb(meminfo, "MemFree");
         /* MemAvailable 是较新内核字段，读取不到时退化为 MemFree */
         out->available_kb = hap_mem_key_kb(meminfo, "MemAvailable");
         if (out->available_kb == 0 && out->total_kb > 0) {
             out->available_kb = out->free_kb;
         }
         out->swap_total_kb = hap_mem_key_kb(meminfo, "SwapTotal");
-        out->swap_free_kb  = hap_mem_key_kb(meminfo, "SwapFree");
-        out->used_kb       = (out->total_kb > out->available_kb)
-                             ? (out->total_kb - out->available_kb) : 0;
+        out->swap_free_kb = hap_mem_key_kb(meminfo, "SwapFree");
+        out->used_kb =
+            (out->total_kb > out->available_kb) ? (out->total_kb - out->available_kb) : 0;
     }
 
     /* 内存类型无法从 /proc 可靠读取；留空表示未知 */

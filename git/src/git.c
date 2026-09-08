@@ -19,8 +19,8 @@
 #include "git.h"
 #include "git_internal.h"
 
-#define PLUGIN_ID  "git"
-#define GIT_PROTO  "GIT"
+#define PLUGIN_ID "git"
+#define GIT_PROTO "GIT"
 
 /* 子模块实现（见 src 下各 .c 文件） */
 /* storage.c */
@@ -37,11 +37,11 @@ extern int git_ops_reset(const char *ref, int hard);
 extern int git_ops_revert(const char *commit);
 /* history.c */
 extern git_commit_t *git_ops_log(int limit, const char *since);
-extern git_blame_t  *git_ops_blame(const char *file);
-extern char         *git_ops_diff(const char *c1, const char *c2);
-extern void          git_ops_free_commits(git_commit_t *head);
-extern void          git_ops_free_blame(git_blame_t *head);
-extern char         *git_ops_status(void);
+extern git_blame_t *git_ops_blame(const char *file);
+extern char *git_ops_diff(const char *c1, const char *c2);
+extern void git_ops_free_commits(git_commit_t *head);
+extern void git_ops_free_blame(git_blame_t *head);
+extern char *git_ops_status(void);
 /* branch.c */
 extern int git_ops_branch(const char *name, const char *base);
 extern int git_ops_merge(const char *branch, const char *message);
@@ -49,8 +49,7 @@ extern int git_ops_merge(const char *branch, const char *message);
 extern uint64_t git_ops_size(void);
 extern int git_ops_compact(int level, uint64_t *old_size, uint64_t *new_size);
 /* audit.c */
-extern git_audit_entry_t *git_ops_audit(int limit, const char *user,
-                                        uint64_t since);
+extern git_audit_entry_t *git_ops_audit(int limit, const char *user, uint64_t since);
 extern void git_ops_free_audit(git_audit_entry_t *head);
 
 /* 协议接口：返回当前配置（本文件实现） */
@@ -62,36 +61,36 @@ static git_config_t *git_ops_get_config(void);
 static hw_git_ops_t g_ops;
 
 static void git_ops_init_table(void) {
-    g_ops.init      = git_ops_init;
-    g_ops.clone     = git_ops_clone;
-    g_ops.add       = git_ops_add;
-    g_ops.commit    = git_ops_commit;
-    g_ops.push      = git_ops_push;
-    g_ops.pull      = git_ops_pull;
+    g_ops.init = git_ops_init;
+    g_ops.clone = git_ops_clone;
+    g_ops.add = git_ops_add;
+    g_ops.commit = git_ops_commit;
+    g_ops.push = git_ops_push;
+    g_ops.pull = git_ops_pull;
 
-    g_ops.tag       = git_ops_tag;
-    g_ops.checkout  = git_ops_checkout;
-    g_ops.reset     = git_ops_reset;
-    g_ops.revert    = git_ops_revert;
+    g_ops.tag = git_ops_tag;
+    g_ops.checkout = git_ops_checkout;
+    g_ops.reset = git_ops_reset;
+    g_ops.revert = git_ops_revert;
 
-    g_ops.log       = git_ops_log;
-    g_ops.blame     = git_ops_blame;
-    g_ops.diff      = git_ops_diff;
+    g_ops.log = git_ops_log;
+    g_ops.blame = git_ops_blame;
+    g_ops.diff = git_ops_diff;
 
-    g_ops.branch    = git_ops_branch;
-    g_ops.merge     = git_ops_merge;
+    g_ops.branch = git_ops_branch;
+    g_ops.merge = git_ops_merge;
 
-    g_ops.size      = git_ops_size;
-    g_ops.compact   = git_ops_compact;
-    g_ops.status    = git_ops_status;
+    g_ops.size = git_ops_size;
+    g_ops.compact = git_ops_compact;
+    g_ops.status = git_ops_status;
 
-    g_ops.audit     = git_ops_audit;
+    g_ops.audit = git_ops_audit;
 
     g_ops.free_commits = git_ops_free_commits;
-    g_ops.free_blame   = git_ops_free_blame;
-    g_ops.free_audit   = git_ops_free_audit;
+    g_ops.free_blame = git_ops_free_blame;
+    g_ops.free_audit = git_ops_free_audit;
 
-    g_ops.get_config   = git_ops_get_config;
+    g_ops.get_config = git_ops_get_config;
 }
 
 /* 确保仓库存在（.git 目录），不存在则初始化 */
@@ -116,8 +115,7 @@ static int git_plugin_init(hw_plugin_t *self) {
     git_ops_init_table();
     /* 确保主仓库与审计目录存在 */
     ensure_repo();
-    git_audit_write(&git_g_ctx, "system", "init", git_g_ctx.repo_path,
-                    "GIT 插件初始化", 1);
+    git_audit_write(&git_g_ctx, "system", "init", git_g_ctx.repo_path, "GIT 插件初始化", 1);
     git_g_ctx.initialized = 1;
     HWAPI_LOGI("git", "init: repo=%s", git_g_ctx.repo_path);
     return HWRUN_OK;
@@ -131,8 +129,7 @@ static int git_plugin_start(hw_plugin_t *self) {
 static int git_plugin_stop(hw_plugin_t *self) {
     (void)self;
     if (git_g_ctx.initialized) {
-        git_audit_write(&git_g_ctx, "system", "stop", git_g_ctx.repo_path,
-                        "GIT 插件停止", 1);
+        git_audit_write(&git_g_ctx, "system", "stop", git_g_ctx.repo_path, "GIT 插件停止", 1);
         git_g_ctx.initialized = 0;
     }
     return HWRUN_OK;
@@ -160,11 +157,11 @@ static git_config_t *git_ops_get_config(void) {
    插件生命周期回调表（hw_plugin_ops_t，SDK 宏将其拷贝进描述符）
    ============================================================ */
 static hw_plugin_ops_t g_ops_desc = {
-    .init          = git_plugin_init,
-    .start         = git_plugin_start,
-    .stop          = git_plugin_stop,
-    .destroy       = git_plugin_destroy,
-    .configure     = NULL,
+    .init = git_plugin_init,
+    .start = git_plugin_start,
+    .stop = git_plugin_stop,
+    .destroy = git_plugin_destroy,
+    .configure = NULL,
     .get_interface = git_plugin_get_interface,
 };
 
@@ -174,11 +171,14 @@ static hw_plugin_ops_t g_ops_desc = {
 HWRUN_PLUGIN_BIND()
 
 /* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
-static const char *const g_provides[] = { GIT_PROTO, NULL };
+static const char *const g_provides[] = {GIT_PROTO, NULL};
 static const char *const g_requires[] = {
-    HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO, NULL,
+    HWPROTO_LOG,
+    HWPROTO_PARAM,
+    HWPROTO_METAPROTO,
+    NULL,
 };
 
 HWRUN_PLUGIN_DEFINE("git", "Git 版本控制", "1.0.0", HWPLUGIN_TYPE_GIT,
-                    "系统 Git 命令的封装层 + 审计日志 + 自动历史管理",
-                    &g_ops_desc, g_provides, g_requires)
+                    "系统 Git 命令的封装层 + 审计日志 + 自动历史管理", &g_ops_desc, g_provides,
+                    g_requires)

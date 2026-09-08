@@ -36,7 +36,7 @@ uint64_t git_ops_size(void) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
         if (!strncmp(line, "size-pack:", 10)) {
-            size = strtoull(line + 10, NULL, 10) * 1024;   /* KB → B */
+            size = strtoull(line + 10, NULL, 10) * 1024; /* KB → B */
         }
         line = nl ? nl + 1 : NULL;
     }
@@ -76,8 +76,8 @@ int git_ops_compact(int level, uint64_t *old_size, uint64_t *new_size) {
         /* 若系统装有 git-filter-repo，执行真实的陈旧历史扁平化：
            将当前分支历史重写为单一更扁的结构，保留工作区快照。
            失败时仅告警，不影响后续 repack/gc。 */
-        git_result_t *fr = git_exec(NULL,
-            "filter-repo --force --refs HEAD --replace-refs delete-no-add");
+        git_result_t *fr =
+            git_exec(NULL, "filter-repo --force --refs HEAD --replace-refs delete-no-add");
         if (fr) {
             git_result_free(fr);
         }

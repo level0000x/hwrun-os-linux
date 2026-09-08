@@ -15,7 +15,7 @@
 
 /* 定长连接表 */
 static np_socket_t s_conns[NP_CONN_CAP];
-static int         s_count = 0;
+static int s_count = 0;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 找到 fd 对应的下标；未找到返回 -1 */
@@ -47,17 +47,23 @@ int np_conn_register(const np_socket_t *c) {
 int np_conn_update_state(int fd, np_sock_state_t st) {
     pthread_mutex_lock(&s_lock);
     int i = find_index(fd);
-    if (i < 0) { pthread_mutex_unlock(&s_lock); return -ENOENT; }
+    if (i < 0) {
+        pthread_mutex_unlock(&s_lock);
+        return -ENOENT;
+    }
     s_conns[i].state = st;
     pthread_mutex_unlock(&s_lock);
     return 0;
 }
 
-int np_conn_set_addresses(int fd, const char *remote_ip, unsigned remote_port,
-                          const char *local_ip, unsigned local_port) {
+int np_conn_set_addresses(int fd, const char *remote_ip, unsigned remote_port, const char *local_ip,
+                          unsigned local_port) {
     pthread_mutex_lock(&s_lock);
     int i = find_index(fd);
-    if (i < 0) { pthread_mutex_unlock(&s_lock); return -ENOENT; }
+    if (i < 0) {
+        pthread_mutex_unlock(&s_lock);
+        return -ENOENT;
+    }
     if (remote_ip) {
         strncpy(s_conns[i].remote_ip, remote_ip, sizeof(s_conns[i].remote_ip) - 1);
         s_conns[i].remote_ip[sizeof(s_conns[i].remote_ip) - 1] = '\0';
@@ -79,7 +85,10 @@ int np_conn_set_local(int fd, const char *local_ip, unsigned local_port) {
 int np_conn_unregister(int fd) {
     pthread_mutex_lock(&s_lock);
     int i = find_index(fd);
-    if (i < 0) { pthread_mutex_unlock(&s_lock); return -ENOENT; }
+    if (i < 0) {
+        pthread_mutex_unlock(&s_lock);
+        return -ENOENT;
+    }
     /* 用末尾元素覆盖，避免搬移 */
     s_conns[i] = s_conns[s_count - 1];
     s_count--;
@@ -97,7 +106,10 @@ int np_conn_get(int fd, np_socket_t *out) {
     if (!out) return -EINVAL;
     pthread_mutex_lock(&s_lock);
     int i = find_index(fd);
-    if (i < 0) { pthread_mutex_unlock(&s_lock); return -ENOENT; }
+    if (i < 0) {
+        pthread_mutex_unlock(&s_lock);
+        return -ENOENT;
+    }
     *out = s_conns[i];
     pthread_mutex_unlock(&s_lock);
     return 0;

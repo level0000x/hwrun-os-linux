@@ -14,11 +14,11 @@
 #include <dirent.h>
 #include <sys/statvfs.h>
 
-#define SYS_BLOCK         "/sys/block"
-#define SYS_DEV_MODEL     "%s/%s/device/model"
-#define SYS_DEV_SERIAL    "%s/%s/device/serial"
-#define SYS_DEV_SIZE      "%s/%s/size"
-#define PROC_MOUNTS       "/proc/mounts"
+#define SYS_BLOCK "/sys/block"
+#define SYS_DEV_MODEL "%s/%s/device/model"
+#define SYS_DEV_SERIAL "%s/%s/device/serial"
+#define SYS_DEV_SIZE "%s/%s/size"
+#define PROC_MOUNTS "/proc/mounts"
 
 /* 简单判断挂载源是否命中块设备名（如 /dev/sda1 命中 sda） */
 static int hap_mount_matches(const char *fsdev, const char *diskname) {
@@ -29,8 +29,7 @@ static int hap_mount_matches(const char *fsdev, const char *diskname) {
 }
 
 /* 从 statfs/路径读取挂载点使用情况；返回 0 表示命中并填充 */
-static int hap_stat_mount(const char *mp, uint64_t *used_mb,
-                          uint64_t *free_mb, double *pct) {
+static int hap_stat_mount(const char *mp, uint64_t *used_mb, uint64_t *free_mb, double *pct) {
 #if defined(_WIN32)
     return HAP_USERES;
 #else
@@ -38,11 +37,10 @@ static int hap_stat_mount(const char *mp, uint64_t *used_mb,
     unsigned long blksize;
     uint64_t total, used, avail;
     if (statvfs(mp, &st) != 0 || st.f_blocks == 0) return HAP_USERES;
-    blksize = (unsigned long)st.f_frsize ? (unsigned long)st.f_frsize
-                                         : (unsigned long)st.f_bsize;
+    blksize = (unsigned long)st.f_frsize ? (unsigned long)st.f_frsize : (unsigned long)st.f_bsize;
     total = (uint64_t)st.f_blocks * blksize;
     avail = (uint64_t)st.f_bavail * blksize;
-    used  = (total > avail) ? (total - avail) : 0;
+    used = (total > avail) ? (total - avail) : 0;
     *used_mb = used / (1024ULL * 1024ULL);
     *free_mb = avail / (1024ULL * 1024ULL);
     *pct = total ? ((double)used / (double)total) * 100.0 : 0.0;
@@ -60,9 +58,9 @@ int hap_disk_probe(hap_disk_info_t *out) {
     memset(out, 0, sizeof(hap_disk_info_t));
 
     d = opendir(SYS_BLOCK);
-    if (!d) return HAP_OK;   /* 无 /sys/block（如 Windows） */
+    if (!d) return HAP_OK; /* 无 /sys/block（如 Windows） */
 
-    while ((e = readdir(d)) != NULL && idx < sizeof(out->devices)/sizeof(out->devices[0])) {
+    while ((e = readdir(d)) != NULL && idx < sizeof(out->devices) / sizeof(out->devices[0])) {
         /* 跳过虚拟设备与指针链接目录 */
         if (e->d_name[0] == '.') continue;
         /* 仅统计真实可容量设备：既非 loop/ram 分区，又有 size 文件 */
@@ -83,13 +81,19 @@ int hap_disk_probe(hap_disk_info_t *out) {
         snprintf(path, sizeof(path), SYS_DEV_MODEL, SYS_BLOCK, e->d_name);
         if (hap_read_file(path, val, sizeof(val)) > 0) {
             char *p = val + strlen(val);
-            while (p > val && isspace((unsigned char)p[-1])) { p--; *p = '\0'; }
+            while (p > val && isspace((unsigned char)p[-1])) {
+                p--;
+                *p = '\0';
+            }
             strncpy(dev->model, val, sizeof(dev->model) - 1);
         }
         snprintf(path, sizeof(path), SYS_DEV_SERIAL, SYS_BLOCK, e->d_name);
         if (hap_read_file(path, val, sizeof(val)) > 0) {
             char *p = val + strlen(val);
-            while (p > val && isspace((unsigned char)p[-1])) { p--; *p = '\0'; }
+            while (p > val && isspace((unsigned char)p[-1])) {
+                p--;
+                *p = '\0';
+            }
         }
 
         dev->available = 1;
@@ -115,13 +119,24 @@ int hap_disk_probe(hap_disk_info_t *out) {
                     char *sp;
                     /* device */
                     sp = strchr(t, ' ');
-                    if (sp) { *sp = '\0'; snprintf(fsdev, sizeof(fsdev), "%s", t); t = sp + 1; }
+                    if (sp) {
+                        *sp = '\0';
+                        snprintf(fsdev, sizeof(fsdev), "%s", t);
+                        t = sp + 1;
+                    }
                     /* mountpoint */
                     sp = strchr(t, ' ');
-                    if (sp) { *sp = '\0'; snprintf(mp, sizeof(mp), "%s", t); t = sp + 1; }
+                    if (sp) {
+                        *sp = '\0';
+                        snprintf(mp, sizeof(mp), "%s", t);
+                        t = sp + 1;
+                    }
                     /* fstype */
                     sp = strchr(t, ' ');
-                    if (sp) { *sp = '\0'; snprintf(fstype, sizeof(fstype), "%s", t); }
+                    if (sp) {
+                        *sp = '\0';
+                        snprintf(fstype, sizeof(fstype), "%s", t);
+                    }
                 }
                 if (mp[0]) {
                     for (uint32_t i = 0; i < idx; i++) {

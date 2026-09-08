@@ -38,14 +38,14 @@ static int fsp_list(const char *path, fsp_dirent_t *entries, int max) {
     while ((e = readdir(d))) {
         const char *nm = e->d_name;
         if (nm[0] == '.') {
-            if (nm[1] == '\0') continue;             /* .  */
+            if (nm[1] == '\0') continue;                 /* .  */
             if (nm[1] == '.' && nm[2] == '\0') continue; /* .. */
         }
-        if (n >= max) break;                          /* 缓冲区满，停止 */
+        if (n >= max) break; /* 缓冲区满，停止 */
 
         if (entries) {
             fsp_dirent_t *en = &entries[n];
-            en->ino  = (uint64_t)e->d_ino;
+            en->ino = (uint64_t)e->d_ino;
             en->type = (uint32_t)e->d_type;
             snprintf(en->name, sizeof(en->name), "%s", nm);
         }
@@ -56,8 +56,8 @@ static int fsp_list(const char *path, fsp_dirent_t *entries, int max) {
 }
 
 void hw_fsp_ops_dir_init(hw_fsp_ops_t *ops) {
-    ops->mkdir  = fsp_mkdir;
-    ops->rmdir  = fsp_rmdir;
+    ops->mkdir = fsp_mkdir;
+    ops->rmdir = fsp_rmdir;
     ops->exists = fsp_exists;
-    ops->list   = fsp_list;
+    ops->list = fsp_list;
 }

@@ -42,13 +42,11 @@ int git_ops_init(const char *path) {
         dir = git_g_ctx.repo_path;
     }
 
-    git_result_t *r = git_exec_audit(dir, "init", "system", "init",
-                                     path ? path : git_g_ctx.repo_path);
+    git_result_t *r =
+        git_exec_audit(dir, "init", "system", "init", path ? path : git_g_ctx.repo_path);
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
-    if (!r->success)
-        HWAPI_LOGE(PLUGIN_ID, "git init 失败: %s",
-                   r->stdout_buf ? r->stdout_buf : "");
+    if (!r->success) HWAPI_LOGE(PLUGIN_ID, "git init 失败: %s", r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -63,8 +61,7 @@ int git_ops_clone(const char *remote, const char *local_path) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        HWAPI_LOGE(PLUGIN_ID, "git clone 失败: %s",
-                   r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git clone 失败: %s", r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -123,13 +120,11 @@ int git_ops_push(const char *remote, const char *branch) {
             snprintf(cmd + n, sizeof(cmd) - n, " %s", branch);
         }
     }
-    git_result_t *r = git_exec_audit(NULL, cmd, "system", "push",
-                                     remote ? remote : git_g_ctx.config.remote_url);
+    git_result_t *r =
+        git_exec_audit(NULL, cmd, "system", "push", remote ? remote : git_g_ctx.config.remote_url);
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
-    if (!r->success)
-        HWAPI_LOGE(PLUGIN_ID, "git push 失败: %s",
-                   r->stdout_buf ? r->stdout_buf : "");
+    if (!r->success) HWAPI_LOGE(PLUGIN_ID, "git push 失败: %s", r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -144,13 +139,11 @@ int git_ops_pull(const char *remote, const char *branch) {
             snprintf(cmd + n, sizeof(cmd) - n, " %s", branch);
         }
     }
-    git_result_t *r = git_exec_audit(NULL, cmd, "system", "pull",
-                                     remote ? remote : git_g_ctx.config.remote_url);
+    git_result_t *r =
+        git_exec_audit(NULL, cmd, "system", "pull", remote ? remote : git_g_ctx.config.remote_url);
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
-    if (!r->success)
-        HWAPI_LOGE(PLUGIN_ID, "git pull 失败: %s",
-                   r->stdout_buf ? r->stdout_buf : "");
+    if (!r->success) HWAPI_LOGE(PLUGIN_ID, "git pull 失败: %s", r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }

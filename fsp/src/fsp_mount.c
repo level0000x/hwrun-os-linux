@@ -51,18 +51,18 @@ static int fsp_mount_list(fsp_mountinfo_t *infos, int max) {
         unescape(d, dev, sizeof(dev));
         unescape(m, mnt, sizeof(mnt));
         snprintf(fstype, sizeof(fstype), "%s", f);
-        snprintf(opts,   sizeof(opts),   "%s", o);
+        snprintf(opts, sizeof(opts), "%s", o);
         /* freq/passno 仅 /etc/fstab 有值，mounts 通常为 0 0 */
-        freq   = (unsigned)strtoul(fr, NULL, 10);
+        freq = (unsigned)strtoul(fr, NULL, 10);
         passno = (unsigned)strtoul(ps, NULL, 10);
 
         fsp_mountinfo_t *mi = &infos[count];
         memset(mi, 0, sizeof(*mi));
-        snprintf(mi->device,      sizeof(mi->device),      "%s", dev);
-        snprintf(mi->mountpoint,  sizeof(mi->mountpoint),  "%s", mnt);
-        snprintf(mi->fstype,      sizeof(mi->fstype),      "%s", fstype);
-        snprintf(mi->options,     sizeof(mi->options),     "%s", opts);
-        mi->freq   = freq;
+        snprintf(mi->device, sizeof(mi->device), "%s", dev);
+        snprintf(mi->mountpoint, sizeof(mi->mountpoint), "%s", mnt);
+        snprintf(mi->fstype, sizeof(mi->fstype), "%s", fstype);
+        snprintf(mi->options, sizeof(mi->options), "%s", opts);
+        mi->freq = freq;
         mi->passno = passno;
         count++;
     }

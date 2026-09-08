@@ -22,13 +22,12 @@
 #include "sp_internal.h"
 
 #define SP_CBC_IV_LEN 16
-#define SP_HMAC_LEN   32   /* HMAC-SHA256 */
+#define SP_HMAC_LEN 32 /* HMAC-SHA256 */
 
 /* ============================================================
  * 由单字节 tag 与 key 派生固定长度的子密钥（SHA-256）
  * ============================================================ */
-static int sp_derive_sub(const uint8_t *key, uint32_t key_len,
-                         uint8_t tag, uint8_t out[32]) {
+static int sp_derive_sub(const uint8_t *key, uint32_t key_len, uint8_t tag, uint8_t out[32]) {
     uint8_t buf[2048];
     if (key_len > 2000) return SP_EINVAL;
     memcpy(buf, key, key_len);
@@ -41,8 +40,7 @@ static int sp_derive_sub(const uint8_t *key, uint32_t key_len,
  * 计算 HMAC-SHA256( data )，key 为字节数组
  * 返回 32 字节摘要 out
  * ============================================================ */
-static int sp_hmac_sha256(const uint8_t *key, size_t key_len,
-                          const uint8_t *data, size_t data_len,
+static int sp_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len,
                           uint8_t out[32]) {
     if (key_len == 0 || key_len > 4096) return SP_EINVAL;
 
@@ -56,21 +54,26 @@ static int sp_hmac_sha256(const uint8_t *key, size_t key_len,
 
     /* HMAC key 走 hexkey，避免特殊字符进入命令行 */
     char cmd[16384];
-    snprintf(cmd, sizeof(cmd),
-             "openssl dgst -sha256 -mac HMAC -macopt hexkey:%s -r %s",
-             khex, sp_q(inpath, qbuf, sizeof(qbuf)));
+    snprintf(cmd, sizeof(cmd), "openssl dgst -sha256 -mac HMAC -macopt hexkey:%s -r %s", khex,
+             sp_q(inpath, qbuf, sizeof(qbuf)));
 
     char *outpath = sp_tmp_path(pout, sizeof(pout));
     int rc = sp_sh(cmd, outpath, NULL);
-    if (rc != 0) { unlink(inpath); unlink(outpath); return SP_EIO; }
+    if (rc != 0) {
+        unlink(inpath);
+        unlink(outpath);
+        return SP_EIO;
+    }
 
     char hex[512];
     ssize_t n = sp_read_text(outpath, hex, sizeof(hex));
-    unlink(inpath); unlink(outpath);
+    unlink(inpath);
+    unlink(outpath);
     if (n <= 0) return SP_EIO;
 
     char *tok = hex, *stop = hex;
-    while (*stop && *stop != ' ' && *stop != '\t' && *stop != '\n') stop++;
+    while (*stop && *stop != ' ' && *stop != '\t' && *stop != '\n')
+        stop++;
     *stop = 0;
     if ((size_t)(stop - tok) != 64) return SP_EIO;
 
@@ -85,14 +88,10 @@ static int sp_hmac_sha256(const uint8_t *key, size_t key_len,
  *  key: 调用方秘钥；iv: 16 字节（NULL 则由系统生成，但调用方需自行保留以解密）；
  *  aad: 附加认证数据（可空）；pt: 明文；ct/tag 为输出缓冲。
  * ============================================================ */
-int sp_encrypt(const uint8_t *key, uint32_t key_len,
-               const uint8_t *iv, uint32_t iv_len,
-               const uint8_t *aad, uint32_t aad_len,
-               const uint8_t *pt, uint32_t pt_len,
-               uint8_t *ct, uint32_t *ct_len,
-               uint8_t *tag, uint32_t *tag_len) {
-    if (!key || key_len == 0 || !pt || pt_len == 0 || !ct || !ct_len ||
-        !tag || !tag_len)
+int sp_encrypt(const uint8_t *key, uint32_t key_len, const uint8_t *iv, uint32_t iv_len,
+               const uint8_t *aad, uint32_t aad_len, const uint8_t *pt, uint32_t pt_len,
+               uint8_t *ct, uint32_t *ct_len, uint8_t *tag, uint32_t *tag_len) {
+    if (!key || key_len == 0 || !pt || pt_len == 0 || !ct || !ct_len || !tag || !tag_len)
         return SP_EINVAL;
 
     /* 派生加密/认证密钥 */
@@ -116,51 +115,84 @@ int sp_encrypt(const uint8_t *key, uint32_t key_len,
 
     int rc;
     char pip[8192], pct[8192];
-    char *inpath  = sp_tmp_path(pip, sizeof(pip));
-    char *ctpath  = sp_tmp_path(pct, sizeof(pct));
+    char *inpath = sp_tmp_path(pip, sizeof(pip));
+    char *ctpath = sp_tmp_path(pct, sizeof(pct));
     if (!inpath || !ctpath) return SP_EIO;
-    if (sp_write_all(inpath, pt, pt_len) != SP_OK) { rc = SP_EIO; goto out; }
+    if (sp_write_all(inpath, pt, pt_len) != SP_OK) {
+        rc = SP_EIO;
+        goto out;
+    }
 
     /* AES-256-CBC 加密 */
     char cmd[16384], qi[8192], qc[8192];
-    snprintf(cmd, sizeof(cmd),
-             "openssl enc -aes-256-cbc -K %s -iv %s -in %s -out %s",
-             keHex, ivHex, sp_q(inpath, qi, sizeof(qi)),
-             sp_q(ctpath, qc, sizeof(qc)));
+    snprintf(cmd, sizeof(cmd), "openssl enc -aes-256-cbc -K %s -iv %s -in %s -out %s", keHex, ivHex,
+             sp_q(inpath, qi, sizeof(qi)), sp_q(ctpath, qc, sizeof(qc)));
     rc = sp_sh(cmd, NULL, NULL);
-    if (rc != 0) { rc = SP_EIO; goto out; }
+    if (rc != 0) {
+        rc = SP_EIO;
+        goto out;
+    }
 
     /* 读取密文长度 */
     long ctSize = -1;
     {
         FILE *f = fopen(ctpath, "rb");
-        if (!f) { rc = SP_EIO; goto out; }
-        fseek(f, 0, SEEK_END); ctSize = ftell(f); fclose(f);
+        if (!f) {
+            rc = SP_EIO;
+            goto out;
+        }
+        fseek(f, 0, SEEK_END);
+        ctSize = ftell(f);
+        fclose(f);
     }
-    if (ctSize <= 0 || (uint32_t)ctSize > *ct_len) { rc = SP_ENOMEM; goto out; }
+    if (ctSize <= 0 || (uint32_t)ctSize > *ct_len) {
+        rc = SP_ENOMEM;
+        goto out;
+    }
     {
         FILE *f = fopen(ctpath, "rb");
-        if (!f) { rc = SP_EIO; goto out; }
-        if (fread(ct, 1, (size_t)ctSize, f) != (size_t)ctSize) { fclose(f); rc = SP_EIO; goto out; }
+        if (!f) {
+            rc = SP_EIO;
+            goto out;
+        }
+        if (fread(ct, 1, (size_t)ctSize, f) != (size_t)ctSize) {
+            fclose(f);
+            rc = SP_EIO;
+            goto out;
+        }
         fclose(f);
     }
 
     /* 认证输入 = aad || iv || ciphertext */
     size_t macDataLen = (aad ? aad_len : 0) + SP_CBC_IV_LEN + (size_t)ctSize;
-    if (macDataLen > 0x100000) { rc = SP_ENOMEM; goto out; }
+    if (macDataLen > 0x100000) {
+        rc = SP_ENOMEM;
+        goto out;
+    }
     uint8_t *macData = malloc(macDataLen ? macDataLen : 1);
-    if (!macData) { rc = SP_ENOMEM; goto out; }
+    if (!macData) {
+        rc = SP_ENOMEM;
+        goto out;
+    }
     size_t o = 0;
-    if (aad && aad_len) { memcpy(macData + o, aad, aad_len); o += aad_len; }
-    memcpy(macData + o, ivp, SP_CBC_IV_LEN); o += SP_CBC_IV_LEN;
-    memcpy(macData + o, ct, (size_t)ctSize); o += (size_t)ctSize;
+    if (aad && aad_len) {
+        memcpy(macData + o, aad, aad_len);
+        o += aad_len;
+    }
+    memcpy(macData + o, ivp, SP_CBC_IV_LEN);
+    o += SP_CBC_IV_LEN;
+    memcpy(macData + o, ct, (size_t)ctSize);
+    o += (size_t)ctSize;
 
     uint8_t mac[SP_HMAC_LEN];
     rc = sp_hmac_sha256(macKey, 32, macData, macDataLen, mac);
     free(macData);
     if (rc != SP_OK) goto out;
 
-    if (*tag_len < SP_HMAC_LEN) { rc = SP_ENOMEM; goto out; }
+    if (*tag_len < SP_HMAC_LEN) {
+        rc = SP_ENOMEM;
+        goto out;
+    }
     memcpy(tag, mac, SP_HMAC_LEN);
     *tag_len = SP_HMAC_LEN;
     *ct_len = (uint32_t)ctSize;
@@ -178,14 +210,10 @@ out:
 /* ============================================================
  * 对称解密（先验 HMAC，再解密）
  * ============================================================ */
-int sp_decrypt(const uint8_t *key, uint32_t key_len,
-               const uint8_t *iv, uint32_t iv_len,
-               const uint8_t *aad, uint32_t aad_len,
-               const uint8_t *ct, uint32_t ct_len,
-               const uint8_t *tag, uint32_t tag_len,
-               uint8_t *pt, uint32_t *pt_len) {
-    if (!key || key_len == 0 || !ct || ct_len == 0 || !pt || !pt_len ||
-        !tag || tag_len == 0)
+int sp_decrypt(const uint8_t *key, uint32_t key_len, const uint8_t *iv, uint32_t iv_len,
+               const uint8_t *aad, uint32_t aad_len, const uint8_t *ct, uint32_t ct_len,
+               const uint8_t *tag, uint32_t tag_len, uint8_t *pt, uint32_t *pt_len) {
+    if (!key || key_len == 0 || !ct || ct_len == 0 || !pt || !pt_len || !tag || tag_len == 0)
         return SP_EINVAL;
     if (!iv || iv_len != SP_CBC_IV_LEN) return SP_EINVAL;
 
@@ -199,8 +227,12 @@ int sp_decrypt(const uint8_t *key, uint32_t key_len,
     uint8_t *macData = malloc(macDataLen ? macDataLen : 1);
     if (!macData) return SP_ENOMEM;
     size_t o = 0;
-    if (aad && aad_len) { memcpy(macData + o, aad, aad_len); o += aad_len; }
-    memcpy(macData + o, iv, SP_CBC_IV_LEN); o += SP_CBC_IV_LEN;
+    if (aad && aad_len) {
+        memcpy(macData + o, aad, aad_len);
+        o += aad_len;
+    }
+    memcpy(macData + o, iv, SP_CBC_IV_LEN);
+    o += SP_CBC_IV_LEN;
     memcpy(macData + o, ct, ct_len);
 
     uint8_t mac[SP_HMAC_LEN];
@@ -217,38 +249,59 @@ int sp_decrypt(const uint8_t *key, uint32_t key_len,
     sp_to_hex(iv, SP_CBC_IV_LEN, ivHex);
 
     char pip[8192], pct[8192], pout[8192], qi[8192], qc[8192];
-    char *inpath  = sp_tmp_path(pip, sizeof(pip));
-    char *ctpath  = sp_tmp_path(pct, sizeof(pct));
-    char *ptpath  = sp_tmp_path(pout, sizeof(pout));
+    char *inpath = sp_tmp_path(pip, sizeof(pip));
+    char *ctpath = sp_tmp_path(pct, sizeof(pct));
+    char *ptpath = sp_tmp_path(pout, sizeof(pout));
     if (!inpath || !ctpath || !ptpath) return SP_EIO;
-    if (sp_write_all(inpath, ct, ct_len) != SP_OK) { rc = SP_EIO; goto out; }
+    if (sp_write_all(inpath, ct, ct_len) != SP_OK) {
+        rc = SP_EIO;
+        goto out;
+    }
 
     char cmd[16384];
-    snprintf(cmd, sizeof(cmd),
-             "openssl enc -d -aes-256-cbc -K %s -iv %s -in %s -out %s",
-             keHex, ivHex, sp_q(inpath, qi, sizeof(qi)),
-             sp_q(ptpath, qc, sizeof(qc)));
+    snprintf(cmd, sizeof(cmd), "openssl enc -d -aes-256-cbc -K %s -iv %s -in %s -out %s", keHex,
+             ivHex, sp_q(inpath, qi, sizeof(qi)), sp_q(ptpath, qc, sizeof(qc)));
     rc = sp_sh(cmd, NULL, NULL);
-    if (rc != 0) { rc = SP_EIO; goto out; }
+    if (rc != 0) {
+        rc = SP_EIO;
+        goto out;
+    }
 
     long ptSize = -1;
     {
         FILE *f = fopen(ptpath, "rb");
-        if (!f) { rc = SP_EIO; goto out; }
-        fseek(f, 0, SEEK_END); ptSize = ftell(f); fclose(f);
+        if (!f) {
+            rc = SP_EIO;
+            goto out;
+        }
+        fseek(f, 0, SEEK_END);
+        ptSize = ftell(f);
+        fclose(f);
     }
-    if (ptSize < 0 || (uint32_t)ptSize > *pt_len) { rc = SP_ENOMEM; goto out; }
+    if (ptSize < 0 || (uint32_t)ptSize > *pt_len) {
+        rc = SP_ENOMEM;
+        goto out;
+    }
     {
         FILE *f = fopen(ptpath, "rb");
-        if (!f) { rc = SP_EIO; goto out; }
-        if (fread(pt, 1, (size_t)ptSize, f) != (size_t)ptSize) { fclose(f); rc = SP_EIO; goto out; }
+        if (!f) {
+            rc = SP_EIO;
+            goto out;
+        }
+        if (fread(pt, 1, (size_t)ptSize, f) != (size_t)ptSize) {
+            fclose(f);
+            rc = SP_EIO;
+            goto out;
+        }
         fclose(f);
     }
     *pt_len = (uint32_t)ptSize;
     rc = SP_OK;
 
 out:
-    unlink(inpath); unlink(ctpath); unlink(ptpath);
+    unlink(inpath);
+    unlink(ctpath);
+    unlink(ptpath);
     return rc;
 }
 
@@ -264,14 +317,18 @@ int sp_random(uint8_t *buf, uint32_t len) {
     char *outpath = sp_tmp_path(pout, sizeof(pout));
     if (!outpath) return SP_EIO;
     int rc = sp_sh(cmd, outpath, NULL);
-    if (rc != 0) { unlink(outpath); return SP_EIO; }
+    if (rc != 0) {
+        unlink(outpath);
+        return SP_EIO;
+    }
     char line[8192];
     ssize_t n = sp_read_text(outpath, line, sizeof(line));
     unlink(outpath);
     if (n <= 0) return SP_EIO;
     /* 去除尾部空白/换行，再按十六进制解析 */
-    while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r' ||
-                     line[n-1] == ' ' || line[n-1] == '\t')) line[--n] = 0;
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ' ||
+                     line[n - 1] == '\t'))
+        line[--n] = 0;
     size_t blen = 0;
     rc = sp_from_hex(line, buf, len, &blen);
     if (rc != SP_OK || blen != len) return SP_EIO;
@@ -281,20 +338,14 @@ int sp_random(uint8_t *buf, uint32_t len) {
 /* ============================================================
  * 回调装配
  * ============================================================ */
-static int ops_encrypt_wrap(const uint8_t *key, uint32_t kl,
-                            const uint8_t *iv, uint32_t il,
-                            const uint8_t *aad, uint32_t al,
-                            const uint8_t *pt, uint32_t pl,
-                            uint8_t *ct, uint32_t *cl,
-                            uint8_t *tag, uint32_t *tl) {
+static int ops_encrypt_wrap(const uint8_t *key, uint32_t kl, const uint8_t *iv, uint32_t il,
+                            const uint8_t *aad, uint32_t al, const uint8_t *pt, uint32_t pl,
+                            uint8_t *ct, uint32_t *cl, uint8_t *tag, uint32_t *tl) {
     return sp_encrypt(key, kl, iv, il, aad, al, pt, pl, ct, cl, tag, tl);
 }
-static int ops_decrypt_wrap(const uint8_t *key, uint32_t kl,
-                            const uint8_t *iv, uint32_t il,
-                            const uint8_t *aad, uint32_t al,
-                            const uint8_t *ct, uint32_t cl,
-                            const uint8_t *tag, uint32_t tl,
-                            uint8_t *pt, uint32_t *pl) {
+static int ops_decrypt_wrap(const uint8_t *key, uint32_t kl, const uint8_t *iv, uint32_t il,
+                            const uint8_t *aad, uint32_t al, const uint8_t *ct, uint32_t cl,
+                            const uint8_t *tag, uint32_t tl, uint8_t *pt, uint32_t *pl) {
     return sp_decrypt(key, kl, iv, il, aad, al, ct, cl, tag, tl, pt, pl);
 }
 
@@ -302,5 +353,5 @@ void sp_crypto_bind(hw_sp_ops_t *ops) {
     if (!ops) return;
     ops->encrypt = ops_encrypt_wrap;
     ops->decrypt = ops_decrypt_wrap;
-    ops->random  = sp_random;
+    ops->random = sp_random;
 }

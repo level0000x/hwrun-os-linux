@@ -25,13 +25,13 @@ static int fsp_symlink(const char *target, const char *linkpath) {
 
 static ssize_t fsp_readlink(const char *path, char *buf, size_t size) {
     ssize_t n = readlink(path, buf, size > 0 ? size - 1 : 0);
-    if (n >= 0 && size > 0) buf[n] = '\0';  /* 保证 NUL 结尾，便于上层使用 */
+    if (n >= 0 && size > 0) buf[n] = '\0'; /* 保证 NUL 结尾，便于上层使用 */
     return n;
 }
 
 void hw_fsp_ops_perm_init(hw_fsp_ops_t *ops) {
-    ops->chmod    = fsp_chmod;
-    ops->chown    = fsp_chown;
-    ops->symlink  = fsp_symlink;
+    ops->chmod = fsp_chmod;
+    ops->chown = fsp_chown;
+    ops->symlink = fsp_symlink;
     ops->readlink = fsp_readlink;
 }

@@ -39,8 +39,7 @@ int git_ops_merge(const char *branch, const char *message) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        HWAPI_LOGE(PLUGIN_ID, "git merge 失败: %s",
-                   r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git merge 失败: %s", r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
