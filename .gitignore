@@ -6,6 +6,9 @@ linux-src/
 kernel/build/
 *.o
 *.ko
+*.exe
+*.so
+*.dll
 hwrun-bus
 tests/test_proto
 *.cmd
