@@ -214,6 +214,12 @@ HWRun OS booted (8 plugins, 13 protocols)
 
 它目前是内核边界桥接模块，不是现有 BUS 的强依赖。现有 BUS 继续使用进程内 METAPROTO 路由，这是当前可运行的主路径。`kctl` 客户端是面向该桥接的可选调用路径，且与用户态 METAPROTO 解耦。
 
+### 6.2 占位清理与启动校验（0.4 B 组）
+
+- `hw_metaproto_export_api`（空壳）与 `hw_metaproto_api_t` 结构、`HWRUN_USE_TABLE_API` 条件段已删除：全仓无任何调用方，按 YAGNI 判定为死代码；原功能无需该 API，直接调用裸 `hw_metaproto_register/unregister/resolve/list/subscribe/notify/check_deps` 函数。
+- `hw_param_mark_revision` 落地为事件钩子：param 属依赖链第 1 环，不直接依赖 GIT 头；改为在 ctx 上提供可选回调 `on_revision(userdata, reason)`，由 bus（第 2 环）在 `hw_bus_init` 装配。回调 resolve GIT 协议，在 git 插件已启动且 auto_commit 开启时把参数状态文件 `add + commit("param: <reason>")`；git 就绪前静默跳过，commit 期间设重入守卫防递归。
+- `boot_chain` 启动校验补齐：`hw_plugin_start` 在 requires 检查之后新增 conflicts 检查（声明冲突的协议已被注册 → 拒绝启动、置 ERROR、返回 `HWRUN_ECONFLICT`）；`boot_chain` 末尾对 boot_order 表外的已发现插件给出"未纳入启动序，不会自动启动"告警。
+
 ## 7. 已知差异
 
 1. TXT 文档同时描述了自研微内核和 Linux 内核两条路线，当前实现选择 Linux。
