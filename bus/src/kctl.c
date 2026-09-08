@@ -38,6 +38,16 @@
     (HWRUN_KCTL_PROTOCOL_NAME_MAX + HWRUN_KCTL_PROTOCOL_VERSION_MAX +                              \
      HWRUN_KCTL_PROVIDER_NAME_MAX + 8)
 
+/* ABI 固化：用户态 desc 与内核 kernel/include/uapi/hwrun.h 的
+ * struct hwrun_protocol_desc 必须逐字节对齐（64+16+64+8=152），
+ * 任何一侧改布局都会在此编译期失败。 */
+_Static_assert(sizeof(hwrun_kctl_desc_t) == 152, "kctl desc ABI size drift");
+_Static_assert(sizeof(hwrun_kctl_desc_t) == KCTL_DESC_SIZE, "kctl desc size macro mismatch");
+_Static_assert(offsetof(hwrun_kctl_desc_t, protocol) == 0, "kctl desc protocol offset");
+_Static_assert(offsetof(hwrun_kctl_desc_t, version) == 64, "kctl desc version offset");
+_Static_assert(offsetof(hwrun_kctl_desc_t, provider) == 80, "kctl desc provider offset");
+_Static_assert(offsetof(hwrun_kctl_desc_t, implementation) == 144, "kctl desc impl offset");
+
 #define KCTL_IOC_GET_ABI KCTL_IOC(KCTL_READ, KCTL_MAGIC, 0x00, sizeof(uint32_t))
 #define KCTL_IOC_PING KCTL_IOC(KCTL_READ | KCTL_WRITE, KCTL_MAGIC, 0x01, sizeof(uint32_t))
 #define KCTL_IOC_PROTOCOL_REGISTER KCTL_IOC(KCTL_WRITE, KCTL_MAGIC, 0x10, KCTL_DESC_SIZE)

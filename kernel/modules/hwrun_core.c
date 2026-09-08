@@ -11,6 +11,21 @@
 #include "hwrun_kernel.h"
 #include "uapi/hwrun.h"
 
+#include <linux/stddef.h>
+
+// ABI 固化：与用户态 bus/src/kctl.c 的 hwrun_kctl_desc_t 逐字节对齐。
+// 改动本结构或 kctl.h 的任一 MAX 常量都会在此编译期失败。
+_Static_assert(sizeof(struct hwrun_protocol_desc) == 152,
+               "uapi protocol desc ABI size drift");
+_Static_assert(offsetof(struct hwrun_protocol_desc, protocol) == 0,
+               "uapi desc protocol offset");
+_Static_assert(offsetof(struct hwrun_protocol_desc, version) == 64,
+               "uapi desc version offset");
+_Static_assert(offsetof(struct hwrun_protocol_desc, provider) == 80,
+               "uapi desc provider offset");
+_Static_assert(offsetof(struct hwrun_protocol_desc, implementation) == 144,
+               "uapi desc impl offset");
+
 struct hwrun_protocol {
     struct list_head node;
     char protocol[HWRUN_PROTOCOL_NAME_MAX];
