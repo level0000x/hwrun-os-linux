@@ -86,3 +86,13 @@ git hap pmp fsp np sp crypto loader/   8 个用户态协议插件
 tests/           CMocka 单测 + 真协议集成测试（ctest 聚合）
 kernel/          Linux kbuild profiles + hwrun_core.ko 模块 + uapi
 ```
+
+## 许可
+
+本项目以 **GNU GPL v3.0** 发布，全文见 [LICENSE](LICENSE)。
+
+- 本项目自身的代码：GPLv3。
+- 其中引用的 **Linux 内核**（`linux-src/` 外部源码树，不入库）为 **GPLv2**，按其自身条款分发；
+  本仓库不打包内核源码。
+- 第三方组件（若引入）各自许可见其自身 LICENSE，并在其目录内声明。
+
