@@ -1,0 +1,42 @@
+# HWRun OS — C 代码格式化基线（仓库根）
+#
+# 派生自 LLVM，贴合仓库既有手写风格：
+#   4 空格缩进 / 列宽 100 / Attach 大括号 / 指针星号贴变量名 / include 顺序保持现状。
+# 兼容 clang-format 14+（WSL: Ubuntu clang-format 14.0.0）。
+# 本文件只落地门禁基线；是否对存量代码批量格式化由仓库维护者另行决定。
+#
+# 用法：
+#   clang-format -i <file>                  # 格式化单个文件
+#   clang-format --dry-run --Werror <files> # 只校验不改（CI 门禁用）
+---
+BasedOnStyle: LLVM
+
+# ---- 缩进：4 空格 ----
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# ---- 列宽 ----
+ColumnLimit: 100
+
+# ---- 大括号：Attach（K&R，贴近仓库现状） ----
+BreakBeforeBraces: Attach
+
+# ---- 指针对齐：星号贴变量名（仓库既有风格为 `char *p`；LLVM 默认同款） ----
+# 注意：切勿改为 Left(`char* p`)，那会把全仓数百处指针声明判为违规。
+DerivePointerAlignment: false
+PointerAlignment: Right
+
+# ---- 短函数：适中。C 无类内定义，InlineOnly 等效“不把多行短函数压成单行” ----
+AllowShortFunctionsOnASingleLine: InlineOnly
+
+# ---- 控制语句 ----
+# 保留块起始处的空行
+KeepEmptyLinesAtTheStartOfBlocks: true
+# 单行 if（无 else）保持现状，不强制展开
+AllowShortIfStatementsOnASingleLine: WithoutElse
+
+# ---- include：保持现状顺序，不排序、不重排块 ----
+IncludeBlocks: Preserve
+SortIncludes: Never

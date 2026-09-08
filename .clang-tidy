@@ -1,0 +1,20 @@
+# HWRun OS — clang-tidy 静态检查基线（仓库根）
+#
+# 启用大类：bugprone-*（易错模式）、clang-analyzer-*（编译器静态分析）、
+#          performance-*（性能反模式）。
+# 禁用大类：readability-* 与 llvm-*（命名/风格类，交给 clang-format 与代码评审）。
+# WarningsAsErrors 留空：检查结果作为提示，不因 tidy 告警直接打断构建。
+#
+# 用法：
+#   clang-tidy <file>.c -- <编译选项>            # 单个文件
+#   run-clang-tidy build/compile_commands.json   # 全工程（需 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON）
+---
+Checks: >
+  clang-diagnostic-*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  -readability-*,
+  -llvm-*
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/|bus/src/'

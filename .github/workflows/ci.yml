@@ -1,0 +1,120 @@
+# HWRun OS — CI 工程门禁
+#
+# 双轨构建（设计文档 §8 / §3 沿用期间）：
+#   - CMake 主轨道：Release 构建测试、ASan/UBSan 构建测试；
+#   - Makefile 兼容轨道：build-make 保留性验证（make + make test）；
+#   - static：clang-format 格式门禁。
+#
+# 依赖全部走 apt（仓库无 vcpkg）：cmake / libcmocka-dev / pkg-config / libssl-dev
+# （libssl-dev 提供 crypto 插件所需的 libcrypto 头与库；libcmocka-dev 供 CMocka 单测）。
+# kernel/ 与 linux-src/ 不在本 CI 范围（linux-src 不入库，kernel 需本地 kbuild 环境）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) 主轨道：Release 构建 + ctest
+  # ---------------------------------------------------------------
+  build-test:
+    name: Build & Test (CMake Release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libcmocka-dev pkg-config libssl-dev
+
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j2
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------
+  # 2) 消毒器轨道：ASan + UBSan 构建 + ctest
+  # ---------------------------------------------------------------
+  sanitize:
+    name: Build & Test (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libcmocka-dev pkg-config libssl-dev
+
+      - name: Configure (sanitizer=address;undefined)
+        run: 'cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHWRUN_ENABLE_SANITIZER="address;undefined"'
+
+      - name: Build
+        run: cmake --build build -j2
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------
+  # 3) 静态门禁：clang-format 格式校验
+  #
+  # 现状：存量代码尚未全量格式化，直接 fail 会让 CI 一开始就红。
+  # 处置：本 job 设 continue-on-error，作为提示性门禁；
+  #       待存量代码按 .clang-format 收敛后，去掉 continue-on-error 收紧为硬门禁。
+  # 校验范围：git 跟踪的 *.c/*.h（天然排除 build/、linux-src/ 等非入库目录）。
+  # ---------------------------------------------------------------
+  static:
+    name: Format check (clang-format)
+    runs-on: ubuntu-latest
+    continue-on-error: true # 待存量格式化后收紧（删除本行即硬门禁）
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format
+
+      - name: clang-format --dry-run --Werror
+        run: |
+          files=$(git ls-files '*.c' '*.h')
+          echo "checking $(echo "$files" | wc -l) files"
+          # shellcheck disable=SC2086
+          clang-format --dry-run --Werror $files
+
+  # ---------------------------------------------------------------
+  # 4) Makefile 兼容轨道：保留性验证 make + make test
+  #    （说明：CMake 为主轨道，Makefile 双轨期间仍需维护，直至下线）
+  # ---------------------------------------------------------------
+  build-make:
+    name: Build & Test (Makefile legacy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcmocka-dev pkg-config libssl-dev
+
+      # make 全量（bus + 各插件 .so）后，make test 所需插件产物即就绪
+      - name: make (bus + plugins)
+        run: make -j2
+
+      - name: make test
+        run: make test

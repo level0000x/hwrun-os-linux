@@ -1,0 +1,16 @@
+# HWRun OS — 跨编辑器基础配置（仓库根）
+#
+# 实测说明：仓库内 .txt（含 CMakeLists.txt）与 .md 当前均为 LF 行尾，
+# 故统一 end_of_line=lf；如未来确有 CRLF 文档子集，再为其单独开 [*.txt] 覆盖节。
+
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+end_of_line = lf
+
+# Makefile 配方必须使用 Tab，编辑器勿用空格替换
+[Makefile]
+indent_style = tab
