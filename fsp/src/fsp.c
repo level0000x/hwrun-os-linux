@@ -55,6 +55,19 @@ static int fsp_stop(hw_plugin_t *self) {
     return HWRUN_OK;
 }
 
+/* 动态配置：fsp.root 变更时校验并记录（总线 param->configure 路由调用）。
+ * fsp.root 为空视为复位为 "/"；此实现示范 configure 链路端到端可用。 */
+static int fsp_configure(hw_plugin_t *self, const char *key, const char *value) {
+    (void)self;
+    if (strcmp(key, "fsp.root") == 0) {
+        const char *root = (value && value[0]) ? value : "/";
+        HWAPI_LOGI("fsp", "configure: fsp.root=%s", root);
+        return HWRUN_OK;
+    }
+    /* 非本插件管理的 key：静默接受（路由已按插件 id 前缀过滤，正常不会到这） */
+    return HWRUN_OK;
+}
+
 static int fsp_destroy(hw_plugin_t *self) {
     (void)self;
     self->state = HWPLUGIN_UNINSTALLED;
@@ -74,7 +87,7 @@ static hw_plugin_ops_t fsp_ops = {
     .start        = fsp_start,
     .stop         = fsp_stop,
     .destroy      = fsp_destroy,
-    .configure    = NULL,
+    .configure    = fsp_configure,
     .get_interface= fsp_get_interface,
 };
 

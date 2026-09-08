@@ -20,6 +20,9 @@ target_link_libraries(hwrun-core PRIVATE ${CMAKE_DL_LIBS})
 # 可执行入口
 add_executable(hwrun-bus src/main.c)
 target_link_libraries(hwrun-bus PRIVATE hwrun-core)
+# 导出主程序符号：loader 用 RTLD_GLOBAL 加载插件 .so，插件的
+# hw_str_*/runtime 回调等需从宿主动态符号表解析
+set_target_properties(hwrun-bus PROPERTIES ENABLE_EXPORTS ON)
 
 # 安装
 install(TARGETS hwrun-bus RUNTIME DESTINATION bin)

@@ -269,10 +269,11 @@ int hw_bus_boot_chain(hw_bus_t *bus) {
         if (p->state == HWPLUGIN_STARTED) continue;
         int rc = hw_plugin_start(bus, p);
         if (rc != HWRUN_OK) {
-            HWLOG_WARNF(&bus->log, "bus", "boot: %s failed to start (rc=%d)",
-                        boot_order[i], rc);
+            HWLOG_WARNF(&bus->log, "bus", "boot: %s failed to start (%s)",
+                        boot_order[i], hw_strerror(rc));
         }
     }
+    hw_bus_config_route(bus);   /* 启动完成后：参数变更 -> 插件 configure 路由 */
     return HWRUN_OK;
 }
 
@@ -293,4 +294,41 @@ int hw_bus_unload(hw_bus_t *bus, const char *id) {
     hw_plugin_t *p = hw_bus_find(bus, id);
     if (!p) return HWRUN_ENOENT;
     return hw_plugin_unload(bus, p);
+}
+
+/* ---- 参数变更 -> 插件 configure 路由 ---- */
+
+/* param watch 回调（在 param 锁外派发，可安全调 bus 接口）。
+ * key 形如 "<plugin_id>.<rest>"：首段点号前为插件 id。 */
+static int config_route_cb(const char *key, const char *old_value,
+                           const char *new_value, void *userdata) {
+    hw_bus_t *bus = (hw_bus_t *)userdata;
+    (void)old_value;
+    if (!bus || !key || !new_value) return 0;
+
+    /* 解析插件 id = key 首段（点号前） */
+    const char *dot = strchr(key, '.');
+    char id[64];
+    size_t n = dot ? (size_t)(dot - key) : strlen(key);
+    if (n == 0 || n >= sizeof(id)) return 0;
+    memcpy(id, key, n);
+    id[n] = '\0';
+
+    hw_plugin_t *p = hw_bus_find(bus, id);
+    if (!p || p->state != HWPLUGIN_STARTED || !p->ops.configure) return 0;
+
+    int rc = p->ops.configure(p, key, new_value);
+    if (rc != HWRUN_OK) {
+        HWLOG_WARNF(&bus->log, id, "configure %s failed (%s)",
+                    key, hw_strerror(rc));
+    }
+    return 0;
+}
+
+int hw_bus_config_route(hw_bus_t *bus) {
+    if (!bus || !bus->initialized) return HWRUN_EINVAL;
+    /* 单例 watcher：pattern="" 收全部变更，回调内按 key 首段路由到插件。
+     * bus 作 userdata；shutdown 时 param_shutdown 统一释放 watcher。 */
+    return hw_param_watch(&bus->params, "bus", "",
+                          config_route_cb, bus);
 }

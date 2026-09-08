@@ -75,6 +75,11 @@ extern int  hw_bus_resolve(hw_bus_t *bus, const char *protocol,
 extern hw_plugin_t *hw_bus_find(hw_bus_t *bus, const char *id);
 extern int          hw_bus_plugin_count(hw_bus_t *bus);
 
+/* 参数变更 -> 插件 configure 动态配置路由：
+ * 对形如 "<plugin_id>.<key>" 的参数变更，找到已启动插件并调其
+ * ops.configure(self, key, value)。boot_chain 完成后调用一次即可。 */
+extern int hw_bus_config_route(hw_bus_t *bus);
+
 /* ============================================================
  * plugin.yml 解析（bus/yml.c）
  * ============================================================ */

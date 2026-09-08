@@ -23,6 +23,8 @@ set(_plugin_dirs
 
 add_executable(test_proto test_proto.c)
 target_link_libraries(test_proto PRIVATE hwrun-core hwrun_includes)
+# 导出符号给 dlopen 的插件 .so 解析（与 hwrun-bus 一致）
+set_target_properties(test_proto PROPERTIES ENABLE_EXPORTS ON)
 target_include_directories(test_proto PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../hap/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../pmp/include

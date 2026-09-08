@@ -94,10 +94,30 @@ void hw_plugin_inject_runtime(hw_bus_t *bus, hw_plugin_t *p) {
     if (p->runtime_bind) p->runtime_bind(&rt);
 }
 
+/* 注册插件提供的协议（start 的 provides 注册段）；返回已注册数或负错误 */
+static int plugin_register_provides(hw_bus_t *bus, hw_plugin_t *p) {
+    int done = 0;
+    for (int i = 0; i < p->provides_count; i++) {
+        void *impl = p->ops.get_interface
+                     ? p->ops.get_interface(p->provides[i]) : NULL;
+        int rc = hw_metaproto_register(&bus->meta, p->provides[i],
+                                       HWRUN_PROTOCOL_VERSION, p->id,
+                                       impl ? impl : (void *)p);
+        if (rc != HWRUN_OK) return -done;   /* 负的已注册数，便于回滚 */
+        done++;
+    }
+    return done;
+}
+
+/* 回滚已注册的 provides（前 n 个） */
+static void plugin_unregister_provides(hw_bus_t *bus, hw_plugin_t *p, int n) {
+    for (int i = 0; i < n && i < p->provides_count; i++)
+        hw_metaproto_unregister(&bus->meta, p->provides[i], p->id);
+}
+
 int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
     if (!bus || !p) return HWRUN_EINVAL;
 
-    hw_protocol_route_t *route = NULL;
     int rc = hw_metaproto_check_deps(&bus->meta,
                                      (const char *const *)p->requires,
                                      p->requires_count, NULL, 0);
@@ -114,28 +134,39 @@ int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
     /* 注入运行时（LOG/PARAM/GIT），再触发 init */
     hw_plugin_inject_runtime(bus, p);
 
-    /* init */
+    /* init：失败即置 ERROR，无副作用可回滚（provides 尚未注册） */
     if (p->ops.init) {
         rc = p->ops.init(p);
-        if (rc != HWRUN_OK) { p->state = HWPLUGIN_ERROR; return rc; }
+        if (rc != HWRUN_OK) {
+            HWLOG_ERRF(&bus->log, p->id, "init failed: %s", hw_strerror(rc));
+            p->state = HWPLUGIN_ERROR;
+            return rc;
+        }
     }
     p->state = HWPLUGIN_LOADED;
 
-    /* 注册插件提供的协议 */
-    for (int i = 0; i < p->provides_count; i++) {
-        void *impl = p->ops.get_interface ? p->ops.get_interface(p->provides[i]) : NULL;
-        hw_metaproto_register(&bus->meta, p->provides[i], HWRUN_PROTOCOL_VERSION,
-                              p->id, impl ? impl : (void *)p);
+    /* 注册插件提供的协议；中途失败则回滚已注册项 */
+    int nreg = plugin_register_provides(bus, p);
+    if (nreg < 0) {
+        int done = -nreg;
+        plugin_unregister_provides(bus, p, done);
+        HWLOG_ERRF(&bus->log, p->id, "register provides failed");
+        p->state = HWPLUGIN_ERROR;
+        return HWRUN_ECONFLICT;
     }
 
-    /* start */
+    /* start：失败需回滚（init 已完成、provides 已注册），避免半启动残留 */
     if (p->ops.start) {
         rc = p->ops.start(p);
-        if (rc != HWRUN_OK) { p->state = HWPLUGIN_ERROR; return rc; }
+        if (rc != HWRUN_OK) {
+            HWLOG_ERRF(&bus->log, p->id, "start failed: %s", hw_strerror(rc));
+            plugin_unregister_provides(bus, p, p->provides_count);
+            p->state = HWPLUGIN_ERROR;
+            return rc;
+        }
     }
     p->state = HWPLUGIN_STARTED;
     HWLOG_INFOF(&bus->log, "bus", "plugin started: %s v%s", p->id, p->version);
-    (void)route;
     return HWRUN_OK;
 }
 

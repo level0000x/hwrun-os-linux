@@ -97,11 +97,25 @@ static void test_hw_fmt_path(void **state) {
     assert_int_equal(hw_fmt_path(buf, sizeof(buf), "d", NULL), HWRUN_EINVAL);
 }
 
+/* ---- hw_strerror：负 errno / 私有域 / 0 的可读描述 ---- */
+static void test_hw_strerror(void **state) {
+    (void)state;
+
+    assert_string_equal(hw_strerror(HWRUN_OK), "ok");
+    assert_non_null(hw_strerror(HWRUN_ENOENT));      /* strerror(-ENOENT) 非空 */
+    assert_non_null(hw_strerror(HWRUN_EINVAL));
+    assert_non_null(hw_strerror(HWRUN_ECONFLICT));   /* 私有域固定文案 */
+    assert_non_null(hw_strerror(HWRUN_ENOTREADY));
+    /* 正 errno 也应可译（防御性） */
+    assert_non_null(hw_strerror(ENOENT));
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_error_code_semantics),
         cmocka_unit_test(test_hw_str_eq),
         cmocka_unit_test(test_hw_fmt_path),
+        cmocka_unit_test(test_hw_strerror),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

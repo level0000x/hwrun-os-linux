@@ -80,6 +80,20 @@ int hw_fmt_path(char *out, size_t cap, const char *dir, const char *name) {
         return snprintf(out, cap, "%s/%s", dir, name) < (int)cap ? HWRUN_OK : HWRUN_ENOMEM;
 }
 
+/* 负 errno -> 可读描述；HWRun 私有域（HW_EBASE 之上）-> 固定文案 */
+const char *hw_strerror(int rc) {
+    if (rc == 0) return "ok";
+    int code = (rc < 0) ? -rc : rc;
+    if (code >= HW_EBASE) {
+        switch (code - HW_EBASE) {
+        case 1: return "conflict (dependency or registration)";
+        case 2: return "not ready";
+        default: return "unknown error";
+        }
+    }
+    return strerror(code);   /* 标准 errno（glibc 线程安全，返回静态缓冲） */
+}
+
 /* ============================================================
  * 参数树
  * ============================================================ */

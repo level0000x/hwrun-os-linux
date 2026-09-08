@@ -151,7 +151,7 @@ static int cmd_kctl(int argc, char **argv) {
     if (argc < 1) {               /* 默认 ping + abi */
         uint32_t abi = 0, ping = 0x12345678, orig = ping;
         rc = hwrun_kctl_get_abi(&c, &abi);
-        printf("kctl: open %s: %s\n", c.device, rc==HWRUN_OK?"ok":"failed");
+        printf("kctl: open %s: %s\n", c.device, hw_strerror(rc));
         if (rc == HWRUN_OK) printf("kctl: abi version = %u\n", abi);
         if (hwrun_kctl_ping(&c, &ping) == HWRUN_OK)
             printf("kctl: ping 0x%08x -> 0x%08x\n", orig, ping);
@@ -162,11 +162,11 @@ static int cmd_kctl(int argc, char **argv) {
     if (hw_str_eq(argv[0], "abi")) {
         uint32_t abi = 0;
         rc = hwrun_kctl_get_abi(&c, &abi);
-        printf("abi: %s (%u)\n", rc==HWRUN_OK?"ok":"failed", abi);
+        printf("abi: %s (%u)\n", hw_strerror(rc), abi);
     } else if (hw_str_eq(argv[0], "ping") && argc >= 2) {
         uint32_t v = (uint32_t)strtoul(argv[1], NULL, 0), orig = v;
         rc = hwrun_kctl_ping(&c, &v);
-        printf("ping 0x%08x -> 0x%08x: %s\n", orig, v, rc==HWRUN_OK?"ok":"failed");
+        printf("ping 0x%08x -> 0x%08x: %s\n", orig, v, hw_strerror(rc));
     } else if (hw_str_eq(argv[0], "list")) {
         const char *proto[] = {
             "METAPROTO","BUS","PARAM","LOG","GIT","HAP","PMP","FSP",

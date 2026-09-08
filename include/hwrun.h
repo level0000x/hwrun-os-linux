@@ -241,6 +241,7 @@ extern char  *hw_strdup(const char *s);
 extern char  *hw_strndup(const char *s, size_t n);
 extern int    hw_str_eq(const char *a, const char *b);
 extern int    hw_fmt_path(char *out, size_t cap, const char *dir, const char *name);
+extern const char *hw_strerror(int rc);   /* 负 errno / 私有域 -> 可读描述 */
 
 /* 参数树 */
 extern hw_param_t *hw_param_find(hw_param_t *root, const char *key);
