@@ -1,8 +1,13 @@
  # HWRun OS 设计与实现基线
 
-版本：0.2
-状态：当前实现基线
+版本：0.3
+状态：当前实现基线（底层工程化重构完成）
 更新时间：2026-09-08
+
+> 本文档为架构与实现基线。编码规范、构建方式见 docs/coding-style.md。
+> 0.3 变更摘要：CMake 统一构建、全库负 errno 错误码、bus 线程锁与内存
+> 所有权修复、插件入口统一 SDK 宏、CMocka 测试体系、CI 门禁、废弃自研
+> i386 微内核（kernel 收敛到 Linux kbuild）。
 
 ## 1. 项目定位
 
@@ -186,6 +191,18 @@ HWRun OS booted (8 plugins, 13 protocols)
 - 真协议调用自测 `tests/`：dlopen 插件 → metaproto 解析 → 真实调用 HAP/PMP/FSP/NP/LOADER ops，38 项断言全部通过
 - CRYPTO 插件 Makefile 支持双平台（MSYS2/mingw64 与 Linux/系统 OpenSSL），Linux 下产出 ELF `.so`
 
+### 6.1 底层工程化重构（0.3）
+
+- 构建系统迁移 CMake：顶层 + bus(hwrun-core 静态库/hwrun-bus) + 8 插件 + tests，统一告警与 ctest；顶层 Makefile 保留兼容
+- 错误码全库负 errno 化：`HWRUN_*` 收敛为标准 errno 别名 + 私有域 `HW_EBASE`（见 include/hwrun.h）；修复 `loader_run` 返正 bug、`main` 魔法数
+- bus 并发安全：`hwlock` 读写锁抽象 + RAII 宏，接入 metaproto/param/log/plugins 链表；通知"锁内快照→出锁派发"
+- bus 内存所有权：修复 scan 元数据泄漏，`hw_plugin_free_meta` + shutdown 全释放（valgrind 零泄漏）
+- PID1 信号处理：SIGTERM/SIGINT 优雅停机、SIGPIPE 忽略
+- 插件 SDK：`include/hwrun_plugin.h` 的 `HWRUN_PLUGIN_BIND/DEFINE` 统一 8 插件入口，消灭多套手写骨架；运行时 fprintf 转 HWAPI
+- 测试体系：CMocka + ctest 聚合（test_errno/param/metaproto/yml/lock + test_proto 真协议）
+- CI 门禁：`.github/workflows/ci.yml`（build/sanitize/static/make 四 job）；`.clang-format`/`.clang-tidy`/`.editorconfig`
+- kernel 收敛：废弃自研 i386 微内核（src/boot/linker.ld 及配套头移除），保留 Linux kbuild 集成（config profiles + hwrun_core.ko + uapi）
+
 当前 `hwrun_core.ko` 提供：
 
 - `/dev/hwrun`
@@ -207,24 +224,30 @@ HWRun OS booted (8 plugins, 13 protocols)
 6. 文档中的协议版本兼容规则还没有完全统一到所有插件。
 7. 内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接。
 8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 尚未装入真实 Linux 内核做 ioctl 运行级验证（需引导 6.1 内核）。
+9. plugin.yml 仍有嵌套 map 与扁平纯字符串两种形态并存，单一样式收敛（统一嵌套 `plugin:` 根 + protocol/version map）列为遗留项。
 
 ## 8. 后续实施顺序
 
 1. ~~固化 `minimal` 和 `host` profile 的构建、产物和启动测试~~（已在 WSL 完成构建固化）
 2. ~~为 BUS 增加稳定的内核边界客户端，按需访问 `/dev/hwrun`~~（`kctl` 已实现）
-3. 统一 `plugin.yml`、`hw_plugin_entry()`、协议版本和错误码。
-4. 将 PARAM、LOG、GIT 接口注入现有插件生命周期。
-5. ~~为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动~~（`tests/` 38 项断言通过）
+3. ~~统一 `plugin.yml`、`hw_plugin_entry()`、协议版本和错误码~~（0.3：SDK 宏统一入口 + 负 errno 收敛；plugin.yml 单一样式收敛为遗留项，见第 7.9）
+4. ~~将 PARAM、LOG、GIT 接口注入现有插件生命周期~~（已注入，见 6.1）
+5. ~~为 HAP/PMP/FSP/NP/LOADER 增加真正的协议调用测试，而不是只测试启动~~（CMocka 体系，6 组用例通过）
 6. 对确实需要内核权限的能力增加薄 `.ko`，避免重复实现用户态插件逻辑。
 7. 将 `hwrun_core.ko` 装入引导的 minimal 内核，完成 `kctl` 客户端在内核边界的运行级验证。
 8. 最后再推进 bootloader、rootfs、ISO 和完整发行版构建。
+9. ~~底层工程化重构（构建/错误码/并发/内存/信号/测试/门禁）~~（0.3 已完成并验证）
 
 ## 9. 基线提交
 
-当前架构基线已推送到 `origin/main`：
+架构与工程化基线已推送到 `origin/main`：
 
 ```text
+87ec2fa build: 迁移统一 CMake 构建树并新增 hwlock 线程锁抽象
+0afb837 refactor: 全库错误码收敛为负 errno 语义
+52843dc refactor: bus 锁接入——子系统头加 hwlock 字段,补 runtime.c 入库
+17549e8 feat: 新增插件 SDK 头并引入 CMocka 单测体系
+637f8ff chore: 增加 clang-format/tidy 与 editorconfig 门禁配置及 CI
+7260785 refactor: 废弃自研 i386 微内核,收敛 kernel 到 Linux kbuild 集成
 bef330b 建立机制最小化内核 profile
-7cf3b43 修复现有插件链构建编排
-5102ea0 实现 HWRun 内核协议路由基础
 ```
