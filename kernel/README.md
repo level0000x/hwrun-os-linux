@@ -32,6 +32,10 @@ socket、namespace、cgroup、seccomp 等现有插件所需的机制。
 `qemu` profile 在 `minimal` 之上叠加 `config/qemu.config`（串口/devtmpfs/misc/
 gzip-initramfs），用于模块运行级验证。
 
+三个 profile 均已在本地 `linux-src/`（6.1.0）真编译验证：`minimal`/`qemu`
+出 `hwrun_core.ko` 且 qemu 运行级 ioctl 通过；`host` 全量 bzImage（fs/net/
+overlay 等机制）+ 模块链接零未解析符号。
+
 ### 运行级验证（QEMU）
 
 ```sh
