@@ -1,4 +1,6 @@
-# HWRun OS — SP 插件描述（安全协议，依赖链第 7 环）
+# HWRun OS — SP 插件描述
+# Security Protocol：认证、授权、对称加密（AES-256-CBC+HMAC）、哈希、
+# 签名、密钥管理与完整性校验。
 plugin:
   id: "sp"
   name: "Security Protocol"

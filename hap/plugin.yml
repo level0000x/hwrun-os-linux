@@ -1,4 +1,5 @@
 # HWRun OS — HAP 插件描述
+# Hardware Abstraction Protocol：统一访问 CPU、内存、磁盘、网络与系统信息。
 plugin:
   id: "hap"
   name: "Hardware Abstraction Protocol"
@@ -8,12 +9,16 @@ plugin:
   description: "HWRun OS 硬件抽象协议：统一访问 CPU、内存、磁盘、网络与系统信息"
 
   provides:
-    - "HAP"
+    - protocol: "HAP"
+      version: "1.0"
 
   requires:
-    - "LOG"
-    - "PARAM"
-    - "METAPROTO"
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
 
   files:
     - "build/hap.so"

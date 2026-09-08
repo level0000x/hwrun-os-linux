@@ -1,22 +1,28 @@
-# HWRun OS — NP 插件描述（扁平格式，兼容 bus/yml.c 解析）
-id: "np"
-name: "Network Protocol"
-version: "1.0.0"
-type: "network"
+# HWRun OS — NP 插件描述
+# Network Protocol：socket、TCP/UDP/UNIX、名称解析、网络接口枚举的统一抽象。
+plugin:
+  id: "np"
+  name: "Network Protocol"
+  version: "1.0.0"
+  type: "network"
 
-description: "HWRun OS 网络协议：提供 socket、TCP/UDP/UNIX、名称解析、网络接口枚举等网络功能的统一抽象"
+  description: "HWRun OS 网络协议：提供 socket、TCP/UDP/UNIX、名称解析、网络接口枚举等网络功能的统一抽象"
 
-provides:
-  - "NP"
+  provides:
+    - protocol: "NP"
+      version: "1.0"
 
-requires:
-  - "HAP"
-  - "LOG"
-  - "PARAM"
-  - "METAPROTO"
+  requires:
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
 
-conflicts:
-  - ""
+  conflicts: []
 
-files:
-  - "build/np.so"
+  files:
+    - "build/np.so"

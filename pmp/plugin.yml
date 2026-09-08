@@ -1,6 +1,5 @@
-# PMP（进程管理协议）插件描述
-# 依赖链：METAPROTO -> PARAM -> LOG -> HAP -> PMP
-
+# HWRun OS — PMP 插件描述
+# Process Management Protocol：进程创建、控制、等待、信号、调度、亲和性与任务管理。
 plugin:
   id: "pmp"
   name: "Process Management Protocol"
@@ -8,16 +7,22 @@ plugin:
   type: "kernel"
   author: "HWRun OS"
   license: "GPL"
+
   description: "HWRun OS 进程管理协议，提供进程创建、控制、等待、信号、调度、亲和性与任务管理"
 
   provides:
-    - "PMP"
+    - protocol: "PMP"
+      version: "1.0"
 
   requires:
-    - "METAPROTO"
-    - "PARAM"
-    - "LOG"
-    - "HAP"
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
 
   files:
     - "build/pmp.so"

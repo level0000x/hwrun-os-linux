@@ -1,22 +1,29 @@
-# FSP 插件描述（总线扫描 plugin.yml 解析；采用扁平字段 + 简单列表）
-id: "fsp"
-name: "FileSystem Protocol"
-version: "1.0.0"
-type: "fs"
-description: "HWRun OS 文件系统协议：文件、目录、权限、路径、挂载操作"
+# HWRun OS — FSP 插件描述
+# FileSystem Protocol：文件、目录、权限、路径、挂载操作。
+# 依赖链 <HAP> <PMP> <LOG> <PARAM> <METAPROTO>
+plugin:
+  id: "fsp"
+  name: "FileSystem Protocol"
+  version: "1.0.0"
+  type: "fs"
 
-# 提供的协议
-provides:
-  - "FSP"
+  description: "HWRun OS 文件系统协议：文件、目录、权限、路径、挂载操作"
 
-# 依赖协议（依赖链 <HAP> <PMP> <LOG> <PARAM> <METAPROTO>）
-requires:
-  - "HAP"
-  - "PMP"
-  - "LOG"
-  - "PARAM"
-  - "METAPROTO"
+  provides:
+    - protocol: "FSP"
+      version: "1.0"
 
-# 交付文件（相对本目录，总线会解析为绝对路径）
-files:
-  - "build/fsp.so"
+  requires:
+    - protocol: "HAP"
+      version: "1.0"
+    - protocol: "PMP"
+      version: "1.0"
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  files:
+    - "build/fsp.so"
