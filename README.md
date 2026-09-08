@@ -89,10 +89,10 @@ kernel/          Linux kbuild profiles + hwrun_core.ko 模块 + uapi
 
 ## 许可
 
-本项目以 **GNU GPL v3.0** 发布，全文见 [LICENSE](LICENSE)。
+本项目以 **GNU GPL v2.0** 发布，全文见 [LICENSE](LICENSE)。
 
-- 本项目自身的代码：GPLv3。
-- 其中引用的 **Linux 内核**（`linux-src/` 外部源码树，不入库）为 **GPLv2**，按其自身条款分发；
-  本仓库不打包内核源码。
-- 第三方组件（若引入）各自许可见其自身 LICENSE，并在其目录内声明。
+- 本项目自身代码：**GPLv2**（与 Linux 内核一致，便于内核侧改动/补丁保持同协议）。
+- 子目录可**独立声明**自己的许可（在该目录内放 `LICENSE`/`COPYING` 与来源说明）。
+- 引用的 **Linux 内核**（`linux-src/` 外部源码树，不入库）为 **GPLv2**，按其自身条款分发；
+  本仓库不打包内核源码。内核侧改动（模块 / 最小化补丁）同样按 GPLv2。
 
