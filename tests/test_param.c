@@ -27,15 +27,14 @@
 
 /* ---- watcher 回调记录 ---- */
 typedef struct watch_rec {
-    int  calls;            /* 收到通知次数      */
+    int calls; /* 收到通知次数      */
     char last_key[128];
-    char last_old[256];    /* old==NULL 时记为空串 */
+    char last_old[256]; /* old==NULL 时记为空串 */
     char last_new[256];
-    int  old_null_count;   /* old 为 NULL 的次数 */
+    int old_null_count; /* old 为 NULL 的次数 */
 } watch_rec_t;
 
-static int watch_cb(const char *key, const char *old_v, const char *new_v,
-                    void *userdata) {
+static int watch_cb(const char *key, const char *old_v, const char *new_v, void *userdata) {
     watch_rec_t *r = (watch_rec_t *)userdata;
     r->calls++;
     snprintf(r->last_key, sizeof(r->last_key), "%s", key ? key : "");
@@ -76,40 +75,38 @@ static void test_param_basic_rw(void **state) {
     assert_false(hw_param_get_bool(&ctx, "no.such.key", false));
 
     /* string */
-    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "rr",
-                                        HWPARAM_TYPE_STRING, "调度策略"),
-                     HWRUN_OK);
+    assert_int_equal(
+        hw_param_set_value(&ctx, "sched.policy", "rr", HWPARAM_TYPE_STRING, "调度策略"), HWRUN_OK);
     const char *v = hw_param_get(&ctx, "sched.policy");
     assert_non_null(v);
     assert_string_equal(v, "rr");
 
     /* 覆盖写 */
-    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
     assert_string_equal(hw_param_get(&ctx, "sched.policy"), "fifo");
 
     /* int */
-    assert_int_equal(hw_param_set_value(&ctx, "net.port", "8080",
-                                        HWPARAM_TYPE_INT, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "net.port", "8080", HWPARAM_TYPE_INT, NULL),
+                     HWRUN_OK);
     assert_int_equal(hw_param_get_int(&ctx, "net.port", -1), 8080);
     assert_int_equal(hw_param_get_int(&ctx, "net.port", 12345), 8080);
 
     /* bool 形态识别 */
-    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "true",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "true", HWPARAM_TYPE_BOOL, NULL),
+                     HWRUN_OK);
     assert_true(hw_param_get_bool(&ctx, "feat.enable", false));
-    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "yes",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "yes", HWPARAM_TYPE_BOOL, NULL),
+                     HWRUN_OK);
     assert_true(hw_param_get_bool(&ctx, "feat.enable", false));
-    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "no",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "no", HWPARAM_TYPE_BOOL, NULL),
+                     HWRUN_OK);
     assert_false(hw_param_get_bool(&ctx, "feat.enable", true));
-    assert_int_equal(hw_param_set_value(&ctx, "feat.num", "0",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.num", "0", HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
     assert_false(hw_param_get_bool(&ctx, "feat.num", true));
     /* 无法识别的布尔值 → 回退默认 */
-    assert_int_equal(hw_param_set_value(&ctx, "feat.weird", "maybe",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.weird", "maybe", HWPARAM_TYPE_BOOL, NULL),
+                     HWRUN_OK);
     assert_true(hw_param_get_bool(&ctx, "feat.weird", true));
 
     /* shutdown 后置 NULL，一切 get 返回缺省 */
@@ -132,19 +129,15 @@ static void test_param_watch(void **state) {
     memset(&sched, 0, sizeof(sched));
 
     /* pattern ""=监听全部；"sched.*" 仅命中 sched 前缀 */
-    assert_int_equal(hw_param_watch(&ctx, "watcher-all", "", watch_cb, &all),
-                     HWRUN_OK);
-    assert_int_equal(hw_param_watch(&ctx, "watcher-sched", "sched.*",
-                                    watch_cb, &sched), HWRUN_OK);
+    assert_int_equal(hw_param_watch(&ctx, "watcher-all", "", watch_cb, &all), HWRUN_OK);
+    assert_int_equal(hw_param_watch(&ctx, "watcher-sched", "sched.*", watch_cb, &sched), HWRUN_OK);
     /* 非法入参 → EINVAL */
-    assert_int_equal(hw_param_watch(&ctx, NULL, NULL, watch_cb, NULL),
-                     HWRUN_EINVAL);
-    assert_int_equal(hw_param_watch(&ctx, "watcher-x", NULL, NULL, NULL),
-                     HWRUN_EINVAL);
+    assert_int_equal(hw_param_watch(&ctx, NULL, NULL, watch_cb, NULL), HWRUN_EINVAL);
+    assert_int_equal(hw_param_watch(&ctx, "watcher-x", NULL, NULL, NULL), HWRUN_EINVAL);
 
     /* 首次设置：old == NULL */
-    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
     assert_int_equal(all.calls, 1);
     assert_string_equal(all.last_key, "sched.policy");
     assert_int_equal(all.old_null_count, 1);
@@ -153,16 +146,16 @@ static void test_param_watch(void **state) {
     assert_int_equal(sched.calls, 1);
 
     /* 再次设置：watcher 收到 old 与 new */
-    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "cfs",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "cfs", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
     assert_int_equal(all.calls, 2);
     assert_string_equal(all.last_old, "fifo");
     assert_string_equal(all.last_new, "cfs");
     assert_int_equal(sched.calls, 2);
 
     /* 不匹配 "sched.*" 的 key：全量 watcher 命中，pattern watcher 不命中 */
-    assert_int_equal(hw_param_set_value(&ctx, "net.port", "9999",
-                                        HWPARAM_TYPE_INT, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "net.port", "9999", HWPARAM_TYPE_INT, NULL),
+                     HWRUN_OK);
     assert_int_equal(all.calls, 3);
     assert_string_equal(all.last_key, "net.port");
     assert_int_equal(sched.calls, 2);
@@ -175,18 +168,18 @@ static void test_param_file_roundtrip(void **state) {
     (void)state;
     char path[256];
     tmp_conf_path(path, sizeof(path));
-    remove(path);                       /* 清理可能的残留 */
+    remove(path); /* 清理可能的残留 */
 
     hw_param_context_t ctx;
     assert_int_equal(hw_param_init(&ctx, NULL), HWRUN_OK);
-    assert_int_equal(hw_param_set_value(&ctx, "net.ip", "10.0.0.7",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
-    assert_int_equal(hw_param_set_value(&ctx, "net.port", "8080",
-                                        HWPARAM_TYPE_INT, NULL), HWRUN_OK);
-    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo",
-                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
-    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "true",
-                                        HWPARAM_TYPE_BOOL, NULL), HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "net.ip", "10.0.0.7", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "net.port", "8080", HWPARAM_TYPE_INT, NULL),
+                     HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "sched.policy", "fifo", HWPARAM_TYPE_STRING, NULL),
+                     HWRUN_OK);
+    assert_int_equal(hw_param_set_value(&ctx, "feat.enable", "true", HWPARAM_TYPE_BOOL, NULL),
+                     HWRUN_OK);
     assert_int_equal(hw_param_save_file(&ctx, path), HWRUN_OK);
     hw_param_shutdown(&ctx);
 
@@ -212,11 +205,49 @@ static void test_param_file_roundtrip(void **state) {
     assert_true(hw_param_get_bool(&ctx2, "feat.enable", false));
 
     /* load 不存在的文件 → ENOENT */
-    assert_int_equal(hw_param_load_file(&ctx2, "/tmp/hwtest_param_missing.conf",
-                                        HWPARAM_USER), HWRUN_ENOENT);
+    assert_int_equal(hw_param_load_file(&ctx2, "/tmp/hwtest_param_missing.conf", HWPARAM_USER),
+                     HWRUN_ENOENT);
 
     hw_param_shutdown(&ctx2);
     remove(path);
+}
+
+/* ---- mark_revision 钩子：装配 on_revision 后 set_value 触发，带 reason ---- */
+typedef struct rev_rec {
+    int  calls;
+    char last_reason[128];
+} rev_rec_t;
+
+static void rev_cb(void *userdata, const char *reason) {
+    rev_rec_t *r = (rev_rec_t *)userdata;
+    r->calls++;
+    snprintf(r->last_reason, sizeof(r->last_reason), "%s", reason ? reason : "");
+}
+
+static void test_param_revision_hook(void **state) {
+    (void)state;
+    hw_param_context_t ctx;
+    rev_rec_t rec;
+
+    assert_int_equal(hw_param_init(&ctx, NULL), HWRUN_OK);
+
+    /* 未装配钩子：set_value 正常，不崩 */
+    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v1",
+                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+
+    /* 装配后：每次成功 set_value 回调一次，reason = 变更 key */
+    memset(&rec, 0, sizeof(rec));
+    ctx.on_revision = rev_cb;
+    ctx.revision_userdata = &rec;
+    assert_int_equal(hw_param_set_value(&ctx, "rev.key", "v2",
+                                        HWPARAM_TYPE_STRING, NULL), HWRUN_OK);
+    assert_int_equal(rec.calls, 1);
+    assert_string_equal(rec.last_reason, "rev.key");
+
+    /* shutdown 后 on_revision 不再被触发（ctx->initialized=0 直接返回） */
+    hw_param_shutdown(&ctx);
+    hw_param_set_value(&ctx, "rev.key", "v3", HWPARAM_TYPE_STRING, NULL);
+    assert_int_equal(rec.calls, 1);
 }
 
 int main(void) {
@@ -224,6 +255,7 @@ int main(void) {
         cmocka_unit_test(test_param_basic_rw),
         cmocka_unit_test(test_param_watch),
         cmocka_unit_test(test_param_file_roundtrip),
+        cmocka_unit_test(test_param_revision_hook),
     };
     return cmocka_run_group_tests(tests, NULL, group_teardown);
 }

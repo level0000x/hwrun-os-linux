@@ -19,11 +19,11 @@ extern "C" {
 #endif
 
 /* 与 kernel/include/uapi/hwrun.h 对齐 */
-#define HWRUN_KCTL_DEVICE          "/dev/hwrun"
-#define HWRUN_KCTL_ABI_VERSION     1
-#define HWRUN_KCTL_PROTOCOL_NAME_MAX   64
+#define HWRUN_KCTL_DEVICE "/dev/hwrun"
+#define HWRUN_KCTL_ABI_VERSION 1
+#define HWRUN_KCTL_PROTOCOL_NAME_MAX 64
 #define HWRUN_KCTL_PROTOCOL_VERSION_MAX 16
-#define HWRUN_KCTL_PROVIDER_NAME_MAX   64
+#define HWRUN_KCTL_PROVIDER_NAME_MAX 64
 
 typedef struct hwrun_kctl_desc {
     char protocol[HWRUN_KCTL_PROTOCOL_NAME_MAX];
@@ -34,21 +34,21 @@ typedef struct hwrun_kctl_desc {
 
 /* 客户端句柄：持有已打开的设备 fd */
 typedef struct hwrun_kctl {
-    int fd;           /* -1 = 未连接 */
+    int fd; /* -1 = 未连接 */
     char device[128];
-    int  connected;
+    int connected;
 } hwrun_kctl_t;
 
 /* ---- 生命周期 ---- */
-extern int hwrun_kctl_open(hwrun_kctl_t *c);          /* 打开 /dev/hwrun（可多次） */
+extern int hwrun_kctl_open(hwrun_kctl_t *c); /* 打开 /dev/hwrun（可多次） */
 extern int hwrun_kctl_open_path(hwrun_kctl_t *c, const char *path);
 extern void hwrun_kctl_close(hwrun_kctl_t *c);
 
 /* ---- 内核协议操作 ---- */
-extern int hwrun_kctl_get_abi(hwrun_kctl_t *c, uint32_t *abi);          /* HWRUN_IOC_GET_ABI */
-extern int hwrun_kctl_ping(hwrun_kctl_t *c, uint32_t *value);           /* HWRUN_IOC_PING   */
-extern int hwrun_kctl_protocol_register(hwrun_kctl_t *c, const char *protocol,
-                                        const char *version, const char *provider);
+extern int hwrun_kctl_get_abi(hwrun_kctl_t *c, uint32_t *abi); /* HWRUN_IOC_GET_ABI */
+extern int hwrun_kctl_ping(hwrun_kctl_t *c, uint32_t *value);  /* HWRUN_IOC_PING   */
+extern int hwrun_kctl_protocol_register(hwrun_kctl_t *c, const char *protocol, const char *version,
+                                        const char *provider);
 extern int hwrun_kctl_protocol_unregister(hwrun_kctl_t *c, const char *protocol,
                                           const char *provider);
 extern int hwrun_kctl_protocol_resolve(hwrun_kctl_t *c, const char *protocol,

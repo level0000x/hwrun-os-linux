@@ -35,28 +35,35 @@ int hw_str_eq(const char *a, const char *b) {
 }
 
 char **hw_str_split(const char *s, const char *sep, int *count) {
-    if (!s || !sep) { if (count) *count = 0; return NULL; }
+    if (!s || !sep) {
+        if (count) *count = 0;
+        return NULL;
+    }
 
     /* 先统计 */
     int n = 0;
     char *tmp = hw_strdup(s);
     char *save = NULL;
-    for (char *tok = strtok_r(tmp, sep, &save); tok;
-         tok = strtok_r(NULL, sep, &save)) {
+    for (char *tok = strtok_r(tmp, sep, &save); tok; tok = strtok_r(NULL, sep, &save)) {
         n++;
     }
     free(tmp);
 
-    if (n == 0) { if (count) *count = 0; return NULL; }
+    if (n == 0) {
+        if (count) *count = 0;
+        return NULL;
+    }
 
     char **list = malloc((n + 1) * sizeof(char *));
-    if (!list) { if (count) *count = 0; return NULL; }
+    if (!list) {
+        if (count) *count = 0;
+        return NULL;
+    }
 
     tmp = hw_strdup(s);
     save = NULL;
     int i = 0;
-    for (char *tok = strtok_r(tmp, sep, &save); tok;
-         tok = strtok_r(NULL, sep, &save)) {
+    for (char *tok = strtok_r(tmp, sep, &save); tok; tok = strtok_r(NULL, sep, &save)) {
         list[i++] = hw_strdup(tok);
     }
     list[i] = NULL;
@@ -68,13 +75,14 @@ char **hw_str_split(const char *s, const char *sep, int *count) {
 
 void hw_str_list_free(char **list, int count) {
     if (!list) return;
-    for (int i = 0; i < count; i++) free(list[i]);
+    for (int i = 0; i < count; i++)
+        free(list[i]);
     free(list);
 }
 
 int hw_fmt_path(char *out, size_t cap, const char *dir, const char *name) {
     if (!out || cap == 0 || !dir || !name) return HWRUN_EINVAL;
-    if (dir[strlen(dir)-1] == '/')
+    if (dir[strlen(dir) - 1] == '/')
         return snprintf(out, cap, "%s%s", dir, name) < (int)cap ? HWRUN_OK : HWRUN_ENOMEM;
     else
         return snprintf(out, cap, "%s/%s", dir, name) < (int)cap ? HWRUN_OK : HWRUN_ENOMEM;
@@ -86,20 +94,22 @@ const char *hw_strerror(int rc) {
     int code = (rc < 0) ? -rc : rc;
     if (code >= HW_EBASE) {
         switch (code - HW_EBASE) {
-        case 1: return "conflict (dependency or registration)";
-        case 2: return "not ready";
-        default: return "unknown error";
+        case 1:
+            return "conflict (dependency or registration)";
+        case 2:
+            return "not ready";
+        default:
+            return "unknown error";
         }
     }
-    return strerror(code);   /* 标准 errno（glibc 线程安全，返回静态缓冲） */
+    return strerror(code); /* 标准 errno（glibc 线程安全，返回静态缓冲） */
 }
 
 /* ============================================================
  * 参数树
  * ============================================================ */
 
-static hw_param_t *param_alloc(const char *key, const char *value,
-                               int type, const char *desc) {
+static hw_param_t *param_alloc(const char *key, const char *value, int type, const char *desc) {
     hw_param_t *p = calloc(1, sizeof(hw_param_t));
     if (!p) return NULL;
     snprintf(p->key, sizeof(p->key), "%s", key);
@@ -110,8 +120,7 @@ static hw_param_t *param_alloc(const char *key, const char *value,
 }
 
 /* 按 '.' 分割 key 的前缀与剩余 */
-static int param_split_key(const char *key, char *head, size_t hcap,
-                           const char **rest) {
+static int param_split_key(const char *key, char *head, size_t hcap, const char **rest) {
     const char *dot = strchr(key, '.');
     if (!dot) {
         snprintf(head, hcap, "%s", key);
@@ -133,14 +142,15 @@ hw_param_t *hw_param_get_child(hw_param_t *p, const char *key) {
     return NULL;
 }
 
-hw_param_t *hw_param_add_child(hw_param_t *parent, const char *key,
-                               const char *value, int type, const char *desc) {
+hw_param_t *hw_param_add_child(hw_param_t *parent, const char *key, const char *value, int type,
+                               const char *desc) {
     if (!parent || !key) return NULL;
     hw_param_t *p = param_alloc(key, value, type, desc);
     if (!p) return NULL;
     /* 追加到兄弟链表尾部 */
     hw_param_t **tail = &parent->child;
-    while (*tail) tail = &(*tail)->sibling;
+    while (*tail)
+        tail = &(*tail)->sibling;
     *tail = p;
     return p;
 }
@@ -157,15 +167,13 @@ hw_param_t *hw_param_find(hw_param_t *root, const char *key) {
     return hw_param_find(node, rest);
 }
 
-const char *hw_param_value(hw_param_t *root, const char *key,
-                           const char *def) {
+const char *hw_param_value(hw_param_t *root, const char *key, const char *def) {
     hw_param_t *p = hw_param_find(root, key);
     if (!p || !p->value[0]) return def;
     return p->value;
 }
 
-int hw_param_set(hw_param_t *root, const char *key, const char *value,
-                 int type, const char *desc) {
+int hw_param_set(hw_param_t *root, const char *key, const char *value, int type, const char *desc) {
     if (!root || !key || !value) return HWRUN_EINVAL;
 
     char head[128];
@@ -195,7 +203,8 @@ int hw_param_set(hw_param_t *root, const char *key, const char *value,
 /* 打印一棵参数树（调试/CLI 用） */
 void hw_param_dump(hw_param_t *p, int indent) {
     if (!p) return;
-    for (int i = 0; i < indent; i++) fputs("  ", stdout);
+    for (int i = 0; i < indent; i++)
+        fputs("  ", stdout);
     if (p->child && p->value[0]) {
         printf("[%s] = %s\n", p->key, p->value);
     } else if (p->child) {

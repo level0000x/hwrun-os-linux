@@ -52,16 +52,20 @@ extern "C" {
 
 /* 插件入口与运行时槽的符号声明（供 bus/loader 与测试 dlsym 前引用） */
 extern hw_plugin_t *hw_plugin_entry(void);
-extern void          hw_plugin_runtime_bind(hw_runtime_t *rt);
+extern void hw_plugin_runtime_bind(hw_runtime_t *rt);
 extern hw_runtime_t *hw_plugin_runtime_get(void);
 
 /* ============================================================
  * 运行时槽定义（HWRUN_PLUGIN_BIND 展开一次）
  * ============================================================ */
-#define HWRUN_PLUGIN_BIND()                                                \
-    static hw_runtime_t *g_hwrt;                                           \
-    void          hw_plugin_runtime_bind(hw_runtime_t *rt) { g_hwrt = rt; }\
-    hw_runtime_t *hw_plugin_runtime_get(void) { return g_hwrt; }
+#define HWRUN_PLUGIN_BIND()                                                                        \
+    static hw_runtime_t *g_hwrt;                                                                   \
+    void hw_plugin_runtime_bind(hw_runtime_t *rt) {                                                \
+        g_hwrt = rt;                                                                               \
+    }                                                                                              \
+    hw_runtime_t *hw_plugin_runtime_get(void) {                                                    \
+        return g_hwrt;                                                                             \
+    }
 
 /* ============================================================
  * 插件描述符生成（懒初始化）
@@ -75,33 +79,30 @@ extern hw_runtime_t *hw_plugin_runtime_get(void);
  *   _prov  provides 数组（const char*[]，NULL 哨兵结尾）
  *   _req   requires 数组（同上）
  * ============================================================ */
-#define HWRUN_PLUGIN_DEFINE(_id, _name, _ver, _type, _desc,                \
-                            _ops_p, _prov, _req)                           \
-    static hw_plugin_t g_hwplugin;                                          \
-    __attribute__((visibility("default")))                                  \
-    hw_plugin_t *hw_plugin_entry(void) {                                    \
-        if (g_hwplugin.id[0] == '\0') {                                     \
-            size_t _i;                                                      \
-            memset(&g_hwplugin, 0, sizeof(g_hwplugin));                     \
-            snprintf(g_hwplugin.id, sizeof(g_hwplugin.id), "%s", (_id));    \
-            snprintf(g_hwplugin.name, sizeof(g_hwplugin.name), "%s",        \
-                     (_name));                                              \
-            snprintf(g_hwplugin.version, sizeof(g_hwplugin.version),        \
-                     "%s", (_ver));                                         \
-            snprintf(g_hwplugin.description, sizeof(g_hwplugin.description),\
-                     "%s", (_desc));                                        \
-            g_hwplugin.type  = (_type);                                     \
-            g_hwplugin.state = HWPLUGIN_INSTALLED;                          \
-            g_hwplugin.provides = (char **)(void *)(_prov);                 \
-            for (_i = 0; (_prov)[_i] != NULL; _i++) ;                       \
-            g_hwplugin.provides_count = (int)_i;                            \
-            g_hwplugin.requires = (char **)(void *)(_req);                  \
-            for (_i = 0; (_req)[_i] != NULL; _i++) ;                        \
-            g_hwplugin.requires_count = (int)_i;                            \
-            g_hwplugin.ops = *(_ops_p);                       \
-            g_hwplugin.runtime_bind = hw_plugin_runtime_bind;               \
-        }                                                                   \
-        return &g_hwplugin;                                                 \
+#define HWRUN_PLUGIN_DEFINE(_id, _name, _ver, _type, _desc, _ops_p, _prov, _req)                   \
+    static hw_plugin_t g_hwplugin;                                                                 \
+    __attribute__((visibility("default"))) hw_plugin_t *hw_plugin_entry(void) {                    \
+        if (g_hwplugin.id[0] == '\0') {                                                            \
+            size_t _i;                                                                             \
+            memset(&g_hwplugin, 0, sizeof(g_hwplugin));                                            \
+            snprintf(g_hwplugin.id, sizeof(g_hwplugin.id), "%s", (_id));                           \
+            snprintf(g_hwplugin.name, sizeof(g_hwplugin.name), "%s", (_name));                     \
+            snprintf(g_hwplugin.version, sizeof(g_hwplugin.version), "%s", (_ver));                \
+            snprintf(g_hwplugin.description, sizeof(g_hwplugin.description), "%s", (_desc));       \
+            g_hwplugin.type = (_type);                                                             \
+            g_hwplugin.state = HWPLUGIN_INSTALLED;                                                 \
+            g_hwplugin.provides = (char **)(void *)(_prov);                                        \
+            for (_i = 0; (_prov)[_i] != NULL; _i++)                                                \
+                ;                                                                                  \
+            g_hwplugin.provides_count = (int)_i;                                                   \
+            g_hwplugin.requires = (char **)(void *)(_req);                                         \
+            for (_i = 0; (_req)[_i] != NULL; _i++)                                                 \
+                ;                                                                                  \
+            g_hwplugin.requires_count = (int)_i;                                                   \
+            g_hwplugin.ops = *(_ops_p);                                                            \
+            g_hwplugin.runtime_bind = hw_plugin_runtime_bind;                                      \
+        }                                                                                          \
+        return &g_hwplugin;                                                                        \
     }
 
 #ifdef __cplusplus

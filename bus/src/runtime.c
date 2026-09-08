@@ -12,7 +12,7 @@
 
 #include <stdarg.h>
 
-static hw_bus_t *g_bus;   /* 单例：总线只有一个实例 */
+static hw_bus_t *g_bus; /* 单例：总线只有一个实例 */
 
 /* ---- LOG：转发到 LOG 子系统的 va_list 版本 ---- */
 static void rt_log(int level, const char *plugin_id, const char *fmt, ...) {
@@ -32,16 +32,13 @@ static int rt_param_get_int(const char *key, int def) {
 static bool rt_param_get_bool(const char *key, bool def) {
     return g_bus ? hw_param_get_bool(&g_bus->params, key, def) : def;
 }
-static int rt_param_set(const char *key, const char *value, int type,
-                        const char *desc) {
-    return g_bus ? hw_param_set_value(&g_bus->params, key, value, type, desc)
-                 : HWRUN_EINVAL;
+static int rt_param_set(const char *key, const char *value, int type, const char *desc) {
+    return g_bus ? hw_param_set_value(&g_bus->params, key, value, type, desc) : HWRUN_EINVAL;
 }
 static int rt_param_watch(const char *plugin_id, const char *pattern,
-                          int (*cb)(const char*, const char*, const char*, void*),
+                          int (*cb)(const char *, const char *, const char *, void *),
                           void *userdata) {
-    return g_bus ? hw_param_watch(&g_bus->params, plugin_id, pattern, cb, userdata)
-                 : HWRUN_EINVAL;
+    return g_bus ? hw_param_watch(&g_bus->params, plugin_id, pattern, cb, userdata) : HWRUN_EINVAL;
 }
 
 void hw_runtime_bus_bind(hw_bus_t *bus) {
@@ -51,12 +48,12 @@ void hw_runtime_bus_bind(hw_bus_t *bus) {
 /* 构造 LOG/PARAM 回调；GIT 由 loader 解析到真实 ops 后补填 */
 void hw_runtime_fill(hw_runtime_t *rt) {
     memset(rt, 0, sizeof(*rt));
-    rt->log            = rt_log;
-    rt->param_get      = rt_param_get;
-    rt->param_get_int  = rt_param_get_int;
+    rt->log = rt_log;
+    rt->param_get = rt_param_get;
+    rt->param_get_int = rt_param_get_int;
     rt->param_get_bool = rt_param_get_bool;
-    rt->param_set      = rt_param_set;
-    rt->param_watch    = rt_param_watch;
+    rt->param_set = rt_param_set;
+    rt->param_watch = rt_param_watch;
 }
 
 /* 供测试直接访问总线单例 */

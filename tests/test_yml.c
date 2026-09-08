@@ -31,29 +31,28 @@
 
 /* 样例：plugin 嵌套根；provides/requires 同时含 "- protocol: X" 与 "- X"；
  * 顶层 version/type 必须不被列表项子键（version/type）覆盖。 */
-static const char YML_BODY[] =
-    "# CMocka yml 解析夹具\n"
-    "plugin:\n"
-    "  id: \"testplug\"\n"
-    "  name: \"Test Plugin\"\n"
-    "  version: \"2.3.4\"\n"
-    "  type: \"tools\"\n"
-    "  description: \"yml parse fixture\"\n"
-    "  provides:\n"
-    "    - protocol: \"FOO\"\n"
-    "      version: \"1.0\"\n"
-    "    - \"BAR\"\n"
-    "  requires:\n"
-    "    - protocol: \"LOG\"\n"
-    "      version: \"1.0\"\n"
-    "    - \"METAPROTO\"\n"
-    "  params:\n"
-    "    - key: \"testplug.flag\"\n"
-    "      type: \"bool\"\n"
-    "      default: \"true\"\n"
-    "  files:\n"
-    "    - \"build/testplug.so\"\n"
-    "    - \"README.md\"\n";
+static const char YML_BODY[] = "# CMocka yml 解析夹具\n"
+                               "plugin:\n"
+                               "  id: \"testplug\"\n"
+                               "  name: \"Test Plugin\"\n"
+                               "  version: \"2.3.4\"\n"
+                               "  type: \"tools\"\n"
+                               "  description: \"yml parse fixture\"\n"
+                               "  provides:\n"
+                               "    - protocol: \"FOO\"\n"
+                               "      version: \"1.0\"\n"
+                               "    - \"BAR\"\n"
+                               "  requires:\n"
+                               "    - protocol: \"LOG\"\n"
+                               "      version: \"1.0\"\n"
+                               "    - \"METAPROTO\"\n"
+                               "  params:\n"
+                               "    - key: \"testplug.flag\"\n"
+                               "      type: \"bool\"\n"
+                               "      default: \"true\"\n"
+                               "  files:\n"
+                               "    - \"build/testplug.so\"\n"
+                               "    - \"README.md\"\n";
 
 /* ---- 临时文件路径：/tmp/hwtest_yml_<pid>.yml ---- */
 static void tmp_yml_path(char *buf, size_t cap) {
@@ -73,7 +72,7 @@ static void test_yml_parse_ok(void **state) {
     (void)state;
     char path[256];
     tmp_yml_path(path, sizeof(path));
-    remove(path);                       /* 清理可能的残留 */
+    remove(path); /* 清理可能的残留 */
 
     FILE *fp = fopen(path, "w");
     assert_non_null(fp);
@@ -94,7 +93,7 @@ static void test_yml_parse_ok(void **state) {
     assert_string_equal(hw_type_to_str(HWPLUGIN_TYPE_TOOLS), "tools");
     /* 缩进回归：顶层 version/type 不被列表项子键与 params 项覆盖 */
     assert_string_equal(disc.version, "2.3.4");
-    assert_string_equal(disc.type, "tools");   /* 未被 params 的 type: bool 覆盖 */
+    assert_string_equal(disc.type, "tools"); /* 未被 params 的 type: bool 覆盖 */
 
     /* provides：version map + 纯字符串两形态，均入列 */
     assert_int_equal(disc.provides_count, 2);
@@ -132,8 +131,7 @@ static void test_yml_parse_errors(void **state) {
     hw_plugin_discovery_t disc;
 
     assert_int_equal(hw_yml_parse_plugin(NULL, &disc), HWRUN_EINVAL);
-    assert_int_equal(hw_yml_parse_plugin("/tmp/hwtest_yml_no_such_file.yml",
-                                         &disc), HWRUN_ENOENT);
+    assert_int_equal(hw_yml_parse_plugin("/tmp/hwtest_yml_no_such_file.yml", &disc), HWRUN_ENOENT);
 }
 
 int main(void) {

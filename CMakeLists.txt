@@ -71,12 +71,14 @@ set(CMAKE_SHARED_LIBRARY_PREFIX "")
 set(HWRUN_ENABLE_SANITIZER "" CACHE STRING
     "address|undefined|thread|all （多个用分号）")
 if(HWRUN_ENABLE_SANITIZER)
-  set(_san_flags "")
+  # 以 CMake 列表累积（add_compile_options 只按分号切分；若拼成含空格的
+  # 单个字符串，多 sanitizer 会被当作一个参数传给编译器导致失败）
+  unset(_san_flags)
   foreach(_s IN LISTS HWRUN_ENABLE_SANITIZER)
     if(_s STREQUAL "all")
-      set(_san_flags "${_san_flags} -fsanitize=address -fsanitize=undefined -fsanitize=thread")
+      list(APPEND _san_flags -fsanitize=address -fsanitize=undefined -fsanitize=thread)
     else()
-      set(_san_flags "${_san_flags} -fsanitize=${_s}")
+      list(APPEND _san_flags "-fsanitize=${_s}")
     endif()
   endforeach()
   add_compile_options(${_san_flags})

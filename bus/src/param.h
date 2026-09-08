@@ -17,23 +17,22 @@ extern "C" {
 
 /* 参数来源层级 */
 enum {
-    HWPARAM_HW   = 0,   /* 硬件参数（硬件探测提供） */
-    HWPARAM_SYS  = 1,   /* 系统参数（系统生成）     */
-    HWPARAM_USER = 2,   /* 用户参数（用户配置）     */
-    HWPARAM_PLUG = 3,   /* 插件参数（插件配置）     */
-    HWPARAM_GIT  = 4,   /* Git 参数                */
-    HWPARAM_FMT  = 5,   /* 格式参数                */
-    HWPARAM_RUN  = 6,   /* 运行时参数              */
+    HWPARAM_HW = 0,   /* 硬件参数（硬件探测提供） */
+    HWPARAM_SYS = 1,  /* 系统参数（系统生成）     */
+    HWPARAM_USER = 2, /* 用户参数（用户配置）     */
+    HWPARAM_PLUG = 3, /* 插件参数（插件配置）     */
+    HWPARAM_GIT = 4,  /* Git 参数                */
+    HWPARAM_FMT = 5,  /* 格式参数                */
+    HWPARAM_RUN = 6,  /* 运行时参数              */
     HWPARAM_SRC_MAX,
 };
 
 /* 参数变更监听器 */
 typedef struct hw_param_watcher {
     char plugin_id[64];
-    int (*on_change)(const char *key, const char *old_value,
-                     const char *new_value, void *userdata);
+    int (*on_change)(const char *key, const char *old_value, const char *new_value, void *userdata);
     void *userdata;
-    char pattern[128];      /* 通配：""=全部, "scheduler.*" */
+    char pattern[128]; /* 通配：""=全部, "scheduler.*" */
     struct hw_param_watcher *next;
 } hw_param_watcher_t;
 
@@ -45,38 +44,39 @@ typedef struct hw_param_context {
     char dirs[HWPARAM_SRC_MAX][256];      /* 各来源目录 */
     char git_state_file[256];             /* git 状态文件 */
     int  initialized;
+
+    /* 参数树变更钩子（bus 在 init 后装配，用于 GIT 自动 commit 等）。
+     * param 属第 1 环，不依赖 GIT，只把"参数被改动"事件在此转发出去；
+     * hw_param_set_value 在写锁外调用该回调。init 置空，shutdown 后不再触发。 */
+    void (*on_revision)(void *userdata, const char *reason);
+    void *revision_userdata;
 } hw_param_context_t;
 
 /* 初始化：默认加载 dirs 下全部 yml/conf 参数 */
-extern int  hw_param_init(hw_param_context_t *ctx, const char *root_dir);
+extern int hw_param_init(hw_param_context_t *ctx, const char *root_dir);
 extern void hw_param_shutdown(hw_param_context_t *ctx);
 
 /* 值读写 */
 extern const char *hw_param_get(hw_param_context_t *ctx, const char *key);
-extern int         hw_param_get_int(hw_param_context_t *ctx, const char *key,
-                                    int def);
-extern bool        hw_param_get_bool(hw_param_context_t *ctx, const char *key,
-                                     bool def);
-extern int         hw_param_set_value(hw_param_context_t *ctx, const char *key,
-                                      const char *value, int type,
-                                      const char *desc);
+extern int hw_param_get_int(hw_param_context_t *ctx, const char *key, int def);
+extern bool hw_param_get_bool(hw_param_context_t *ctx, const char *key, bool def);
+extern int hw_param_set_value(hw_param_context_t *ctx, const char *key, const char *value, int type,
+                              const char *desc);
 
 /* 监听 */
-extern int  hw_param_watch(hw_param_context_t *ctx, const char *plugin_id,
-                           const char *pattern,
-                           int (*cb)(const char*,const char*,const char*,void*),
-                           void *userdata);
-extern void hw_param_notify(hw_param_context_t *ctx, const char *key,
-                            const char *old_v, const char *new_v);
+extern int hw_param_watch(hw_param_context_t *ctx, const char *plugin_id, const char *pattern,
+                          int (*cb)(const char *, const char *, const char *, void *),
+                          void *userdata);
+extern void hw_param_notify(hw_param_context_t *ctx, const char *key, const char *old_v,
+                            const char *new_v);
 
-/* 变更自动 git commit（依赖 GIT 子系统，先标记待办） */
-extern void hw_param_mark_revision(hw_param_context_t *ctx,
-                                   const char *reason);
+/* 参数树被改动（set_value 成功后写锁外触发）：
+ * 把事件转发到 ctx->on_revision 钩子（bus 装配的 GIT 自动 commit 等） */
+extern void hw_param_mark_revision(hw_param_context_t *ctx, const char *reason);
 
 /* 加载/保存到文件（简单键值 / 近似 yml） */
-extern int  hw_param_load_file(hw_param_context_t *ctx, const char *path,
-                               int source);
-extern int  hw_param_save_file(hw_param_context_t *ctx, const char *path);
+extern int hw_param_load_file(hw_param_context_t *ctx, const char *path, int source);
+extern int hw_param_save_file(hw_param_context_t *ctx, const char *path);
 
 /* 列出全部（调试/CLI） */
 extern void hw_param_dump_all(hw_param_context_t *ctx);

@@ -11,25 +11,24 @@
 #include <ctype.h>
 #include <fnmatch.h>
 
-static int hw_param_tree_save(const hw_param_t *p, const char *prefix,
-                              FILE *fp);
+static int hw_param_tree_save(const hw_param_t *p, const char *prefix, FILE *fp);
 
 int hw_param_init(hw_param_context_t *ctx, const char *root_dir) {
     if (!ctx) return HWRUN_EINVAL;
     memset(ctx, 0, sizeof(*ctx));
     hw_locker_init(&ctx->lock, HWLOCK_RW);
     ctx->root = calloc(1, sizeof(hw_param_t));
-    if (!ctx->root) { hw_locker_destroy(&ctx->lock); return HWRUN_ENOMEM; }
+    if (!ctx->root) {
+        hw_locker_destroy(&ctx->lock);
+        return HWRUN_ENOMEM;
+    }
     snprintf(ctx->root->key, sizeof(ctx->root->key), ".");
     ctx->root->type = HWPARAM_TYPE_STRING;
     ctx->initialized = 1;
     if (root_dir) {
-        hw_fmt_path(ctx->dirs[HWPARAM_USER], sizeof(ctx->dirs[HWPARAM_USER]),
-                    root_dir, "params");
-        hw_fmt_path(ctx->dirs[HWPARAM_HW], sizeof(ctx->dirs[HWPARAM_HW]),
-                    root_dir, "hardware");
-        hw_fmt_path(ctx->dirs[HWPARAM_GIT], sizeof(ctx->dirs[HWPARAM_GIT]),
-                    root_dir, "git");
+        hw_fmt_path(ctx->dirs[HWPARAM_USER], sizeof(ctx->dirs[HWPARAM_USER]), root_dir, "params");
+        hw_fmt_path(ctx->dirs[HWPARAM_HW], sizeof(ctx->dirs[HWPARAM_HW]), root_dir, "hardware");
+        hw_fmt_path(ctx->dirs[HWPARAM_GIT], sizeof(ctx->dirs[HWPARAM_GIT]), root_dir, "git");
     }
     return HWRUN_OK;
 }
@@ -47,6 +46,14 @@ void hw_param_tree_free(hw_param_t *p) {
 
 void hw_param_shutdown(hw_param_context_t *ctx) {
     if (!ctx) return;
+    /* 释放 watcher 链表（watch 节点由 hw_param_watch 分配，shutdown 前不回收则泄漏） */
+    hw_param_watcher_t *w = ctx->watchers;
+    while (w) {
+        hw_param_watcher_t *n = w->next;
+        free(w);
+        w = n;
+    }
+    ctx->watchers = NULL;
     hw_param_tree_free(ctx->root);
     ctx->root = NULL;
     ctx->initialized = 0;
@@ -83,15 +90,13 @@ bool hw_param_get_bool(hw_param_context_t *ctx, const char *key, bool def) {
         if (p && p->value[0]) snprintf(buf, sizeof(buf), "%s", p->value);
     }
     if (!buf[0]) return def;
-    if (hw_str_eq(buf, "true") || hw_str_eq(buf, "1") || hw_str_eq(buf, "yes"))
-        return true;
-    if (hw_str_eq(buf, "false") || hw_str_eq(buf, "0") || hw_str_eq(buf, "no"))
-        return false;
+    if (hw_str_eq(buf, "true") || hw_str_eq(buf, "1") || hw_str_eq(buf, "yes")) return true;
+    if (hw_str_eq(buf, "false") || hw_str_eq(buf, "0") || hw_str_eq(buf, "no")) return false;
     return def;
 }
 
-int hw_param_set_value(hw_param_context_t *ctx, const char *key,
-                       const char *value, int type, const char *desc) {
+int hw_param_set_value(hw_param_context_t *ctx, const char *key, const char *value, int type,
+                       const char *desc) {
     if (!ctx || !ctx->root) return HWRUN_EINVAL;
     int rc = HWRUN_OK;
     /* 锁内完成「读旧值 + 改树」，保证临界区原子；notify 移到出锁后 */
@@ -107,15 +112,13 @@ int hw_param_set_value(hw_param_context_t *ctx, const char *key,
     }
     if (rc == HWRUN_OK) {
         hw_param_notify(ctx, key, has_old ? old_copy : NULL, value);
-        hw_param_mark_revision(ctx, NULL);
+        hw_param_mark_revision(ctx, key);
     }
     return rc;
 }
 
-int hw_param_watch(hw_param_context_t *ctx, const char *plugin_id,
-                   const char *pattern,
-                   int (*cb)(const char*,const char*,const char*,void*),
-                   void *userdata) {
+int hw_param_watch(hw_param_context_t *ctx, const char *plugin_id, const char *pattern,
+                   int (*cb)(const char *, const char *, const char *, void *), void *userdata) {
     if (!ctx || !plugin_id || !cb) return HWRUN_EINVAL;
     int rc = HWRUN_OK;
     HW_WRLOCK_GUARD(&ctx->lock) {
@@ -134,14 +137,17 @@ int hw_param_watch(hw_param_context_t *ctx, const char *plugin_id,
     return rc;
 }
 
-void hw_param_notify(hw_param_context_t *ctx, const char *key,
-                     const char *old_v, const char *new_v) {
+void hw_param_notify(hw_param_context_t *ctx, const char *key, const char *old_v,
+                     const char *new_v) {
     if (!ctx || !key) return;
     /* 锁内快照匹配 watcher（cb+userdata；watcher 可能被并发释放），
      * 出锁后逐个派发 —— 持锁期间绝不调用 watcher 回调。
      * 快照上限 64：超限静默截断（watcher 数百的场景不存在）。 */
     typedef int (*watch_cb_t)(const char *, const char *, const char *, void *);
-    struct { watch_cb_t cb; void *ud; } snaps[64];
+    struct {
+        watch_cb_t cb;
+        void *ud;
+    } snaps[64];
     int n = 0;
     HW_RDLOCK_GUARD(&ctx->lock) {
         for (hw_param_watcher_t *w = ctx->watchers; w; w = w->next) {
@@ -159,8 +165,11 @@ void hw_param_notify(hw_param_context_t *ctx, const char *key,
 }
 
 void hw_param_mark_revision(hw_param_context_t *ctx, const char *reason) {
-    (void)ctx; (void)reason;
-    /* GIT 子系统接入后在此自动 commit 参数变更 */
+    if (!ctx || !ctx->initialized) return;
+    /* set_value 已在此前的写锁外派发（notify 之后调用本函数），锁不在此处持有；
+     * 直接把"参数树被改动"事件转发给 bus 装配的钩子（GIT 自动 commit 等）。
+     * param 属第 1 环，不在此 include 任何 GIT 头。 */
+    if (ctx->on_revision) ctx->on_revision(ctx->revision_userdata, reason);
 }
 
 int hw_param_load_file(hw_param_context_t *ctx, const char *path, int source) {
@@ -171,9 +180,10 @@ int hw_param_load_file(hw_param_context_t *ctx, const char *path, int source) {
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
         if (!*p || *p == '#' || *p == '\n' || *p == '\r') continue;
-        if (*p == ' ') continue;              /* 缩进(嵌套)行：扁平解析跳过 */
+        if (*p == ' ') continue; /* 缩进(嵌套)行：扁平解析跳过 */
 
         char *sep = strchr(p, ':');
         if (!sep) sep = strchr(p, '=');
@@ -183,13 +193,15 @@ int hw_param_load_file(hw_param_context_t *ctx, const char *path, int source) {
         char *val = sep + 1;
 
         char *ke = key + strlen(key);
-        while (ke > key && isspace((unsigned char)ke[-1])) ke--;
+        while (ke > key && isspace((unsigned char)ke[-1]))
+            ke--;
         *ke = '\0';
 
-        while (*val == ' ' || *val == '\t' || *val == '\"') val++;
+        while (*val == ' ' || *val == '\t' || *val == '\"')
+            val++;
         char *ve = val + strlen(val);
-        while (ve > val && (isspace((unsigned char)ve[-1]) ||
-                            ve[-1] == '\"' || ve[-1] == '\r' || ve[-1] == '\n'))
+        while (ve > val && (isspace((unsigned char)ve[-1]) || ve[-1] == '\"' || ve[-1] == '\r' ||
+                            ve[-1] == '\n'))
             ve--;
         *ve = '\0';
 
@@ -214,8 +226,7 @@ int hw_param_save_file(hw_param_context_t *ctx, const char *path) {
 }
 
 /* 递归把参数树写成扁平 "a.b.c: value" */
-static int hw_param_tree_save(const hw_param_t *p, const char *prefix,
-                              FILE *fp) {
+static int hw_param_tree_save(const hw_param_t *p, const char *prefix, FILE *fp) {
     if (!p) return HWRUN_OK;
     for (const hw_param_t *c = p->child; c; c = c->sibling) {
         char kk[512];

@@ -30,33 +30,31 @@ extern "C" {
 #endif
 
 typedef enum {
-    HWLOCK_RW = 0,   /* 读写锁：多读单写 */
-    HWLOCK_MTX,      /* 互斥锁：纯串行 */
+    HWLOCK_RW = 0, /* 读写锁：多读单写 */
+    HWLOCK_MTX,    /* 互斥锁：纯串行 */
 } hw_lock_kind_t;
 
 typedef struct hw_locker {
-    pthread_rwlock_t rw;      /* HWLOCK_RW 使用 */
-    pthread_mutex_t  mtx;     /* HWLOCK_MTX 使用 */
-    hw_lock_kind_t   kind;
-    bool             armed;   /* 是否已开启并行（启动期 false = no-op） */
+    pthread_rwlock_t rw; /* HWLOCK_RW 使用 */
+    pthread_mutex_t mtx; /* HWLOCK_MTX 使用 */
+    hw_lock_kind_t kind;
+    bool armed; /* 是否已开启并行（启动期 false = no-op） */
 } hw_locker_t;
 
 /* 全局并行开关：boot_chain 完成后调用一次，此后所有锁生效 */
 extern void hw_locker_enable_parallel(void);
 
-extern int  hw_locker_init(hw_locker_t *lk, hw_lock_kind_t kind);
+extern int hw_locker_init(hw_locker_t *lk, hw_lock_kind_t kind);
 extern void hw_locker_destroy(hw_locker_t *lk);
-extern int  hw_locker_rdlock(hw_locker_t *lk);
-extern int  hw_locker_wrlock(hw_locker_t *lk);
-extern int  hw_locker_unlock(hw_locker_t *lk);
+extern int hw_locker_rdlock(hw_locker_t *lk);
+extern int hw_locker_wrlock(hw_locker_t *lk);
+extern int hw_locker_unlock(hw_locker_t *lk);
 
 /* 作用域 RAII：进入加锁，离开作用域自动解锁 */
-#define HW_RDLOCK_GUARD(lk) \
-    for (int _hwlk = hw_locker_rdlock((lk)); _hwlk >= 0; \
-         hw_locker_unlock((lk)), _hwlk = -1)
-#define HW_WRLOCK_GUARD(lk) \
-    for (int _hwlk = hw_locker_wrlock((lk)); _hwlk >= 0; \
-         hw_locker_unlock((lk)), _hwlk = -1)
+#define HW_RDLOCK_GUARD(lk)                                                                        \
+    for (int _hwlk = hw_locker_rdlock((lk)); _hwlk >= 0; hw_locker_unlock((lk)), _hwlk = -1)
+#define HW_WRLOCK_GUARD(lk)                                                                        \
+    for (int _hwlk = hw_locker_wrlock((lk)); _hwlk >= 0; hw_locker_unlock((lk)), _hwlk = -1)
 
 #ifdef __cplusplus
 }

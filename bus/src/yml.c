@@ -17,56 +17,94 @@
 
 int hw_type_from_str(const char *s) {
     if (!s) return HWPLUGIN_TYPE_UNKNOWN;
-    if      (hw_str_eq(s, "kernel"))    return HWPLUGIN_TYPE_KERNEL;
-    else if (hw_str_eq(s, "libc"))      return HWPLUGIN_TYPE_LIBC;
-    else if (hw_str_eq(s, "init"))      return HWPLUGIN_TYPE_INIT;
-    else if (hw_str_eq(s, "fs"))        return HWPLUGIN_TYPE_FS;
-    else if (hw_str_eq(s, "network"))   return HWPLUGIN_TYPE_NETWORK;
-    else if (hw_str_eq(s, "security"))  return HWPLUGIN_TYPE_SECURITY;
-    else if (hw_str_eq(s, "storage"))   return HWPLUGIN_TYPE_STORAGE;
-    else if (hw_str_eq(s, "logging"))   return HWPLUGIN_TYPE_LOGGING;
-    else if (hw_str_eq(s, "scheduler")) return HWPLUGIN_TYPE_SCHEDULER;
-    else if (hw_str_eq(s, "git"))       return HWPLUGIN_TYPE_GIT;
-    else if (hw_str_eq(s, "loader"))    return HWPLUGIN_TYPE_LOADER;
-    else if (hw_str_eq(s, "ui"))        return HWPLUGIN_TYPE_UI;
-    else if (hw_str_eq(s, "tools"))     return HWPLUGIN_TYPE_TOOLS;
-    else if (hw_str_eq(s, "management"))return HWPLUGIN_TYPE_MANAGEMENT;
-    else if (hw_str_eq(s, "driver"))    return HWPLUGIN_TYPE_DRIVER;
-    else if (hw_str_eq(s, "container")) return HWPLUGIN_TYPE_CONTAINER;
-    else if (hw_str_eq(s, "crypto"))    return HWPLUGIN_TYPE_CRYPTO;
-    else if (hw_str_eq(s, "application")) return HWPLUGIN_TYPE_MANAGEMENT;
+    if (hw_str_eq(s, "kernel"))
+        return HWPLUGIN_TYPE_KERNEL;
+    else if (hw_str_eq(s, "libc"))
+        return HWPLUGIN_TYPE_LIBC;
+    else if (hw_str_eq(s, "init"))
+        return HWPLUGIN_TYPE_INIT;
+    else if (hw_str_eq(s, "fs"))
+        return HWPLUGIN_TYPE_FS;
+    else if (hw_str_eq(s, "network"))
+        return HWPLUGIN_TYPE_NETWORK;
+    else if (hw_str_eq(s, "security"))
+        return HWPLUGIN_TYPE_SECURITY;
+    else if (hw_str_eq(s, "storage"))
+        return HWPLUGIN_TYPE_STORAGE;
+    else if (hw_str_eq(s, "logging"))
+        return HWPLUGIN_TYPE_LOGGING;
+    else if (hw_str_eq(s, "scheduler"))
+        return HWPLUGIN_TYPE_SCHEDULER;
+    else if (hw_str_eq(s, "git"))
+        return HWPLUGIN_TYPE_GIT;
+    else if (hw_str_eq(s, "loader"))
+        return HWPLUGIN_TYPE_LOADER;
+    else if (hw_str_eq(s, "ui"))
+        return HWPLUGIN_TYPE_UI;
+    else if (hw_str_eq(s, "tools"))
+        return HWPLUGIN_TYPE_TOOLS;
+    else if (hw_str_eq(s, "management"))
+        return HWPLUGIN_TYPE_MANAGEMENT;
+    else if (hw_str_eq(s, "driver"))
+        return HWPLUGIN_TYPE_DRIVER;
+    else if (hw_str_eq(s, "container"))
+        return HWPLUGIN_TYPE_CONTAINER;
+    else if (hw_str_eq(s, "crypto"))
+        return HWPLUGIN_TYPE_CRYPTO;
+    else if (hw_str_eq(s, "application"))
+        return HWPLUGIN_TYPE_MANAGEMENT;
     return HWPLUGIN_TYPE_UNKNOWN;
 }
 
 const char *hw_type_to_str(int type) {
     switch (type) {
-    case HWPLUGIN_TYPE_KERNEL:   return "kernel";
-    case HWPLUGIN_TYPE_LIBC:     return "libc";
-    case HWPLUGIN_TYPE_INIT:     return "init";
-    case HWPLUGIN_TYPE_FS:       return "fs";
-    case HWPLUGIN_TYPE_NETWORK:  return "network";
-    case HWPLUGIN_TYPE_SECURITY: return "security";
-    case HWPLUGIN_TYPE_STORAGE:  return "storage";
-    case HWPLUGIN_TYPE_LOGGING:  return "logging";
-    case HWPLUGIN_TYPE_SCHEDULER:return "scheduler";
-    case HWPLUGIN_TYPE_GIT:      return "git";
-    case HWPLUGIN_TYPE_LOADER:   return "loader";
-    case HWPLUGIN_TYPE_UI:       return "ui";
-    case HWPLUGIN_TYPE_TOOLS:    return "tools";
-    case HWPLUGIN_TYPE_MANAGEMENT:return "management";
-    case HWPLUGIN_TYPE_DRIVER:   return "driver";
-    case HWPLUGIN_TYPE_CONTAINER:return "container";
-    case HWPLUGIN_TYPE_CRYPTO:   return "crypto";
-    default: return "unknown";
+    case HWPLUGIN_TYPE_KERNEL:
+        return "kernel";
+    case HWPLUGIN_TYPE_LIBC:
+        return "libc";
+    case HWPLUGIN_TYPE_INIT:
+        return "init";
+    case HWPLUGIN_TYPE_FS:
+        return "fs";
+    case HWPLUGIN_TYPE_NETWORK:
+        return "network";
+    case HWPLUGIN_TYPE_SECURITY:
+        return "security";
+    case HWPLUGIN_TYPE_STORAGE:
+        return "storage";
+    case HWPLUGIN_TYPE_LOGGING:
+        return "logging";
+    case HWPLUGIN_TYPE_SCHEDULER:
+        return "scheduler";
+    case HWPLUGIN_TYPE_GIT:
+        return "git";
+    case HWPLUGIN_TYPE_LOADER:
+        return "loader";
+    case HWPLUGIN_TYPE_UI:
+        return "ui";
+    case HWPLUGIN_TYPE_TOOLS:
+        return "tools";
+    case HWPLUGIN_TYPE_MANAGEMENT:
+        return "management";
+    case HWPLUGIN_TYPE_DRIVER:
+        return "driver";
+    case HWPLUGIN_TYPE_CONTAINER:
+        return "container";
+    case HWPLUGIN_TYPE_CRYPTO:
+        return "crypto";
+    default:
+        return "unknown";
     }
 }
 
 /* 去首尾空白 */
 static char *trim(char *s) {
     if (!s) return s;
-    while (*s && isspace((unsigned char)*s)) s++;
+    while (*s && isspace((unsigned char)*s))
+        s++;
     char *e = s + strlen(s);
-    while (e > s && isspace((unsigned char)e[-1])) e--;
+    while (e > s && isspace((unsigned char)e[-1]))
+        e--;
     *e = '\0';
     return s;
 }
@@ -74,21 +112,21 @@ static char *trim(char *s) {
 /* 去引号 */
 static char *unquote(char *s) {
     size_t n = strlen(s);
-    if (n >= 2 && ((s[0]=='"' && s[n-1]=='"') || (s[0]=='\'' && s[n-1]=='\''))) {
-        s[n-1] = '\0';
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\''))) {
+        s[n - 1] = '\0';
         return s + 1;
     }
     return s;
 }
 
 static void set_str(char *dst, size_t cap, const char *val) {
-    snprintf(dst, cap, "%s", unquote(trim((char*)val)));
+    snprintf(dst, cap, "%s", unquote(trim((char *)val)));
 }
 
 static int add_str(char **arr, int arr_max, int *count, const char *val) {
     if (*count >= arr_max) return HWRUN_ENOMEM;
-    const char *v = unquote(trim((char*)val));
-    if (!*v) return HWRUN_OK;            /* 空项（如 conflicts 的 "" 占位）不入列 */
+    const char *v = unquote(trim((char *)val));
+    if (!*v) return HWRUN_OK; /* 空项（如 conflicts 的 "" 占位）不入列 */
     char *dup = hw_strdup(v);
     if (!dup) return HWRUN_ENOMEM;
     arr[(*count)++] = dup;
@@ -100,10 +138,14 @@ static int add_str(char **arr, int arr_max, int *count, const char *val) {
  * 不 free(d)。若 d 由堆分配，调用方自行释放。 */
 void hw_plugin_discovery_clear(hw_plugin_discovery_t *d) {
     if (!d) return;
-    for (int i = 0; i < d->provides_count; i++) free(d->provides[i]);
-    for (int i = 0; i < d->requires_count; i++) free(d->requires[i]);
-    for (int i = 0; i < d->conflicts_count; i++) free(d->conflicts[i]);
-    for (int i = 0; i < d->files_count; i++) free(d->files[i]);
+    for (int i = 0; i < d->provides_count; i++)
+        free(d->provides[i]);
+    for (int i = 0; i < d->requires_count; i++)
+        free(d->requires[i]);
+    for (int i = 0; i < d->conflicts_count; i++)
+        free(d->conflicts[i]);
+    for (int i = 0; i < d->files_count; i++)
+        free(d->files[i]);
     memset(d, 0, sizeof(*d));
 }
 
@@ -115,30 +157,45 @@ void hw_plugin_discovery_free(hw_plugin_discovery_t *d) {
 /* ---- 缩进感知的状态机内部定义 ---- */
 
 /* 顶层标量赋值（仅在"不在任何列表项/子键内"时命中） */
-static void set_top_field(hw_plugin_discovery_t *d, const char *key,
-                          const char *val) {
-    if (hw_str_eq(key, "id"))            set_str(d->id, sizeof(d->id), val);
-    else if (hw_str_eq(key, "name"))     set_str(d->name, sizeof(d->name), val);
-    else if (hw_str_eq(key, "version"))  set_str(d->version, sizeof(d->version), val);
-    else if (hw_str_eq(key, "type"))     set_str(d->type, sizeof(d->type), val);
-    else if (hw_str_eq(key, "description")) set_str(d->description, sizeof(d->description), val);
-    else if (hw_str_eq(key, "repo"))     set_str(d->repo, sizeof(d->repo), val);
-    else if (hw_str_eq(key, "branch"))   set_str(d->branch, sizeof(d->branch), val);
-    else if (hw_str_eq(key, "tag"))      set_str(d->tag, sizeof(d->tag), val);
-    else if (hw_str_eq(key, "license"))  set_str(d->license, sizeof(d->license), val);
-    else if (hw_str_eq(key, "author"))   set_str(d->author, sizeof(d->author), val);
-    else if (hw_str_eq(key, "url"))      set_str(d->url, sizeof(d->url), val);
-    else if (hw_str_eq(key, "pre_install"))  set_str(d->pre_install, sizeof(d->pre_install), val);
-    else if (hw_str_eq(key, "post_install")) set_str(d->post_install, sizeof(d->post_install), val);
-    else if (hw_str_eq(key, "pre_uninstall")) set_str(d->pre_uninstall, sizeof(d->pre_uninstall), val);
-    else if (hw_str_eq(key, "post_uninstall")) set_str(d->post_uninstall, sizeof(d->post_uninstall), val);
-    else if (hw_str_eq(key, "size"))     d->size = (size_t)strtoull(val, NULL, 10);
+static void set_top_field(hw_plugin_discovery_t *d, const char *key, const char *val) {
+    if (hw_str_eq(key, "id"))
+        set_str(d->id, sizeof(d->id), val);
+    else if (hw_str_eq(key, "name"))
+        set_str(d->name, sizeof(d->name), val);
+    else if (hw_str_eq(key, "version"))
+        set_str(d->version, sizeof(d->version), val);
+    else if (hw_str_eq(key, "type"))
+        set_str(d->type, sizeof(d->type), val);
+    else if (hw_str_eq(key, "description"))
+        set_str(d->description, sizeof(d->description), val);
+    else if (hw_str_eq(key, "repo"))
+        set_str(d->repo, sizeof(d->repo), val);
+    else if (hw_str_eq(key, "branch"))
+        set_str(d->branch, sizeof(d->branch), val);
+    else if (hw_str_eq(key, "tag"))
+        set_str(d->tag, sizeof(d->tag), val);
+    else if (hw_str_eq(key, "license"))
+        set_str(d->license, sizeof(d->license), val);
+    else if (hw_str_eq(key, "author"))
+        set_str(d->author, sizeof(d->author), val);
+    else if (hw_str_eq(key, "url"))
+        set_str(d->url, sizeof(d->url), val);
+    else if (hw_str_eq(key, "pre_install"))
+        set_str(d->pre_install, sizeof(d->pre_install), val);
+    else if (hw_str_eq(key, "post_install"))
+        set_str(d->post_install, sizeof(d->post_install), val);
+    else if (hw_str_eq(key, "pre_uninstall"))
+        set_str(d->pre_uninstall, sizeof(d->pre_uninstall), val);
+    else if (hw_str_eq(key, "post_uninstall"))
+        set_str(d->post_uninstall, sizeof(d->post_uninstall), val);
+    else if (hw_str_eq(key, "size"))
+        d->size = (size_t)strtoull(val, NULL, 10);
 }
 
 /* 协议字符串列表的四种 section 名 */
 static bool is_proto_section(const char *s) {
-    return hw_str_eq(s, "provides") || hw_str_eq(s, "requires") ||
-           hw_str_eq(s, "conflicts") || hw_str_eq(s, "files");
+    return hw_str_eq(s, "provides") || hw_str_eq(s, "requires") || hw_str_eq(s, "conflicts") ||
+           hw_str_eq(s, "files");
 }
 
 int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {
@@ -158,20 +215,25 @@ int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {
      *   非 "- " 列表项、非列表项子键时赋值。
      */
     char section[64] = "";
-    int  sec_indent  = -1;
+    int sec_indent = -1;
 
     while (fgets(line, sizeof(line), fp)) {
         /* 计算缩进（仅空格；制表符按 1 计，本仓库 yml 均用空格） */
         int indent = 0;
         char *p = line;
-        while (*p == ' ' || *p == '\t') { indent++; p++; }
+        while (*p == ' ' || *p == '\t') {
+            indent++;
+            p++;
+        }
         /* 去掉行尾 \n/\r，得到内容 */
         char *end = p + strlen(p);
-        while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = '\0';
+        while (end > p && (end[-1] == '\n' || end[-1] == '\r'))
+            *--end = '\0';
 
         /* 注释/空行 */
         char *q = p;
-        while (*q == ' ' || *q == '\t') q++;
+        while (*q == ' ' || *q == '\t')
+            q++;
         if (!*q || *q == '#') continue;
         p = q;
 
@@ -180,7 +242,7 @@ int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {
 
         /* 列表项："- x" / "- protocol: X" / "- key: ..." */
         if (*p == '-') {
-            if (!section[0]) continue;               /* 顶层裸列表无意义 */
+            if (!section[0]) continue; /* 顶层裸列表无意义 */
             char *val = p + 1;
             if (*val == ' ') val++;
             val = trim(val);
@@ -193,7 +255,7 @@ int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {
                     *c = '\0';
                     char *proto = trim(c + 1);
                     if (!*proto) continue;
-                    if      (hw_str_eq(section, "provides"))
+                    if (hw_str_eq(section, "provides"))
                         add_str(d->provides, 32, &d->provides_count, proto);
                     else if (hw_str_eq(section, "requires"))
                         add_str(d->requires, 32, &d->requires_count, proto);
@@ -202,7 +264,7 @@ int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {
                     else if (hw_str_eq(section, "files"))
                         add_str(d->files, 64, &d->files_count, proto);
                 } else {
-                    if      (hw_str_eq(section, "provides"))
+                    if (hw_str_eq(section, "provides"))
                         add_str(d->provides, 32, &d->provides_count, val);
                     else if (hw_str_eq(section, "requires"))
                         add_str(d->requires, 32, &d->requires_count, val);

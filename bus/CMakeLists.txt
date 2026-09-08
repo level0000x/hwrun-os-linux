@@ -24,6 +24,14 @@ target_link_libraries(hwrun-bus PRIVATE hwrun-core)
 # hw_str_*/runtime 回调等需从宿主动态符号表解析
 set_target_properties(hwrun-bus PROPERTIES ENABLE_EXPORTS ON)
 
+if(HWRUN_ENABLE_COVERAGE)
+  # gcov 覆盖率：hwrun-core 静态库编译插桩；链接方需链 --coverage 拉 libgcov
+  # （hwrun-bus 及测试可执行，后者在 tests/CMakeLists.txt 处理）
+  target_compile_options(hwrun-core PRIVATE --coverage)
+  target_link_options(hwrun-core PRIVATE --coverage)
+  target_link_options(hwrun-bus PRIVATE --coverage)
+endif()
+
 # 安装
 install(TARGETS hwrun-bus RUNTIME DESTINATION bin)
 install(TARGETS hwrun-core ARCHIVE DESTINATION lib/hwrun)

@@ -19,13 +19,16 @@ int hw_proto_version_cmp(const char *a, const char *b) {
     int ra = 1, rb = 1;
     const char *pa = a, *pb = b;
     while (*pa && *pb) {
-        while (*pa && !isdigit((unsigned char)*pa)) pa++;
-        while (*pb && !isdigit((unsigned char)*pb)) pb++;
+        while (*pa && !isdigit((unsigned char)*pa))
+            pa++;
+        while (*pb && !isdigit((unsigned char)*pb))
+            pb++;
         if (!*pa || !*pb) break;
         ma = strtol(pa, (char **)&pa, 10);
         mb = strtol(pb, (char **)&pb, 10);
         if (ma != mb) return ma < mb ? -1 : 1;
-        ra++; rb++;
+        ra++;
+        rb++;
     }
     return 0;
 }
@@ -45,8 +48,7 @@ int hw_metaproto_init(hw_metaproto_registry_t *reg, const char *state_dir) {
     hw_locker_init(&reg->lock, HWLOCK_RW);
     reg->initialized = 1;
     if (state_dir) {
-        snprintf(reg->state_file, sizeof(reg->state_file), "%s/metaproto.state",
-                 state_dir);
+        snprintf(reg->state_file, sizeof(reg->state_file), "%s/metaproto.state", state_dir);
     }
     /* 持久化状态文件暂不强制存在；注册表在内存中重建 */
     return HWRUN_OK;
@@ -72,11 +74,9 @@ void hw_metaproto_shutdown(hw_metaproto_registry_t *reg) {
     hw_locker_destroy(&reg->lock);
 }
 
-int hw_metaproto_register(hw_metaproto_registry_t *reg,
-                          const char *protocol, const char *version,
+int hw_metaproto_register(hw_metaproto_registry_t *reg, const char *protocol, const char *version,
                           const char *plugin_id, void *implementation) {
-    if (!reg || !reg->initialized || !protocol || !plugin_id)
-        return HWRUN_EINVAL;
+    if (!reg || !reg->initialized || !protocol || !plugin_id) return HWRUN_EINVAL;
 
     int rc = HWRUN_OK;
     /* 出锁后派发的通知参数（锁内把要通知的内容快照到局部副本） */
@@ -87,8 +87,7 @@ int hw_metaproto_register(hw_metaproto_registry_t *reg,
         int updated = 0;
         /* 已存在同名协议+插件 → 视为更新实现（热替换） */
         for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
-            if (hw_str_eq(r->protocol, protocol) &&
-                hw_str_eq(r->plugin_id, plugin_id)) {
+            if (hw_str_eq(r->protocol, protocol) && hw_str_eq(r->plugin_id, plugin_id)) {
                 r->implementation = implementation;
                 if (version) snprintf(r->version, sizeof(r->version), "%s", version);
                 snprintf(notify_proto, sizeof(notify_proto), "%s", r->protocol);
@@ -104,8 +103,10 @@ int hw_metaproto_register(hw_metaproto_registry_t *reg,
                 rc = HWRUN_ENOMEM;
             } else {
                 snprintf(r->protocol, sizeof(r->protocol), "%s", protocol);
-                if (version) snprintf(r->version, sizeof(r->version), "%s", version);
-                else snprintf(r->version, sizeof(r->version), HWRUN_PROTOCOL_VERSION);
+                if (version)
+                    snprintf(r->version, sizeof(r->version), "%s", version);
+                else
+                    snprintf(r->version, sizeof(r->version), HWRUN_PROTOCOL_VERSION);
                 snprintf(r->plugin_id, sizeof(r->plugin_id), "%s", plugin_id);
                 r->implementation = implementation;
                 r->provider_state = HWPLUGIN_STARTED;
@@ -120,13 +121,12 @@ int hw_metaproto_register(hw_metaproto_registry_t *reg,
 
     /* 出锁后派发：持锁期间绝不调用 subscriber 回调 */
     if (rc == HWRUN_OK && notify_state)
-        hw_metaproto_notify(reg, notify_proto, notify_version, plugin_id,
-                            notify_state);
+        hw_metaproto_notify(reg, notify_proto, notify_version, plugin_id, notify_state);
     return rc;
 }
 
-int hw_metaproto_unregister(hw_metaproto_registry_t *reg,
-                            const char *protocol, const char *plugin_id) {
+int hw_metaproto_unregister(hw_metaproto_registry_t *reg, const char *protocol,
+                            const char *plugin_id) {
     if (!reg || !protocol) return HWRUN_EINVAL;
     int rc = HWRUN_ENOENT;
     int notify_state = 0;
@@ -152,14 +152,12 @@ int hw_metaproto_unregister(hw_metaproto_registry_t *reg,
 
     /* 出锁后派发：持锁期间绝不调用 subscriber 回调 */
     if (rc == HWRUN_OK)
-        hw_metaproto_notify(reg, notify_proto, notify_version, notify_plugin,
-                            notify_state);
+        hw_metaproto_notify(reg, notify_proto, notify_version, notify_plugin, notify_state);
     return rc;
 }
 
-int hw_metaproto_resolve(hw_metaproto_registry_t *reg,
-                         const char *protocol, const char *version_req,
-                         hw_protocol_route_t **out) {
+int hw_metaproto_resolve(hw_metaproto_registry_t *reg, const char *protocol,
+                         const char *version_req, hw_protocol_route_t **out) {
     if (!reg || !protocol || !out) return HWRUN_EINVAL;
     int rc = HWRUN_ENOENT;
     HW_RDLOCK_GUARD(&reg->lock) {
@@ -168,7 +166,7 @@ int hw_metaproto_resolve(hw_metaproto_registry_t *reg,
                 if (version_req && *version_req) {
                     if (!hw_proto_version_compat(r->version, version_req)) continue;
                 }
-                *out = r;   /* 借用指针：调用方自行保证与 unregister 不同步竞争 */
+                *out = r; /* 借用指针：调用方自行保证与 unregister 不同步竞争 */
                 rc = HWRUN_OK;
                 break;
             }
@@ -177,13 +175,13 @@ int hw_metaproto_resolve(hw_metaproto_registry_t *reg,
     return rc;
 }
 
-int hw_metaproto_list(hw_metaproto_registry_t *reg,
-                      hw_protocol_route_t ***out, int *count) {
+int hw_metaproto_list(hw_metaproto_registry_t *reg, hw_protocol_route_t ***out, int *count) {
     if (!reg || !out || !count) return HWRUN_EINVAL;
     int rc = HWRUN_OK;
     HW_RDLOCK_GUARD(&reg->lock) {
         int n = 0;
-        for (hw_protocol_route_t *r = reg->routes; r; r = r->next) n++;
+        for (hw_protocol_route_t *r = reg->routes; r; r = r->next)
+            n++;
         *count = n;
         if (n == 0) {
             *out = NULL;
@@ -202,10 +200,10 @@ int hw_metaproto_list(hw_metaproto_registry_t *reg,
     return rc;
 }
 
-int hw_metaproto_subscribe(hw_metaproto_registry_t *reg,
-                           const char *plugin_id, const char *protocol,
-                           void (*cb)(const char *p, const char *v,
-                                      const char *plugin, int state)) {
+int hw_metaproto_subscribe(hw_metaproto_registry_t *reg, const char *plugin_id,
+                           const char *protocol,
+                           void (*cb)(const char *p, const char *v, const char *plugin,
+                                      int state)) {
     if (!reg || !plugin_id || !cb) return HWRUN_EINVAL;
     int rc = HWRUN_OK;
     int found = 0;
@@ -225,8 +223,10 @@ int hw_metaproto_subscribe(hw_metaproto_registry_t *reg,
                 rc = HWRUN_ENOMEM;
             } else {
                 snprintf(s->plugin_id, sizeof(s->plugin_id), "%s", plugin_id);
-                if (protocol) snprintf(s->protocol, sizeof(s->protocol), "%s", protocol);
-                else          s->protocol[0] = '\0';
+                if (protocol)
+                    snprintf(s->protocol, sizeof(s->protocol), "%s", protocol);
+                else
+                    s->protocol[0] = '\0';
                 s->on_protocol_change = cb;
                 s->next = reg->subscribers;
                 reg->subscribers = s;
@@ -236,8 +236,7 @@ int hw_metaproto_subscribe(hw_metaproto_registry_t *reg,
     return rc;
 }
 
-void hw_metaproto_notify(hw_metaproto_registry_t *reg,
-                         const char *protocol, const char *version,
+void hw_metaproto_notify(hw_metaproto_registry_t *reg, const char *protocol, const char *version,
                          const char *plugin_id, int state) {
     if (!reg) return;
     /* 锁内快照匹配订阅者的回调指针（subscriber 可能被并发 unsubscribe/free），
@@ -249,8 +248,7 @@ void hw_metaproto_notify(hw_metaproto_registry_t *reg,
     HW_RDLOCK_GUARD(&reg->lock) {
         for (hw_protocol_sub_t *s = reg->subscribers; s; s = s->next) {
             if (s->protocol[0] && !hw_str_eq(s->protocol, protocol)) continue;
-            if (n < (int)(sizeof(snaps) / sizeof(snaps[0])))
-                snaps[n++] = s->on_protocol_change;
+            if (n < (int)(sizeof(snaps) / sizeof(snaps[0]))) snaps[n++] = s->on_protocol_change;
         }
     }
     for (int i = 0; i < n; i++) {
@@ -258,8 +256,7 @@ void hw_metaproto_notify(hw_metaproto_registry_t *reg,
     }
 }
 
-int hw_metaproto_check_deps(hw_metaproto_registry_t *reg,
-                            const char *const *requires, int count,
+int hw_metaproto_check_deps(hw_metaproto_registry_t *reg, const char *const *requires, int count,
                             char *missing, size_t cap) {
     if (!reg || !requires || count < 0) return HWRUN_EINVAL;
     if (missing && cap) missing[0] = '\0';
@@ -269,11 +266,13 @@ int hw_metaproto_check_deps(hw_metaproto_registry_t *reg,
         for (int i = 0; i < count; i++) {
             int ok = 0;
             for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
-                if (hw_str_eq(r->protocol, requires[i])) { ok = 1; break; }
+                if (hw_str_eq(r->protocol, requires[i])) {
+                    ok = 1;
+                    break;
+                }
             }
             if (!ok) {
-                if (missing && cap)
-                    snprintf(missing, cap, "%s", requires[i]);
+                if (missing && cap) snprintf(missing, cap, "%s", requires[i]);
                 rc = HWRUN_ENOENT;
                 break;
             }
@@ -281,32 +280,3 @@ int hw_metaproto_check_deps(hw_metaproto_registry_t *reg,
     }
     return rc;
 }
-
-void hw_metaproto_export_api(hw_metaproto_api_t *api,
-                             hw_metaproto_registry_t *reg) {
-    if (!api) return;
-    /* 用 userdata 绑定 registry，各函数指针接收 userdata 参数统一签名 */
-    api->register_protocol = NULL;   /* 表驱动方式，见下 */
-    (void)reg;
-    (void)api;
-}
-
-#ifdef HWRUN_USE_TABLE_API
-/* 若宏开启，用统一签名(void* userdata, ...)的表封装；
-   否则调用方直接用 hw_metaproto_* 裸函数。 */
-int hw_meta_tbl_register(void *reg, const char *p, const char *v,
-                         const char *plugin, void *impl) {
-    return hw_metaproto_register(reg, p, v, plugin, impl);
-}
-int hw_meta_tbl_unregister(void *reg, const char *p, const char *plugin) {
-    return hw_metaproto_unregister(reg, p, plugin);
-}
-int hw_meta_tbl_resolve(void *reg, const char *p, const char *v,
-                        hw_protocol_route_t **out) {
-    return hw_metaproto_resolve(reg, p, v, out);
-}
-int hw_meta_tbl_check_deps(void *reg, const char *const *req, int n,
-                           char *miss, size_t cap) {
-    return hw_metaproto_check_deps(reg, req, n, miss, cap);
-}
-#endif /* HWRUN_USE_TABLE_API */

@@ -5,6 +5,7 @@
  */
 
 #include "bus.h"
+#include "git.h"
 
 #include <dirent.h>
 #include <unistd.h>
@@ -16,14 +17,70 @@ static int  scan_dir(hw_bus_t *bus, const char *dir);
 static int  scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub);
 static char **copy_str_arr(char *const *src, int count);
 
-int hw_bus_init(hw_bus_t *bus, const char *state_dir, const char *scan_path,
-                int level) {
+/* ---- 参数变更 -> GIT 自动 commit（mark_revision 钩子） ---- */
+
+/* mark_revision 触发：resolve GIT 协议，git 插件已启动（route 有真实实现）
+ * 且 auto_commit 开启时，把参数状态文件落盘并 add + commit。
+ * - git 就绪前静默跳过（记录 debug）；
+ * - commit 期间若参数再次被改动而重入本回调，直接返回（防递归）。
+ *   commit 不触碰参数树，实际不会重入，守卫仅为防御性。 */
+static void bus_on_param_revision(void *userdata, const char *reason) {
+    hw_bus_t *bus = (hw_bus_t *)userdata;
+    if (!bus || !bus->initialized || !bus->running) return;
+    if (bus->param_git_committing) return;       /* 重入守卫 */
+    bus->param_git_committing = 1;
+
+    hw_protocol_route_t *route = NULL;
+    if (hw_bus_resolve(bus, HWPROTO_GIT, &route) != HWRUN_OK || !route ||
+        !route->implementation) {
+        bus->param_git_committing = 0;
+        return;                                  /* git 未就绪：静默跳过 */
+    }
+    hw_git_ops_t *g = (hw_git_ops_t *)route->implementation;
+    if (!g->add || !g->commit) { bus->param_git_committing = 0; return; }
+
+    git_config_t *cfg = g->get_config ? g->get_config() : NULL;
+    if (cfg && !cfg->auto_commit) { bus->param_git_committing = 0; return; }
+
+    /* 参数状态文件置于 <state>/git/（默认即 git 插件仓库目录），保证
+     * git add 命中工作区；状态目录未配置时静默跳过。 */
+    char state_file[512] = "";
+    if (bus->params.dirs[HWPARAM_GIT][0])
+        snprintf(state_file, sizeof(state_file), "%s/params.state",
+                 bus->params.dirs[HWPARAM_GIT]);
+    if (!state_file[0] ||
+        hw_param_save_file(&bus->params, state_file) != HWRUN_OK) {
+        HWLOG_DEBUGF(&bus->log, "bus",
+                     "param state persist skipped (git/state dir not ready)");
+        bus->param_git_committing = 0;
+        return;
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg), "param: %s",
+             (reason && reason[0]) ? reason : "tree changed");
+    if (g->add(state_file) != HWRUN_OK) {
+        HWLOG_DEBUGF(&bus->log, "bus", "param auto-commit add failed: %s",
+                     state_file);
+    } else {
+        char oid[64] = "";
+        if (g->commit(msg, oid, sizeof(oid)) == HWRUN_OK)
+            HWLOG_INFOF(&bus->log, "bus", "param auto-commit %s (%s)", oid, msg);
+        else
+            HWLOG_DEBUGF(&bus->log, "bus", "param auto-commit skipped: %s", msg);
+    }
+    bus->param_git_committing = 0;
+}
+
+int hw_bus_init(hw_bus_t *bus, const char *state_dir, const char *scan_path, int level) {
     if (!bus) return HWRUN_EINVAL;
     memset(bus, 0, sizeof(*bus));
     hw_locker_init(&bus->plugins_lock, HWLOCK_RW);
 
-    if (state_dir) snprintf(bus->state_dir, sizeof(bus->state_dir), "%s", state_dir);
-    else           snprintf(bus->state_dir, sizeof(bus->state_dir), "/var/lib/hwrun");
+    if (state_dir)
+        snprintf(bus->state_dir, sizeof(bus->state_dir), "%s", state_dir);
+    else
+        snprintf(bus->state_dir, sizeof(bus->state_dir), "/var/lib/hwrun");
 
     hw_log_init(&bus->log, NULL, level);
     hw_param_init(&bus->params, bus->state_dir);
@@ -47,6 +104,11 @@ int hw_bus_init(hw_bus_t *bus, const char *state_dir, const char *scan_path,
     hw_metaproto_register(&bus->meta, HWPROTO_LOG, "1.0", "bus", NULL);
     hw_metaproto_register(&bus->meta, HWPROTO_GIT, "1.0", "bus", NULL);
 
+    /* 装配参数变更钩子：param 属第 1 环不依赖 GIT，bus 在此把
+     * mark_revision 事件接到 GIT 自动 commit（bus_on_param_revision）。 */
+    bus->params.on_revision = bus_on_param_revision;
+    bus->params.revision_userdata = bus;
+
     /* 绑定总线单例，供运行时注入转发 LOG/PARAM */
     hw_runtime_bus_bind(bus);
 
@@ -68,7 +130,7 @@ void hw_bus_shutdown(hw_bus_t *bus) {
     while (p) {
         hw_plugin_t *n = p->next;
         if (p->state == HWPLUGIN_STARTED || p->state == HWPLUGIN_LOADED)
-            hw_plugin_unload(bus, p);   /* stop + destroy + dlclose */
+            hw_plugin_unload(bus, p); /* stop + destroy + dlclose */
         hw_plugin_free_meta(p);
         free(p);
         p = n;
@@ -83,8 +145,7 @@ void hw_bus_shutdown(hw_bus_t *bus) {
 
 static int check_add_path(hw_bus_t *bus, const char *path) {
     if (bus->scan_paths_count >= HWRUN_SCAN_PATH_MAX) return HWRUN_OK;
-    snprintf(bus->scan_paths[bus->scan_paths_count],
-             sizeof(bus->scan_paths[0]), "%s", path);
+    snprintf(bus->scan_paths[bus->scan_paths_count], sizeof(bus->scan_paths[0]), "%s", path);
     bus->scan_paths_count++;
     return HWRUN_OK;
 }
@@ -94,7 +155,10 @@ hw_plugin_t *hw_bus_find(hw_bus_t *bus, const char *id) {
     hw_plugin_t *ret = NULL;
     HW_RDLOCK_GUARD(&bus->plugins_lock) {
         for (hw_plugin_t *p = bus->plugins; p; p = p->next)
-            if (hw_str_eq(p->id, id)) { ret = p; break; }
+            if (hw_str_eq(p->id, id)) {
+                ret = p;
+                break;
+            }
     }
     /* 借用指针：调用方自行保证与链表增删（scan/insert）不并发竞争 */
     return ret;
@@ -104,7 +168,8 @@ int hw_bus_plugin_count(hw_bus_t *bus) {
     if (!bus) return 0;
     int n = 0;
     HW_RDLOCK_GUARD(&bus->plugins_lock) {
-        for (hw_plugin_t *p = bus->plugins; p; p = p->next) n++;
+        for (hw_plugin_t *p = bus->plugins; p; p = p->next)
+            n++;
     }
     return n;
 }
@@ -150,17 +215,27 @@ static int scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub) {
     hw_plugin_discovery_t disc;
     int rc = hw_yml_parse_plugin(yml_path, &disc);
     if (rc != HWRUN_OK) return rc;
-    if (!disc.id[0]) { hw_plugin_discovery_free(&disc); return HWRUN_EILSEQ; }
+    if (!disc.id[0]) {
+        hw_plugin_discovery_free(&disc);
+        return HWRUN_EILSEQ;
+    }
 
     /* 已登记则跳过 */
-    if (hw_bus_find(bus, disc.id)) { hw_plugin_discovery_free(&disc); return HWRUN_EEXIST; }
+    if (hw_bus_find(bus, disc.id)) {
+        hw_plugin_discovery_free(&disc);
+        return HWRUN_EEXIST;
+    }
 
     hw_plugin_t *p = calloc(1, sizeof(*p));
-    if (!p) { hw_plugin_discovery_free(&disc); return HWRUN_ENOMEM; }
+    if (!p) {
+        hw_plugin_discovery_free(&disc);
+        return HWRUN_ENOMEM;
+    }
     snprintf(p->id, sizeof(p->id), "%s", disc.id);
-    snprintf(p->name, sizeof(p->name), "%s", disc.name[0]?disc.name:disc.id);
-    snprintf(p->version, sizeof(p->version), "%s", disc.version[0]?disc.version:HWRUN_VERSION);
-    snprintf(p->description, sizeof(p->description), "%s", disc.description[0]?disc.description:"");
+    snprintf(p->name, sizeof(p->name), "%s", disc.name[0] ? disc.name : disc.id);
+    snprintf(p->version, sizeof(p->version), "%s", disc.version[0] ? disc.version : HWRUN_VERSION);
+    snprintf(p->description, sizeof(p->description), "%s",
+             disc.description[0] ? disc.description : "");
     p->type = hw_type_from_str(disc.type);
     p->state = HWPLUGIN_INSTALLED;
     snprintf(p->repo_url, sizeof(p->repo_url), "%s", disc.repo);
@@ -174,27 +249,26 @@ static int scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub) {
 
     /* p 的元数据：从 disc 深拷贝出独立堆数组（含绝对路径化前的相对值），
      * 之后清空 disc 内部字符串，杜绝成功路径的 strdup 泄漏。 */
-    p->provides       = copy_str_arr(disc.provides, disc.provides_count);
-    p->requires       = copy_str_arr(disc.requires, disc.requires_count);
-    p->conflicts      = copy_str_arr(disc.conflicts, disc.conflicts_count);
-    p->files          = copy_str_arr(disc.files, disc.files_count);
-    p->provides_count  = disc.provides_count;
-    p->requires_count  = disc.requires_count;
+    p->provides = copy_str_arr(disc.provides, disc.provides_count);
+    p->requires = copy_str_arr(disc.requires, disc.requires_count);
+    p->conflicts = copy_str_arr(disc.conflicts, disc.conflicts_count);
+    p->files = copy_str_arr(disc.files, disc.files_count);
+    p->provides_count = disc.provides_count;
+    p->requires_count = disc.requires_count;
     p->conflicts_count = disc.conflicts_count;
-    p->files_count     = disc.files_count;
-    hw_plugin_discovery_clear(&disc);   /* 释放 disc 内部 strdup（d 在栈上，不 free） */
+    p->files_count = disc.files_count;
+    hw_plugin_discovery_clear(&disc); /* 释放 disc 内部 strdup（d 在栈上，不 free） */
 
     /* 修正文件路径为绝对路径（相对于插件目录） */
     for (int i = 0; i < p->files_count; i++) {
         if (!p->files[i]) continue;
-        if (p->files[i][0] == '/') continue;   /* 已是绝对路径 */
+        if (p->files[i][0] == '/') continue; /* 已是绝对路径 */
         char full[512];
         int prc = hw_fmt_path(full, sizeof(full), plug_dir, p->files[i]);
         if (prc != HWRUN_OK) {
             /* 路径过长被截断会生成错误路径，宁可不登记该文件 */
-            HWLOG_WARNF(&bus->log, "bus",
-                        "discover %s: file path too long, skip: %s/%s",
-                        p->id, plug_dir, p->files[i]);
+            HWLOG_WARNF(&bus->log, "bus", "discover %s: file path too long, skip: %s/%s", p->id,
+                        plug_dir, p->files[i]);
             free(p->files[i]);
             p->files[i] = NULL;
             continue;
@@ -211,8 +285,8 @@ static int scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub) {
         bus->plugins = p;
     }
 
-    HWLOG_INFOF(&bus->log, "bus", "discovered plugin: %s v%s (%s)",
-                p->id, p->version, hw_type_to_str(p->type));
+    HWLOG_INFOF(&bus->log, "bus", "discovered plugin: %s v%s (%s)", p->id, p->version,
+                hw_type_to_str(p->type));
     return HWRUN_OK;
 }
 
@@ -255,6 +329,13 @@ static const char *boot_order[] = {
     NULL
 };
 
+/* 插件 id 是否在 boot_order 表内（决定是否会被 boot_chain 自动启动） */
+static int in_boot_order(const char *id) {
+    for (int i = 0; boot_order[i]; i++)
+        if (hw_str_eq(boot_order[i], id)) return 1;
+    return 0;
+}
+
 int hw_bus_boot_chain(hw_bus_t *bus) {
     if (!bus || !bus->initialized) return HWRUN_EINVAL;
     hw_bus_scan(bus);
@@ -273,12 +354,21 @@ int hw_bus_boot_chain(hw_bus_t *bus) {
                         boot_order[i], hw_strerror(rc));
         }
     }
+
+    /* 启动后校验：boot_order 表外的已发现插件永远不会被自动启动，提示用户 */
+    for (hw_plugin_t *p = bus->plugins; p; p = p->next) {
+        if (p->state == HWPLUGIN_STARTED) continue;
+        if (in_boot_order(p->id)) continue;
+        HWLOG_WARNF(&bus->log, "bus",
+                    "boot: %s 未纳入启动序，不会自动启动 (需要时请 plugins load %s)",
+                    p->id, p->id);
+    }
+
     hw_bus_config_route(bus);   /* 启动完成后：参数变更 -> 插件 configure 路由 */
     return HWRUN_OK;
 }
 
-int hw_bus_resolve(hw_bus_t *bus, const char *protocol,
-                   hw_protocol_route_t **out) {
+int hw_bus_resolve(hw_bus_t *bus, const char *protocol, hw_protocol_route_t **out) {
     return hw_metaproto_resolve(&bus->meta, protocol, NULL, out);
 }
 
@@ -300,8 +390,8 @@ int hw_bus_unload(hw_bus_t *bus, const char *id) {
 
 /* param watch 回调（在 param 锁外派发，可安全调 bus 接口）。
  * key 形如 "<plugin_id>.<rest>"：首段点号前为插件 id。 */
-static int config_route_cb(const char *key, const char *old_value,
-                           const char *new_value, void *userdata) {
+static int config_route_cb(const char *key, const char *old_value, const char *new_value,
+                           void *userdata) {
     hw_bus_t *bus = (hw_bus_t *)userdata;
     (void)old_value;
     if (!bus || !key || !new_value) return 0;
@@ -319,8 +409,7 @@ static int config_route_cb(const char *key, const char *old_value,
 
     int rc = p->ops.configure(p, key, new_value);
     if (rc != HWRUN_OK) {
-        HWLOG_WARNF(&bus->log, id, "configure %s failed (%s)",
-                    key, hw_strerror(rc));
+        HWLOG_WARNF(&bus->log, id, "configure %s failed (%s)", key, hw_strerror(rc));
     }
     return 0;
 }
@@ -329,6 +418,5 @@ int hw_bus_config_route(hw_bus_t *bus) {
     if (!bus || !bus->initialized) return HWRUN_EINVAL;
     /* 单例 watcher：pattern="" 收全部变更，回调内按 key 首段路由到插件。
      * bus 作 userdata；shutdown 时 param_shutdown 统一释放 watcher。 */
-    return hw_param_watch(&bus->params, "bus", "",
-                          config_route_cb, bus);
+    return hw_param_watch(&bus->params, "bus", "", config_route_cb, bus);
 }

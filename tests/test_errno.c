@@ -72,12 +72,10 @@ static void test_hw_fmt_path(void **state) {
 
     char buf[256];
     /* 目录无尾斜杠 */
-    assert_int_equal(hw_fmt_path(buf, sizeof(buf), "/etc/hwrun", "git.so"),
-                     HWRUN_OK);
+    assert_int_equal(hw_fmt_path(buf, sizeof(buf), "/etc/hwrun", "git.so"), HWRUN_OK);
     assert_string_equal(buf, "/etc/hwrun/git.so");
     /* 目录带尾斜杠 */
-    assert_int_equal(hw_fmt_path(buf, sizeof(buf), "/etc/hwrun/", "git.so"),
-                     HWRUN_OK);
+    assert_int_equal(hw_fmt_path(buf, sizeof(buf), "/etc/hwrun/", "git.so"), HWRUN_OK);
     assert_string_equal(buf, "/etc/hwrun/git.so");
     /* 根目录 "/" */
     assert_int_equal(hw_fmt_path(buf, sizeof(buf), "/", "a.so"), HWRUN_OK);
@@ -85,8 +83,7 @@ static void test_hw_fmt_path(void **state) {
 
     /* 容量不足：截断并返回负错误码（HWRUN_ENOMEM） */
     char small[8];
-    int rc = hw_fmt_path(small, sizeof(small), "/very/long/directory/path",
-                         "name.bin");
+    int rc = hw_fmt_path(small, sizeof(small), "/very/long/directory/path", "name.bin");
     assert_true(rc < 0);
     assert_int_equal(rc, HWRUN_ENOMEM);
 
@@ -102,9 +99,9 @@ static void test_hw_strerror(void **state) {
     (void)state;
 
     assert_string_equal(hw_strerror(HWRUN_OK), "ok");
-    assert_non_null(hw_strerror(HWRUN_ENOENT));      /* strerror(-ENOENT) 非空 */
+    assert_non_null(hw_strerror(HWRUN_ENOENT)); /* strerror(-ENOENT) 非空 */
     assert_non_null(hw_strerror(HWRUN_EINVAL));
-    assert_non_null(hw_strerror(HWRUN_ECONFLICT));   /* 私有域固定文案 */
+    assert_non_null(hw_strerror(HWRUN_ECONFLICT)); /* 私有域固定文案 */
     assert_non_null(hw_strerror(HWRUN_ENOTREADY));
     /* 正 errno 也应可译（防御性） */
     assert_non_null(hw_strerror(ENOENT));

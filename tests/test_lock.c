@@ -37,16 +37,16 @@
  * 并发 1：METAPROTO 注册表 hammer
  * ============================================================ */
 #define MP_THREADS 4
-#define MP_ITERS   2000          /* 每线程迭代：2 register + 2 resolve + 1 unregister */
-#define MP_PERM    8             /* 永久协议数（只读解析目标） */
+#define MP_ITERS 2000 /* 每线程迭代：2 register + 2 resolve + 1 unregister */
+#define MP_PERM 8     /* 永久协议数（只读解析目标） */
 
 typedef struct mp_arg {
     hw_metaproto_registry_t *reg;
-    int   tid;
-    long  registers_ok;          /* 每迭代 2 次：新增分支 + 更新分支 */
-    long  resolves_ok;           /* 命中自己刚注册且已更新的协议 */
-    long  perm_hits;             /* 命中永久协议 */
-    long  unregisters_ok;
+    int tid;
+    long registers_ok; /* 每迭代 2 次：新增分支 + 更新分支 */
+    long resolves_ok;  /* 命中自己刚注册且已更新的协议 */
+    long perm_hits;    /* 命中永久协议 */
+    long unregisters_ok;
 } mp_arg_t;
 
 static mp_arg_t g_mp_args[MP_THREADS];
@@ -58,12 +58,12 @@ static void *mp_worker(void *arg) {
     for (int i = 0; i < MP_ITERS; i++) {
         /* 新增分支 */
         snprintf(proto, sizeof(proto), "LOCKP%d_%d", a->tid, i);
-        if (hw_metaproto_register(a->reg, proto, "1.0", "thr",
-                                  (void *)(intptr_t)(0x1000 + i)) == HWRUN_OK)
+        if (hw_metaproto_register(a->reg, proto, "1.0", "thr", (void *)(intptr_t)(0x1000 + i)) ==
+            HWRUN_OK)
             a->registers_ok++;
         /* 更新分支：同插件同协议重注册（热替换实现） */
-        if (hw_metaproto_register(a->reg, proto, "1.0", "thr",
-                                  (void *)(intptr_t)0xBEEF) == HWRUN_OK)
+        if (hw_metaproto_register(a->reg, proto, "1.0", "thr", (void *)(intptr_t)0xBEEF) ==
+            HWRUN_OK)
             a->registers_ok++;
 
         /* 解析自己的协议：必然命中且实现已被更新为新指针 */
@@ -75,13 +75,11 @@ static void *mp_worker(void *arg) {
         /* 解析永久协议：始终命中 */
         snprintf(proto, sizeof(proto), "PERM%d", i % MP_PERM);
         r = NULL;
-        if (hw_metaproto_resolve(a->reg, proto, NULL, &r) == HWRUN_OK && r)
-            a->perm_hits++;
+        if (hw_metaproto_resolve(a->reg, proto, NULL, &r) == HWRUN_OK && r) a->perm_hits++;
 
         /* 注销自己的协议 */
         snprintf(proto, sizeof(proto), "LOCKP%d_%d", a->tid, i);
-        if (hw_metaproto_unregister(a->reg, proto, "thr") == HWRUN_OK)
-            a->unregisters_ok++;
+        if (hw_metaproto_unregister(a->reg, proto, "thr") == HWRUN_OK) a->unregisters_ok++;
     }
     return NULL;
 }
@@ -95,9 +93,9 @@ static void test_metaproto_concurrent(void **state) {
     for (int i = 0; i < MP_PERM; i++) {
         char p[32];
         snprintf(p, sizeof(p), "PERM%d", i);
-        assert_int_equal(hw_metaproto_register(&reg, p, "1.0", "perm",
-                                               (void *)(intptr_t)(0x2000 + i)),
-                         HWRUN_OK);
+        assert_int_equal(
+            hw_metaproto_register(&reg, p, "1.0", "perm", (void *)(intptr_t)(0x2000 + i)),
+            HWRUN_OK);
     }
 
     pthread_t th[MP_THREADS];
@@ -106,8 +104,7 @@ static void test_metaproto_concurrent(void **state) {
         memset(&g_mp_args[t], 0, sizeof(g_mp_args[t]));
         g_mp_args[t].reg = &reg;
         g_mp_args[t].tid = t;
-        if (pthread_create(&th[t], NULL, mp_worker, &g_mp_args[t]) != 0)
-            break;
+        if (pthread_create(&th[t], NULL, mp_worker, &g_mp_args[t]) != 0) break;
         created++;
     }
     for (int t = 0; t < created; t++)
@@ -121,14 +118,14 @@ static void test_metaproto_concurrent(void **state) {
         assert_int_equal(g_mp_args[t].resolves_ok, (long)MP_ITERS);
         assert_int_equal(g_mp_args[t].perm_hits, (long)MP_ITERS);
         assert_int_equal(g_mp_args[t].unregisters_ok, (long)MP_ITERS);
-        tot_reg   += g_mp_args[t].registers_ok;
-        tot_res   += g_mp_args[t].resolves_ok;
-        tot_perm  += g_mp_args[t].perm_hits;
+        tot_reg += g_mp_args[t].registers_ok;
+        tot_res += g_mp_args[t].resolves_ok;
+        tot_perm += g_mp_args[t].perm_hits;
         tot_unreg += g_mp_args[t].unregisters_ok;
     }
-    assert_int_equal(tot_reg,   (long)MP_THREADS * MP_ITERS * 2);
-    assert_int_equal(tot_res,   (long)MP_THREADS * MP_ITERS);
-    assert_int_equal(tot_perm,  (long)MP_THREADS * MP_ITERS);
+    assert_int_equal(tot_reg, (long)MP_THREADS * MP_ITERS * 2);
+    assert_int_equal(tot_res, (long)MP_THREADS * MP_ITERS);
+    assert_int_equal(tot_perm, (long)MP_THREADS * MP_ITERS);
     assert_int_equal(tot_unreg, (long)MP_THREADS * MP_ITERS);
 
     /* 结束时注册表计数一致：仅剩 8 条永久路由，且内容未被破坏 */
@@ -153,12 +150,12 @@ static void test_metaproto_concurrent(void **state) {
  * 并发 2：PARAM 参数树 hammer
  * ============================================================ */
 #define PM_THREADS 4
-#define PM_ITERS   3000
+#define PM_ITERS 3000
 
 typedef struct pm_arg {
     hw_param_context_t *ctx;
-    int   tid;
-    long  sets_ok;              /* 共享 key 写成功次数 */
+    int tid;
+    long sets_ok; /* 共享 key 写成功次数 */
 } pm_arg_t;
 
 static pm_arg_t g_pm_args[PM_THREADS];
@@ -171,8 +168,7 @@ static void *pm_worker(void *arg) {
     for (int i = 0; i < PM_ITERS; i++) {
         /* 共享 key：全部线程并发写，值含线程号与序号 */
         snprintf(val, sizeof(val), "t%d:%d", a->tid, i);
-        if (hw_param_set_value(a->ctx, "conc.counter", val,
-                               HWPARAM_TYPE_STRING, NULL) == HWRUN_OK)
+        if (hw_param_set_value(a->ctx, "conc.counter", val, HWPARAM_TYPE_STRING, NULL) == HWRUN_OK)
             a->sets_ok++;
         /* 每线程独占 key：固定 int 哨兵 */
         snprintf(key, sizeof(key), "conc.t%d", a->tid);
@@ -195,8 +191,7 @@ static void test_param_concurrent(void **state) {
         memset(&g_pm_args[t], 0, sizeof(g_pm_args[t]));
         g_pm_args[t].ctx = &ctx;
         g_pm_args[t].tid = t;
-        if (pthread_create(&th[t], NULL, pm_worker, &g_pm_args[t]) != 0)
-            break;
+        if (pthread_create(&th[t], NULL, pm_worker, &g_pm_args[t]) != 0) break;
         created++;
     }
     for (int t = 0; t < created; t++)
@@ -229,7 +224,7 @@ static void test_param_concurrent(void **state) {
 }
 
 int main(void) {
-    hw_locker_enable_parallel();    /* 武装全局锁：全部 locker 进入真实并发模式 */
+    hw_locker_enable_parallel(); /* 武装全局锁：全部 locker 进入真实并发模式 */
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_metaproto_concurrent),
         cmocka_unit_test(test_param_concurrent),

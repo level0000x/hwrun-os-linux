@@ -62,3 +62,16 @@ foreach(_t IN LISTS _cmocka_unit_tests)
   set_tests_properties(${_t} PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endforeach()
+
+# ----------------------------------------------------------------
+# gcov 覆盖率：test_proto 与全部 CMocka 单测目标统一加 --coverage
+# （hwrun-core 的 --coverage 已在 bus/CMakeLists.txt 由同一 option 控制）
+# ----------------------------------------------------------------
+if(HWRUN_ENABLE_COVERAGE)
+  target_compile_options(test_proto PRIVATE --coverage)
+  target_link_options(test_proto PRIVATE --coverage)
+  foreach(_t IN LISTS _cmocka_unit_tests)
+    target_compile_options(${_t} PRIVATE --coverage)
+    target_link_options(${_t} PRIVATE --coverage)
+  endforeach()
+endif()
