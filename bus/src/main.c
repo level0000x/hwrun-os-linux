@@ -17,10 +17,16 @@
 #include "bus.h"
 #include "kctl.h"
 
+#include <errno.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <signal.h>
 
 static hw_bus_t g_bus;
+
+/* PID1 常驻：收到终止信号后优雅停机 */
+static volatile sig_atomic_t g_stop = 0;
+static void on_term_signal(int sig) { (void)sig; g_stop = 1; }
 
 static int route_count(hw_bus_t *bus);
 static void hw_bus_cli_usage(const char *what);
@@ -179,7 +185,8 @@ static int cmd_kctl(int argc, char **argv) {
         if (rc == HWRUN_OK)
             printf("%s -> v%s by %s (impl=%llu)\n", d.protocol, d.version,
                    d.provider, (unsigned long long)d.implementation);
-        else printf("resolve %s: %s\n", argv[1], rc==-2?"not found":"failed");
+        else printf("resolve %s: %s\n", argv[1],
+                    rc == -ENOENT ? "not found" : "failed");
     } else {
         rc = HWRUN_EINVAL;
         printf("usage: hwrun kctl [abi|ping <hex>|list|resolve <proto>]\n");
@@ -240,11 +247,24 @@ int main(int argc, char **argv) {
 
     /* 默认：按依赖链启动所有插件 */
     hw_bus_boot_chain(&g_bus);
+    /* 自举完成、进入并行服务期才武装锁：之前所有 hw_locker 均为 no-op，
+     * 保证单线程启动阶段零开销且行为与无锁版完全一致 */
+    hw_locker_enable_parallel();
     printf("HWRun OS booted (%d plugins, %d protocols)\n",
            hw_bus_plugin_count(&g_bus), route_count(&g_bus));
 
-    /* PID1 模式下在此常驻；此处简单保持存活 */
-    while (g_bus.running) { sleep(3600); }
+    /* 注册终止信号：SIGTERM/SIGINT 优雅停机；SIGPIPE 忽略（写管道崩溃防御） */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_term_signal;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* PID1 常驻：pause() 挂起，信号到达返回后检查 g_stop 优雅退出 */
+    while (g_bus.running && !g_stop) { pause(); }
+    g_bus.running = 0;
+    printf("HWRun OS shutting down...\n");
     hw_bus_shutdown(&g_bus);
     return 0;
 }

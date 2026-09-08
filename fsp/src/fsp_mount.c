@@ -28,10 +28,10 @@ static void unescape(const char *in, char *out, size_t cap) {
 }
 
 static int fsp_mount_list(fsp_mountinfo_t *infos, int max) {
-    if (!infos || max <= 0) { errno = EINVAL; return -1; }
+    if (!infos || max <= 0) return -EINVAL;
 
     FILE *fp = fopen("/proc/mounts", "r");
-    if (!fp) { errno = ENOENT; return -1; }
+    if (!fp) return -errno;
 
     char line[1024];
     int count = 0;

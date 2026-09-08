@@ -38,18 +38,18 @@ static int fsp_open(const char *path, int flags, mode_t mode) {
 static int fsp_openat(const char *dirpath, const char *path,
                       int flags, mode_t mode) {
     /* 相对路径基于 dirpath 解析；绝对路径或空 dirpath 直接按原样打开 */
-    if (!path || path[0] == '\0') { errno = EINVAL; return -1; }
+    if (!path || path[0] == '\0') return -EINVAL;
     if (!dirpath || dirpath[0] == '\0' || path[0] == '/')
         return open(path, flags, mode);
 
     char full[4096];
     if (snprintf(full, sizeof(full), "%s/%s", dirpath, path)
-        >= (int)sizeof(full)) { errno = ENAMETOOLONG; return -1; }
+        >= (int)sizeof(full)) return -ENAMETOOLONG;
     return open(full, flags, mode);
 }
 
 static int fsp_close(int fd) {
-    if (fd < 0) { errno = EBADF; return -1; }
+    if (fd < 0) return -EBADF;
     return close(fd);
 }
 
@@ -90,21 +90,21 @@ static int fsp_unlink(const char *path) {
 /* ---------- 状态 ---------- */
 static int fsp_stat(const char *path, fsp_stat_t *st) {
     struct stat s;
-    if (stat(path, &s) != 0) return -1;
+    if (stat(path, &s) != 0) return -errno;
     stat_to_fsp(&s, st);
     return 0;
 }
 
 static int fsp_lstat(const char *path, fsp_stat_t *st) {
     struct stat s;
-    if (lstat(path, &s) != 0) return -1;
+    if (lstat(path, &s) != 0) return -errno;
     stat_to_fsp(&s, st);
     return 0;
 }
 
 static int fsp_fstat(int fd, fsp_stat_t *st) {
     struct stat s;
-    if (fstat(fd, &s) != 0) return -1;
+    if (fstat(fd, &s) != 0) return -errno;
     stat_to_fsp(&s, st);
     return 0;
 }
@@ -115,7 +115,7 @@ static int fsp_access(const char *path, int amode) {
 
 static int fsp_statfs(const char *path, fsp_statfs_t *fs) {
     struct statfs s;
-    if (statfs(path, &s) != 0) return -1;
+    if (statfs(path, &s) != 0) return -errno;
     fs->f_type    = (uint64_t)s.f_type;
     fs->f_bsize   = (uint64_t)s.f_bsize;
     fs->f_blocks  = (uint64_t)s.f_blocks;

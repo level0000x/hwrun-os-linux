@@ -117,7 +117,7 @@ int pmp_task_cancel(uint64_t task_id) {
 
 int pmp_task_status(uint64_t task_id, pmp_task_info_t *out) {
     pmp_task_entry_t *e = task_find(task_id);
-    if (!e) { if (out) memset(out, 0, sizeof(*out)); return -2; }
+    if (!e) { if (out) memset(out, 0, sizeof(*out)); return -ENOENT; }
     task_reap();                        /* 惰性回收 */
     if (out) {
         memset(out, 0, sizeof(*out));

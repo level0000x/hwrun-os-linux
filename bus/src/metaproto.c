@@ -42,6 +42,7 @@ int hw_proto_version_compat(const char *have, const char *req) {
 int hw_metaproto_init(hw_metaproto_registry_t *reg, const char *state_dir) {
     if (!reg) return HWRUN_EINVAL;
     memset(reg, 0, sizeof(*reg));
+    hw_locker_init(&reg->lock, HWLOCK_RW);
     reg->initialized = 1;
     if (state_dir) {
         snprintf(reg->state_file, sizeof(reg->state_file), "%s/metaproto.state",
@@ -68,6 +69,7 @@ void hw_metaproto_shutdown(hw_metaproto_registry_t *reg) {
     }
     reg->subscribers = NULL;
     reg->initialized = 0;
+    hw_locker_destroy(&reg->lock);
 }
 
 int hw_metaproto_register(hw_metaproto_registry_t *reg,
@@ -76,80 +78,128 @@ int hw_metaproto_register(hw_metaproto_registry_t *reg,
     if (!reg || !reg->initialized || !protocol || !plugin_id)
         return HWRUN_EINVAL;
 
-    /* 已存在同名协议+插件 → 视为更新实现（热替换） */
-    for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
-        if (hw_str_eq(r->protocol, protocol) && hw_str_eq(r->plugin_id, plugin_id)) {
-            r->implementation = implementation;
-            if (version) snprintf(r->version, sizeof(r->version), "%s", version);
-            hw_metaproto_notify(reg, protocol, r->version, plugin_id,
-                               HWPROTO_STATE_CHANGED);
-            return HWRUN_OK;
+    int rc = HWRUN_OK;
+    /* 出锁后派发的通知参数（锁内把要通知的内容快照到局部副本） */
+    int notify_state = 0;
+    char notify_proto[64] = "", notify_version[16] = "";
+
+    HW_WRLOCK_GUARD(&reg->lock) {
+        int updated = 0;
+        /* 已存在同名协议+插件 → 视为更新实现（热替换） */
+        for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
+            if (hw_str_eq(r->protocol, protocol) &&
+                hw_str_eq(r->plugin_id, plugin_id)) {
+                r->implementation = implementation;
+                if (version) snprintf(r->version, sizeof(r->version), "%s", version);
+                snprintf(notify_proto, sizeof(notify_proto), "%s", r->protocol);
+                snprintf(notify_version, sizeof(notify_version), "%s", r->version);
+                notify_state = HWPROTO_STATE_CHANGED;
+                updated = 1;
+                break;
+            }
+        }
+        if (!updated) {
+            hw_protocol_route_t *r = calloc(1, sizeof(*r));
+            if (!r) {
+                rc = HWRUN_ENOMEM;
+            } else {
+                snprintf(r->protocol, sizeof(r->protocol), "%s", protocol);
+                if (version) snprintf(r->version, sizeof(r->version), "%s", version);
+                else snprintf(r->version, sizeof(r->version), HWRUN_PROTOCOL_VERSION);
+                snprintf(r->plugin_id, sizeof(r->plugin_id), "%s", plugin_id);
+                r->implementation = implementation;
+                r->provider_state = HWPLUGIN_STARTED;
+                r->next = reg->routes;
+                reg->routes = r;
+                snprintf(notify_proto, sizeof(notify_proto), "%s", protocol);
+                snprintf(notify_version, sizeof(notify_version), "%s", r->version);
+                notify_state = HWPROTO_STATE_REGISTERED;
+            }
         }
     }
 
-    hw_protocol_route_t *r = calloc(1, sizeof(*r));
-    if (!r) return HWRUN_ENOMEM;
-    snprintf(r->protocol, sizeof(r->protocol), "%s", protocol);
-    if (version) snprintf(r->version, sizeof(r->version), "%s", version);
-    else         snprintf(r->version, sizeof(r->version), HWRUN_PROTOCOL_VERSION);
-    snprintf(r->plugin_id, sizeof(r->plugin_id), "%s", plugin_id);
-    r->implementation = implementation;
-    r->provider_state = HWPLUGIN_STARTED;
-    r->next = reg->routes;
-    reg->routes = r;
-
-    hw_metaproto_notify(reg, protocol, r->version, plugin_id,
-                       HWPROTO_STATE_REGISTERED);
-    return HWRUN_OK;
+    /* 出锁后派发：持锁期间绝不调用 subscriber 回调 */
+    if (rc == HWRUN_OK && notify_state)
+        hw_metaproto_notify(reg, notify_proto, notify_version, plugin_id,
+                            notify_state);
+    return rc;
 }
 
 int hw_metaproto_unregister(hw_metaproto_registry_t *reg,
                             const char *protocol, const char *plugin_id) {
     if (!reg || !protocol) return HWRUN_EINVAL;
-    hw_protocol_route_t **link = &reg->routes;
-    for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
-        if (hw_str_eq(r->protocol, protocol) &&
-            (!plugin_id || hw_str_eq(r->plugin_id, plugin_id))) {
-            *link = r->next;
-            hw_metaproto_notify(reg, r->protocol, r->version, r->plugin_id,
-                               HWPROTO_STATE_REMOVED);
-            free(r);
-            return HWRUN_OK;
+    int rc = HWRUN_ENOENT;
+    int notify_state = 0;
+    char notify_proto[64] = "", notify_version[16] = "", notify_plugin[64] = "";
+
+    HW_WRLOCK_GUARD(&reg->lock) {
+        hw_protocol_route_t **link = &reg->routes;
+        for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
+            if (hw_str_eq(r->protocol, protocol) &&
+                (!plugin_id || hw_str_eq(r->plugin_id, plugin_id))) {
+                *link = r->next;
+                snprintf(notify_proto, sizeof(notify_proto), "%s", r->protocol);
+                snprintf(notify_version, sizeof(notify_version), "%s", r->version);
+                snprintf(notify_plugin, sizeof(notify_plugin), "%s", r->plugin_id);
+                notify_state = HWPROTO_STATE_REMOVED;
+                free(r);
+                rc = HWRUN_OK;
+                break;
+            }
+            link = &r->next;
         }
-        link = &r->next;
     }
-    return HWRUN_ENOENT;
+
+    /* 出锁后派发：持锁期间绝不调用 subscriber 回调 */
+    if (rc == HWRUN_OK)
+        hw_metaproto_notify(reg, notify_proto, notify_version, notify_plugin,
+                            notify_state);
+    return rc;
 }
 
 int hw_metaproto_resolve(hw_metaproto_registry_t *reg,
                          const char *protocol, const char *version_req,
                          hw_protocol_route_t **out) {
     if (!reg || !protocol || !out) return HWRUN_EINVAL;
-    for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
-        if (hw_str_eq(r->protocol, protocol)) {
-            if (version_req && *version_req) {
-                if (!hw_proto_version_compat(r->version, version_req)) continue;
+    int rc = HWRUN_ENOENT;
+    HW_RDLOCK_GUARD(&reg->lock) {
+        for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
+            if (hw_str_eq(r->protocol, protocol)) {
+                if (version_req && *version_req) {
+                    if (!hw_proto_version_compat(r->version, version_req)) continue;
+                }
+                *out = r;   /* 借用指针：调用方自行保证与 unregister 不同步竞争 */
+                rc = HWRUN_OK;
+                break;
             }
-            *out = r;
-            return HWRUN_OK;
         }
     }
-    return HWRUN_ENOENT;
+    return rc;
 }
 
 int hw_metaproto_list(hw_metaproto_registry_t *reg,
                       hw_protocol_route_t ***out, int *count) {
     if (!reg || !out || !count) return HWRUN_EINVAL;
-    int n = 0;
-    for (hw_protocol_route_t *r = reg->routes; r; r = r->next) n++;
-    *count = n;
-    if (n == 0) { *out = NULL; return HWRUN_OK; }
-    hw_protocol_route_t **arr = malloc(n * sizeof(*arr));
-    if (!arr) return HWRUN_ENOMEM;
-    int i = 0;
-    for (hw_protocol_route_t *r = reg->routes; r; r = r->next) arr[i++] = r;
-    *out = arr;
-    return HWRUN_OK;
+    int rc = HWRUN_OK;
+    HW_RDLOCK_GUARD(&reg->lock) {
+        int n = 0;
+        for (hw_protocol_route_t *r = reg->routes; r; r = r->next) n++;
+        *count = n;
+        if (n == 0) {
+            *out = NULL;
+        } else {
+            hw_protocol_route_t **arr = malloc(n * sizeof(*arr));
+            if (!arr) {
+                rc = HWRUN_ENOMEM;
+            } else {
+                int i = 0;
+                for (hw_protocol_route_t *r = reg->routes; r; r = r->next)
+                    arr[i++] = r;
+                *out = arr;
+            }
+        }
+    }
+    return rc;
 }
 
 int hw_metaproto_subscribe(hw_metaproto_registry_t *reg,
@@ -157,34 +207,54 @@ int hw_metaproto_subscribe(hw_metaproto_registry_t *reg,
                            void (*cb)(const char *p, const char *v,
                                       const char *plugin, int state)) {
     if (!reg || !plugin_id || !cb) return HWRUN_EINVAL;
-    /* 防重 */
-    for (hw_protocol_sub_t *s = reg->subscribers; s; s = s->next) {
-        if (hw_str_eq(s->plugin_id, plugin_id) &&
-            (!protocol || hw_str_eq(s->protocol, protocol))) {
-            s->on_protocol_change = cb;
-            return HWRUN_OK;
+    int rc = HWRUN_OK;
+    int found = 0;
+    HW_WRLOCK_GUARD(&reg->lock) {
+        /* 防重 */
+        for (hw_protocol_sub_t *s = reg->subscribers; s; s = s->next) {
+            if (hw_str_eq(s->plugin_id, plugin_id) &&
+                (!protocol || hw_str_eq(s->protocol, protocol))) {
+                s->on_protocol_change = cb;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            hw_protocol_sub_t *s = calloc(1, sizeof(*s));
+            if (!s) {
+                rc = HWRUN_ENOMEM;
+            } else {
+                snprintf(s->plugin_id, sizeof(s->plugin_id), "%s", plugin_id);
+                if (protocol) snprintf(s->protocol, sizeof(s->protocol), "%s", protocol);
+                else          s->protocol[0] = '\0';
+                s->on_protocol_change = cb;
+                s->next = reg->subscribers;
+                reg->subscribers = s;
+            }
         }
     }
-    hw_protocol_sub_t *s = calloc(1, sizeof(*s));
-    if (!s) return HWRUN_ENOMEM;
-    snprintf(s->plugin_id, sizeof(s->plugin_id), "%s", plugin_id);
-    if (protocol) snprintf(s->protocol, sizeof(s->protocol), "%s", protocol);
-    else          s->protocol[0] = '\0';
-    s->on_protocol_change = cb;
-    s->next = reg->subscribers;
-    reg->subscribers = s;
-    return HWRUN_OK;
+    return rc;
 }
 
 void hw_metaproto_notify(hw_metaproto_registry_t *reg,
                          const char *protocol, const char *version,
                          const char *plugin_id, int state) {
     if (!reg) return;
-    for (hw_protocol_sub_t *s = reg->subscribers; s; s = s->next) {
-        if (s->protocol[0] && !hw_str_eq(s->protocol, protocol)) continue;
-        if (s->on_protocol_change) {
-            s->on_protocol_change(protocol, version, plugin_id, state);
+    /* 锁内快照匹配订阅者的回调指针（subscriber 可能被并发 unsubscribe/free），
+     * 出锁后逐个派发 —— 持锁期间绝不调用 subscriber 回调。
+     * 快照上限 64：超限静默截断（订阅者数百的场景不存在）。 */
+    typedef void (*sub_cb_t)(const char *, const char *, const char *, int);
+    sub_cb_t snaps[64];
+    int n = 0;
+    HW_RDLOCK_GUARD(&reg->lock) {
+        for (hw_protocol_sub_t *s = reg->subscribers; s; s = s->next) {
+            if (s->protocol[0] && !hw_str_eq(s->protocol, protocol)) continue;
+            if (n < (int)(sizeof(snaps) / sizeof(snaps[0])))
+                snaps[n++] = s->on_protocol_change;
         }
+    }
+    for (int i = 0; i < n; i++) {
+        if (snaps[i]) snaps[i](protocol, version, plugin_id, state);
     }
 }
 
@@ -193,16 +263,23 @@ int hw_metaproto_check_deps(hw_metaproto_registry_t *reg,
                             char *missing, size_t cap) {
     if (!reg || !requires || count < 0) return HWRUN_EINVAL;
     if (missing && cap) missing[0] = '\0';
-    for (int i = 0; i < count; i++) {
-        hw_protocol_route_t *r = NULL;
-        int rc = hw_metaproto_resolve(reg, requires[i], NULL, &r);
-        if (rc != HWRUN_OK || !r) {
-            if (missing && cap)
-                snprintf(missing, cap, "%s", requires[i]);
-            return HWRUN_ENOENT;
+    int rc = HWRUN_OK;
+    /* RDLOCK 内直接查表（不复用 resolve 以避免对同一把读写锁嵌套读加锁） */
+    HW_RDLOCK_GUARD(&reg->lock) {
+        for (int i = 0; i < count; i++) {
+            int ok = 0;
+            for (hw_protocol_route_t *r = reg->routes; r; r = r->next) {
+                if (hw_str_eq(r->protocol, requires[i])) { ok = 1; break; }
+            }
+            if (!ok) {
+                if (missing && cap)
+                    snprintf(missing, cap, "%s", requires[i]);
+                rc = HWRUN_ENOENT;
+                break;
+            }
         }
     }
-    return HWRUN_OK;
+    return rc;
 }
 
 void hw_metaproto_export_api(hw_metaproto_api_t *api,

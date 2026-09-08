@@ -9,6 +9,7 @@
  */
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 
 #include <pthread.h>
 #include <dlfcn.h>
@@ -50,6 +51,8 @@ static int sp_init(hw_plugin_t *self) {
 
     pd->started = 0;
     self->private_data = pd;
+    HWAPI_LOGI("sp", "init: key_keepalive=%d",
+               HWAPI_PARAM_GET_INT("sp.key_keepalive", 3600));
     return HWRUN_OK;
 }
 
@@ -249,43 +252,24 @@ int sp_selftest(void) {
     return (fail == 0) ? SP_OK : SP_EIO;
 }
 
-/* ============================================================
- * 插件入口：dlopen 加载时调用，返回 hw_plugin_t*
- * ============================================================ */
-static hw_plugin_t g_sp_plugin;
+/* 生命周期 ops 表：由 SDK 宏装配进描述符 */
+static hw_plugin_ops_t g_ops = {
+    .init          = sp_init,
+    .start         = sp_start,
+    .stop          = sp_stop,
+    .destroy       = sp_destroy,
+    .configure     = sp_configure,
+    .get_interface = sp_get_interface,
+};
 
-__attribute__((visibility("default")))
-hw_plugin_t *hw_plugin_entry(void) {
-    memset(&g_sp_plugin, 0, sizeof(g_sp_plugin));
+/* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据） */
+static const char *const g_provides[] = { "SP", NULL };
+static const char *const g_requires[] = {
+    "LOG", "PARAM", "HAP", "PMP", "FSP", "METAPROTO", NULL
+};
 
-    /* 基础元数据（与 plugin.yml 保持一致） */
-    strncpy(g_sp_plugin.id, "sp", sizeof(g_sp_plugin.id) - 1);
-    strncpy(g_sp_plugin.name, "Security Protocol",
-            sizeof(g_sp_plugin.name) - 1);
-    strncpy(g_sp_plugin.version, "1.0.0", sizeof(g_sp_plugin.version) - 1);
-    g_sp_plugin.type = HWPLUGIN_TYPE_SECURITY;
-    g_sp_plugin.state = HWPLUGIN_INSTALLED;
-    strncpy(g_sp_plugin.description,
-            "HWRun OS 安全协议：认证、授权、加密、解密、哈希、签名、密钥管理与完整性校验",
-            sizeof(g_sp_plugin.description) - 1);
-
-    /* 提供的协议 */
-    static char *sp_provides[] = { "SP" };
-    g_sp_plugin.provides = sp_provides;
-    g_sp_plugin.provides_count = 1;
-
-    /* 依赖的协议（依赖链第 7 环；仅声明，真正校验由总线 && METAPROTO 完成） */
-    static char *sp_requires[] = { "LOG", "PARAM", "HAP", "PMP", "FSP", "METAPROTO" };
-    g_sp_plugin.requires = sp_requires;
-    g_sp_plugin.requires_count = 6;
-
-    /* 生命周期 */
-    g_sp_plugin.ops.init           = sp_init;
-    g_sp_plugin.ops.start          = sp_start;
-    g_sp_plugin.ops.stop           = sp_stop;
-    g_sp_plugin.ops.destroy        = sp_destroy;
-    g_sp_plugin.ops.configure      = sp_configure;
-    g_sp_plugin.ops.get_interface  = sp_get_interface;
-
-    return &g_sp_plugin;
-}
+HWRUN_PLUGIN_BIND()
+HWRUN_PLUGIN_DEFINE(
+    "sp", "Security Protocol", "1.0.0", HWPLUGIN_TYPE_SECURITY,
+    "HWRun OS 安全协议：认证、授权、加密、解密、哈希、签名、密钥管理与完整性校验",
+    &g_ops, g_provides, g_requires)

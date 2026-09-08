@@ -47,8 +47,8 @@ int git_ops_init(const char *path) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git init 失败: %s\n",
-                r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git init 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -63,7 +63,8 @@ int git_ops_clone(const char *remote, const char *local_path) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git clone 失败: %s\n", r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git clone 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -127,7 +128,8 @@ int git_ops_push(const char *remote, const char *branch) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git push 失败: %s\n", r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git push 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -147,7 +149,8 @@ int git_ops_pull(const char *remote, const char *branch) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git pull 失败: %s\n", r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git pull 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }

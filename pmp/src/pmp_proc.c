@@ -66,24 +66,24 @@ static pmp_sched_policy_t linux_to_pmp_policy(int lp) {
 int pmp_fork(void) {
 #if defined(_WIN32)
     /* Windows 无 fork，优雅返回不支持 */
-    return -5;   /* HWRUN_ENOTSUP */
+    return -ENOTSUP;
 #else
     return (int)fork();
 #endif
 }
 
 int pmp_exec(const char *path, char * const argv[]) {
-    if (!path) return -1;              /* HWRUN_EINVAL */
+    if (!path) return -EINVAL;
     /* exec 成功不返回；失败用 errno */
     execv(path, argv);
     return -errno;
 }
 
 int pmp_execve_full(const char *path, char * const argv[], char * const envp[]) {
-    if (!path) return -1;
+    if (!path) return -EINVAL;
 #if defined(_WIN32)
     (void)argv; (void)envp;
-    return -5;                         /* HWRUN_ENOTSUP */
+    return -ENOTSUP;
 #else
     execve(path, argv, envp);
     return -errno;
@@ -92,7 +92,7 @@ int pmp_execve_full(const char *path, char * const argv[], char * const envp[]) 
 
 /* spawn：fork + exec 封装 */
 int pmp_spawn(const char *path, char * const argv[], int *out_pid) {
-    if (!path || !out_pid) return -1;  /* HWRUN_EINVAL */
+    if (!path || !out_pid) return -EINVAL;
 #if defined(_WIN32)
     (void)argv;
     /* CreateProcess 兜底 */
@@ -203,7 +203,7 @@ int pmp_sched_get(int32_t pid, pmp_sched_policy_t *policy,
 int pmp_set_affinity(int32_t pid, uint32_t cpu_mask) {
 #if defined(_WIN32)
     (void)pid; (void)cpu_mask;
-    return -5;                     /* HWRUN_ENOTSUP */
+    return -ENOTSUP;
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -219,7 +219,7 @@ int pmp_set_affinity(int32_t pid, uint32_t cpu_mask) {
 int pmp_get_affinity(int32_t pid, uint32_t *cpu_mask) {
 #if defined(_WIN32)
     (void)pid; (void)cpu_mask;
-    return -5;
+    return -ENOTSUP;
 #else
     cpu_set_t set;
     CPU_ZERO(&set);

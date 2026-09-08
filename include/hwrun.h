@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,22 +29,34 @@ extern "C" {
 #define HWRUN_PROTOCOL_VERSION   "1.0"
 
 /* ============================================================
- * 错误码
+ * 错误码 —— 全库负 errno 化
+ *
+ * 约定：
+ *   成功返回 0（HWRUN_OK）。
+ *   失败一律返回负 errno（-EINVAL/-ENOENT/...），与 libc 语义一致，
+ *   可直接用 strerror(-rc) 转描述。
+ *   无标准 errno 对应的 HWRun 私有错误落在 HW_EBASE 私有域。
+ *
+ * 旧版 HWRUN_E* 为离散负小值（-1..-11），与 glibc errno 数值冲突，
+ * 现收敛为负 errno 别名，源码继续使用 HWRUN_E* 亦语义正确。
  * ============================================================ */
-enum {
-    HWRUN_OK           = 0,
-    HWRUN_EINVAL       = -1,
-    HWRUN_ENOENT       = -2,
-    HWRUN_ENOMEM       = -3,
-    HWRUN_EEXIST       = -4,
-    HWRUN_ENOTSUP      = -5,
-    HWRUN_EILSEQ       = -6,   /* 协议不匹配 */
-    HWRUN_ECONFLICT    = -7,   /* 依赖冲突 */
-    HWRUN_EAGAIN       = -8,
-    HWRUN_EINPROGRESS  = -9,
-    HWRUN_EPERM        = -10,
-    HWRUN_ENOTREADY    = -11,
-};
+#include <errno.h>
+
+#define HWRUN_OK            0
+#define HWRUN_EPERM        (-EPERM)
+#define HWRUN_ENOENT       (-ENOENT)
+#define HWRUN_ENOMEM       (-ENOMEM)
+#define HWRUN_EEXIST       (-EEXIST)
+#define HWRUN_ENOTSUP      (-ENOTSUP)
+#define HWRUN_EILSEQ       (-EILSEQ)          /* 协议不匹配 */
+#define HWRUN_EAGAIN       (-EAGAIN)
+#define HWRUN_EINPROGRESS  (-EINPROGRESS)
+#define HWRUN_EINVAL       (-EINVAL)
+
+/* HWRun 私有错误域：标准 errno 之上（Linux 上限约 133），负号使用 */
+#define HW_EBASE            0x1000
+#define HWRUN_ECONFLICT    (-(HW_EBASE + 1))  /* 依赖/注册冲突 */
+#define HWRUN_ENOTREADY    (-(HW_EBASE + 2))  /* 子系统未就绪 */
 
 /* ============================================================
  * 插件状态（与微内核任务状态对应）
@@ -86,6 +99,7 @@ typedef enum {
  * ============================================================ */
 typedef struct hw_plugin hw_plugin_t;
 typedef struct hw_param  hw_param_t;
+typedef struct hw_runtime hw_runtime_t;   /* 前向声明：runtime_bind 字段使用 */
 
 /* 生命周期回调 —— 每个插件必须实现 */
 typedef struct hw_plugin_ops {
@@ -135,6 +149,10 @@ struct hw_plugin {
     int                ref_count;
     uint64_t           task_id;
     hw_param_t        *params;        /* 默认参数链表 */
+
+    /* 运行时注入绑定点：由 entry() 填充本 .so 的 bind 地址，
+     * loader/测试经此字段调用，避免同名符号在 RTLD_GLOBAL 下冲突 */
+    void (*runtime_bind)(hw_runtime_t *rt);
 
     struct hw_plugin *next, *prev;
 };
@@ -235,6 +253,70 @@ extern int         hw_param_set(hw_param_t *root, const char *key,
 extern hw_param_t *hw_param_add_child(hw_param_t *parent, const char *key,
                                       const char *value, int type,
                                       const char *desc);
+
+/* ============================================================
+ * 运行时注入（BUS 在 init 前注入；插件经 hw_plugin_runtime_get() 获取）
+ *
+ * 插件 .so 自包含，只依赖本契约。BUS 通过 dlsym(句柄, "hw_plugin_runtime_bind")
+ * 把构造好的 hw_runtime_t 投递给插件内部的静态副本，插件随后经
+ * hw_plugin_runtime_get() 使用。未注入 / 回调为 NULL 时便捷宏全部静默降级。
+ * ============================================================ */
+typedef struct hw_runtime hw_runtime_t;
+
+/* 运行时日志级别（与 bus/log.h 的 HWLOG_* 数值一致，供插件独立使用） */
+enum {
+    HWAPI_LOG_DEBUG = 0,
+    HWAPI_LOG_INFO  = 1,
+    HWAPI_LOG_WARN  = 2,
+    HWAPI_LOG_ERROR = 3,
+    HWAPI_LOG_FATAL = 4,
+};
+
+struct hw_runtime {
+    /* ---- LOG ---- */
+    void (*log)(int level, const char *plugin_id, const char *fmt, ...);
+
+    /* ---- PARAM ---- */
+    const char *(*param_get)(const char *key);
+    int         (*param_get_int)(const char *key, int def);
+    bool        (*param_get_bool)(const char *key, bool def);
+    int         (*param_set)(const char *key, const char *value, int type,
+                             const char *desc);
+    int         (*param_watch)(const char *plugin_id, const char *pattern,
+                               int (*cb)(const char*, const char*, const char*,
+                                         void*),
+                               void *userdata);
+
+    /* ---- GIT（签名取自 git/include/git.h） ---- */
+    int   (*git_add)(const char *path);
+    int   (*git_commit)(const char *message, char *out_id, size_t cap);
+    char *(*git_status)(void);          /* 返回值需要 free 后释放 */
+    void  *git;                         /* 原始 hw_git_ops_t*，需更多能力时强转 */
+
+    void *ctx;                          /* 保留，未用 */
+};
+
+/* 每插件 .so 须在自己的入口 .c 实现一次（静态存储） */
+extern void          hw_plugin_runtime_bind(hw_runtime_t *rt);
+extern hw_runtime_t *hw_plugin_runtime_get(void);
+
+/* ===== 便捷宏（插件 #include hwrun.h 后即可使用，NULL 安全） ===== */
+#define HWAPI_R()  hw_plugin_runtime_get()
+#define HWAPI_LOG(level, plug, ...) \
+    do { hw_runtime_t *_r = HWAPI_R(); \
+         if (_r && _r->log) _r->log((level),(plug),__VA_ARGS__); } while (0)
+#define HWAPI_LOGI(plug, ...)  HWAPI_LOG(HWAPI_LOG_INFO,  (plug), __VA_ARGS__)
+#define HWAPI_LOGW(plug, ...)  HWAPI_LOG(HWAPI_LOG_WARN,  (plug), __VA_ARGS__)
+#define HWAPI_LOGE(plug, ...)  HWAPI_LOG(HWAPI_LOG_ERROR, (plug), __VA_ARGS__)
+
+#define HWAPI_PARAM_GET(key) \
+    (HWAPI_R() && HWAPI_R()->param_get ? HWAPI_R()->param_get((key)) : NULL)
+#define HWAPI_PARAM_GET_INT(key, def) \
+    (HWAPI_R() && HWAPI_R()->param_get_int ? HWAPI_R()->param_get_int((key),(def)) : (def))
+#define HWAPI_PARAM_GET_BOOL(key, def) \
+    (HWAPI_R() && HWAPI_R()->param_get_bool ? HWAPI_R()->param_get_bool((key),(def)) : (def))
+#define HWAPI_PARAM_SET(key, val, type, desc) \
+    (HWAPI_R() && HWAPI_R()->param_set ? HWAPI_R()->param_set((key),(val),(type),(desc)) : HWRUN_EINVAL)
 
 #ifdef __cplusplus
 }

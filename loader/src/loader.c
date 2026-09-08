@@ -8,6 +8,7 @@
  */
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 
 #include "../include/loader.h"
 
@@ -37,6 +38,8 @@ static int loader_init(hw_plugin_t *self) {
     if (!pd) return HWRUN_ENOMEM;
     pd->started = 0;
     self->private_data = pd;
+    HWAPI_LOGI("loader", "init: formats=%d",
+               HWAPI_PARAM_GET_INT("loader.formats", 0));
     return HWRUN_OK;
 }
 
@@ -83,48 +86,24 @@ static void *loader_get_interface(const char *protocol) {
     return NULL;
 }
 
-static hw_plugin_t g_loader_plugin;
+/* 生命周期 ops 表：由 SDK 宏装配进描述符 */
+static hw_plugin_ops_t g_ops = {
+    .init          = loader_init,
+    .start         = loader_start,
+    .stop          = loader_stop,
+    .destroy       = loader_destroy,
+    .configure     = loader_configure,
+    .get_interface = loader_get_interface,
+};
 
-/* ============================================================
- * 插件入口：dlopen 加载时调用，返回 hw_plugin_t*
- * ============================================================ */
-__attribute__((visibility("default")))
-hw_plugin_t *hw_plugin_entry(void) {
-    memset(&g_loader_plugin, 0, sizeof(g_loader_plugin));
+/* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据） */
+static const char *const g_provides[] = { "LOADER", NULL };
+static const char *const g_requires[] = {
+    "HAP", "PMP", "FSP", "LOG", "PARAM", "METAPROTO", NULL
+};
 
-    /* 基础元数据（与 plugin.yml 保持一致） */
-    strncpy(g_loader_plugin.id, "loader", sizeof(g_loader_plugin.id) - 1);
-    strncpy(g_loader_plugin.name, "Executable Loader Protocol",
-            sizeof(g_loader_plugin.name) - 1);
-    strncpy(g_loader_plugin.version, "1.0.0",
-            sizeof(g_loader_plugin.version) - 1);
-    g_loader_plugin.type = HWPLUGIN_TYPE_LOADER;
-    g_loader_plugin.state = HWPLUGIN_INSTALLED;
-    strncpy(g_loader_plugin.description,
-            "HWRun OS 可执行文件加载协议：检测 / 加载 / 运行各类可执行格式",
-            sizeof(g_loader_plugin.description) - 1);
-
-    /* 提供的协议 */
-    static char *loader_provides[] = {
-        "LOADER",
-    };
-    g_loader_plugin.provides = loader_provides;
-    g_loader_plugin.provides_count = 1;
-
-    /* 依赖的协议（声明；真正校验由总线 && METAPROTO 完成） */
-    static char *loader_requires[] = {
-        "HAP", "PMP", "FSP", "LOG", "PARAM", "METAPROTO",
-    };
-    g_loader_plugin.requires = loader_requires;
-    g_loader_plugin.requires_count = 6;
-
-    /* 生命周期 */
-    g_loader_plugin.ops.init          = loader_init;
-    g_loader_plugin.ops.start         = loader_start;
-    g_loader_plugin.ops.stop          = loader_stop;
-    g_loader_plugin.ops.destroy       = loader_destroy;
-    g_loader_plugin.ops.configure     = loader_configure;
-    g_loader_plugin.ops.get_interface = loader_get_interface;
-
-    return &g_loader_plugin;
-}
+HWRUN_PLUGIN_BIND()
+HWRUN_PLUGIN_DEFINE(
+    "loader", "Executable Loader Protocol", "1.0.0", HWPLUGIN_TYPE_LOADER,
+    "HWRun OS 可执行文件加载协议：检测 / 加载 / 运行各类可执行格式",
+    &g_ops, g_provides, g_requires)

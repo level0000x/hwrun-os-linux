@@ -10,6 +10,7 @@
  */
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 #include "fsp.h"
 
 #include <stdio.h>
@@ -26,8 +27,6 @@ extern void hw_fsp_ops_mount_init(hw_fsp_ops_t *ops);
 /* 全局 FSP 接口实例 */
 static hw_fsp_ops_t g_fsp_ops;
 
-static hw_plugin_t g_plugin;   /* 插件描述符 */
-
 static int fsp_init(hw_plugin_t *self) {
     (void)self;
     /* 组装 FSP 协议接口：文件/目录/权限/路径/挂载 */
@@ -36,6 +35,9 @@ static int fsp_init(hw_plugin_t *self) {
     hw_fsp_ops_perm_init(&g_fsp_ops);
     hw_fsp_ops_path_init(&g_fsp_ops);
     hw_fsp_ops_mount_init(&g_fsp_ops);
+
+    HWAPI_LOGI("fsp", "init: root=%s",
+               HWAPI_PARAM_GET("fsp.root") ? HWAPI_PARAM_GET("fsp.root") : "/");
 
     self->state = HWPLUGIN_LOADED;
     return HWRUN_OK;   /* 成功 */
@@ -66,6 +68,7 @@ static void *fsp_get_interface(const char *protocol) {
     return NULL;
 }
 
+/* 生命周期回调表（SDK 宏将其拷贝进描述符 g_hwplugin.ops） */
 static hw_plugin_ops_t fsp_ops = {
     .init         = fsp_init,
     .start        = fsp_start,
@@ -75,29 +78,18 @@ static hw_plugin_ops_t fsp_ops = {
     .get_interface= fsp_get_interface,
 };
 
-/* .so 统一入口：返回 hw_plugin_t* */
-hw_plugin_t *hw_plugin_entry(void) {
-    memset(&g_plugin, 0, sizeof(g_plugin));
+/* ============================================================
+ * 运行时注入绑定点 + 插件描述符（统一由 hwrun_plugin.h 宏生成）
+ * ============================================================ */
+HWRUN_PLUGIN_BIND()
 
-    snprintf(g_plugin.id,          sizeof(g_plugin.id),          "%s", "fsp");
-    snprintf(g_plugin.name,        sizeof(g_plugin.name),        "%s", "FileSystem Protocol");
-    snprintf(g_plugin.version,     sizeof(g_plugin.version),     "%s", "1.0.0");
-    g_plugin.type   = HWPLUGIN_TYPE_FS;
-    g_plugin.state  = HWPLUGIN_INSTALLED;
-    snprintf(g_plugin.description, sizeof(g_plugin.description),
-             "%s", "HWRun OS 文件系统协议：文件/目录/权限/路径/挂载操作");
+/* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
+static const char *const g_provides[] = { HWPROTO_FSP, NULL };
+static const char *const g_requires[] = {
+    HWPROTO_HAP, HWPROTO_PMP, HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO,
+    NULL,
+};
 
-    /* 提供的协议 */
-    static char *provides[] = { (char*)"FSP" };
-    g_plugin.provides       = provides;
-    g_plugin.provides_count = 1;
-
-    /* 依赖协议（依赖链顺序） */
-    static char *requires[] = { (char*)"HAP", (char*)"PMP", (char*)"LOG",
-                                (char*)"PARAM", (char*)"METAPROTO" };
-    g_plugin.requires       = requires;
-    g_plugin.requires_count = 5;
-
-    g_plugin.ops = fsp_ops;
-    return &g_plugin;
-}
+HWRUN_PLUGIN_DEFINE("fsp", "FileSystem Protocol", "1.0.0", HWPLUGIN_TYPE_FS,
+                    "HWRun OS 文件系统协议：文件/目录/权限/路径/挂载操作",
+                    &fsp_ops, g_provides, g_requires)

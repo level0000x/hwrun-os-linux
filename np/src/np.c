@@ -8,6 +8,7 @@
  */
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 #include "../include/np.h"
 #include "np_conn.h"
 
@@ -111,6 +112,8 @@ static int np_init(hw_plugin_t *self) {
 
     /* 清空连接跟踪表，避免宿主重用本插件实例时的脏状态 */
     np_conn_clear();
+    HWAPI_LOGI("np", "init: backlog=%d",
+               HWAPI_PARAM_GET_INT("np.listen_backlog", 16));
     return HWRUN_OK;
 }
 
@@ -158,44 +161,24 @@ static void *np_get_interface(const char *protocol) {
     return NULL;
 }
 
-static hw_plugin_t g_np_plugin;
+/* 生命周期 ops 表：由 SDK 宏装配进描述符 */
+static hw_plugin_ops_t g_ops = {
+    .init          = np_init,
+    .start         = np_start,
+    .stop          = np_stop,
+    .destroy       = np_destroy,
+    .configure     = np_configure,
+    .get_interface = np_get_interface,
+};
 
-/* ============================================================
- * 插件入口：dlopen 加载时调用，返回 hw_plugin_t*
- * ============================================================ */
-__attribute__((visibility("default")))
-hw_plugin_t *hw_plugin_entry(void) {
-    memset(&g_np_plugin, 0, sizeof(g_np_plugin));
+/* 协议清单：以 NULL 哨兵结尾的只读数组（.so 静态数据） */
+static const char *const g_provides[] = { "NP", NULL };
+static const char *const g_requires[] = {
+    "HAP", "LOG", "PARAM", "METAPROTO", NULL
+};
 
-    /* 基础元数据（与 plugin.yml 保持一致） */
-    strncpy(g_np_plugin.id, "np", sizeof(g_np_plugin.id) - 1);
-    strncpy(g_np_plugin.name, "Network Protocol", sizeof(g_np_plugin.name) - 1);
-    strncpy(g_np_plugin.version, "1.0.0", sizeof(g_np_plugin.version) - 1);
-    g_np_plugin.type = HWPLUGIN_TYPE_NETWORK;
-    g_np_plugin.state = HWPLUGIN_INSTALLED;
-    strncpy(g_np_plugin.description,
-            "HWRun OS 网络协议：socket、TCP/UDP/UNIX、名称解析、网络接口枚举的统一抽象",
-            sizeof(g_np_plugin.description) - 1);
-
-    /* 提供的协议 */
-    static char *np_provides[] = { "NP" };
-    g_np_plugin.provides = np_provides;
-    g_np_plugin.provides_count = 1;
-
-    /* 依赖的协议（仅声明，真正校验由总线 && METAPROTO 完成） */
-    static char *np_requires[] = {
-        "HAP", "LOG", "PARAM", "METAPROTO",
-    };
-    g_np_plugin.requires = np_requires;
-    g_np_plugin.requires_count = 4;
-
-    /* 生命周期 */
-    g_np_plugin.ops.init          = np_init;
-    g_np_plugin.ops.start         = np_start;
-    g_np_plugin.ops.stop          = np_stop;
-    g_np_plugin.ops.destroy       = np_destroy;
-    g_np_plugin.ops.configure     = np_configure;
-    g_np_plugin.ops.get_interface = np_get_interface;
-
-    return &g_np_plugin;
-}
+HWRUN_PLUGIN_BIND()
+HWRUN_PLUGIN_DEFINE(
+    "np", "Network Protocol", "1.0.0", HWPLUGIN_TYPE_NETWORK,
+    "HWRun OS 网络协议：socket、TCP/UDP/UNIX、名称解析、网络接口枚举的统一抽象",
+    &g_ops, g_provides, g_requires)

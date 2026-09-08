@@ -5,6 +5,7 @@
  */
 
 #include "bus.h"
+#include "git.h"
 
 #include <dlfcn.h>
 #include <time.h>
@@ -70,6 +71,29 @@ int hw_plugin_load_so(hw_bus_t *bus, hw_plugin_t *p) {
     return HWRUN_OK;
 }
 
+/* 把运行时（LOG/PARAM/GIT）注入插件内部的静态副本（init 前调用） */
+void hw_plugin_inject_runtime(hw_bus_t *bus, hw_plugin_t *p) {
+    if (!bus || !p || !p->handle) return;
+
+    hw_runtime_t rt;
+    hw_runtime_fill(&rt);
+
+    /* GIT：解析到真实 hw_git_ops_t 后补填 */
+    hw_protocol_route_t *route = NULL;
+    if (hw_bus_resolve(bus, HWPROTO_GIT, &route) == HWRUN_OK && route &&
+        route->implementation) {
+        hw_git_ops_t *g = (hw_git_ops_t *)route->implementation;
+        rt.git_add    = g->add;
+        rt.git_commit = g->commit;
+        rt.git_status = g->status;
+        rt.git        = g;
+    }
+
+    /* 经插件描述符的 runtime_bind 字段投递（entry() 已填充本 .so 的 bind 地址，
+     * 避免同名符号在 RTLD_GLOBAL 全局符号表下被覆盖而误绑到其它插件） */
+    if (p->runtime_bind) p->runtime_bind(&rt);
+}
+
 int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
     if (!bus || !p) return HWRUN_EINVAL;
 
@@ -86,6 +110,9 @@ int hw_plugin_start(hw_bus_t *bus, hw_plugin_t *p) {
         p->state = HWPLUGIN_ERROR;
         return HWRUN_EILSEQ;
     }
+
+    /* 注入运行时（LOG/PARAM/GIT），再触发 init */
+    hw_plugin_inject_runtime(bus, p);
 
     /* init */
     if (p->ops.init) {

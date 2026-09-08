@@ -36,8 +36,8 @@ int git_ops_checkout(const char *ref) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git checkout 失败: %s\n",
-                r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git checkout 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -51,8 +51,8 @@ int git_ops_reset(const char *ref, int hard) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git reset 失败: %s\n",
-                r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git reset 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }
@@ -66,8 +66,8 @@ int git_ops_revert(const char *commit) {
     if (!r) return -1;
     int ret = r->success ? 0 : -1;
     if (!r->success)
-        fprintf(stderr, "git revert 失败: %s\n",
-                r->stdout_buf ? r->stdout_buf : "");
+        HWAPI_LOGE(PLUGIN_ID, "git revert 失败: %s",
+                   r->stdout_buf ? r->stdout_buf : "");
     git_result_free(r);
     return ret;
 }

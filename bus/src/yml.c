@@ -88,13 +88,21 @@ static int add_str(char **arr, int arr_max, int *count, const char *val) {
     return HWRUN_OK;
 }
 
-void hw_plugin_discovery_free(hw_plugin_discovery_t *d) {
+/* 释放解析结果内部的动态字符串数组。
+ * 注意：d 本身通常位于调用方栈上（bus.c scan_dir_rec），本函数只清内部，
+ * 不 free(d)。若 d 由堆分配，调用方自行释放。 */
+void hw_plugin_discovery_clear(hw_plugin_discovery_t *d) {
     if (!d) return;
     for (int i = 0; i < d->provides_count; i++) free(d->provides[i]);
     for (int i = 0; i < d->requires_count; i++) free(d->requires[i]);
     for (int i = 0; i < d->conflicts_count; i++) free(d->conflicts[i]);
     for (int i = 0; i < d->files_count; i++) free(d->files[i]);
-    free(d);
+    memset(d, 0, sizeof(*d));
+}
+
+/* 兼容旧名：仅清内部（含堆分配的 discovery 对象请另行 free） */
+void hw_plugin_discovery_free(hw_plugin_discovery_t *d) {
+    hw_plugin_discovery_clear(d);
 }
 
 int hw_yml_parse_plugin(const char *yml_path, hw_plugin_discovery_t *d) {

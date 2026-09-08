@@ -9,6 +9,7 @@
 
 #include "pmp.h"
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -79,6 +80,8 @@ static int pmp_plugin_init(hw_plugin_t *self) {
     (void)self;
     memset(&g_ctx, 0, sizeof(g_ctx));
     g_ctx.initialized = 1;
+    HWAPI_LOGI("pmp", "init: task_pool=%d",
+               HWAPI_PARAM_GET_INT("pmp.task_pool", 32));
     return HWRUN_OK;                    /* 0 成功 */
 }
 
@@ -114,39 +117,28 @@ static void *pmp_get_interface(const char *protocol) {
     return NULL;
 }
 
-/* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
-static const char *provides_list[] = { HWPROTO_PMP };
-static const char *requires_list[] = {
-    HWPROTO_METAPROTO, HWPROTO_PARAM, HWPROTO_LOG, HWPROTO_HAP,
-};
-static const char *files_list[] = { "build/pmp.so" };
-
-static hw_plugin_t g_plugin = {
-    .id          = "pmp",
-    .name        = "Process Management Protocol",
-    .version     = "1.0.0",
-    .type        = HWPLUGIN_TYPE_KERNEL,
-    .state       = HWPLUGIN_INSTALLED,
-    .description = "HWRun OS 进程管理协议：进程创建/控制/调度/信号/任务管理",
-    .provides    = (char **)provides_list,
-    .provides_count = 1,
-    .requires    = (char **)requires_list,
-    .requires_count = 4,
-    .files       = (char **)files_list,
-    .files_count = 1,
-    .ops = {
-        .init          = pmp_plugin_init,
-        .start         = pmp_plugin_start,
-        .stop          = pmp_plugin_stop,
-        .destroy       = pmp_plugin_destroy,
-        .configure     = pmp_plugin_configure,
-        .get_interface = pmp_get_interface,
-    },
+/* 生命周期回调表（SDK 宏将其拷贝进描述符 g_hwplugin.ops） */
+static hw_plugin_ops_t pmp_ops = {
+    .init          = pmp_plugin_init,
+    .start         = pmp_plugin_start,
+    .stop          = pmp_plugin_stop,
+    .destroy       = pmp_plugin_destroy,
+    .configure     = pmp_plugin_configure,
+    .get_interface = pmp_get_interface,
 };
 
 /* ============================================================
- * .so 统一导出入口（loader 通过 dlsym 查找）
+ * 运行时注入绑定点 + 插件描述符（统一由 hwrun_plugin.h 宏生成）
  * ============================================================ */
-hw_plugin_t *hw_plugin_entry(void) {
-    return &g_plugin;
-}
+HWRUN_PLUGIN_BIND()
+
+/* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
+static const char *const g_provides[] = { HWPROTO_PMP, NULL };
+static const char *const g_requires[] = {
+    HWPROTO_METAPROTO, HWPROTO_PARAM, HWPROTO_LOG, HWPROTO_HAP, NULL,
+};
+
+HWRUN_PLUGIN_DEFINE("pmp", "Process Management Protocol", "1.0.0",
+                    HWPLUGIN_TYPE_KERNEL,
+                    "HWRun OS 进程管理协议：进程创建/控制/调度/信号/任务管理",
+                    &pmp_ops, g_provides, g_requires)

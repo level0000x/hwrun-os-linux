@@ -43,7 +43,8 @@ int main(void) {
 
     /* ---- 文件读写 ---- */
     const char *path = "./fsp_test.tmp";
-    CHECK(ops->remove(path) == 0 || errno == ENOENT, "清理旧测试文件");
+    int rc = ops->remove(path);
+    CHECK(rc == 0 || rc == -ENOENT, "清理旧测试文件");
 
     int fd = ops->open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     CHECK(fd >= 0, "open(WRONLY|CREAT)");
@@ -87,7 +88,8 @@ int main(void) {
     CHECK(ops->exists(dir) == 0, "exists(dir) == 0");
 
     /* ---- 权限 ---- */
-    CHECK(ops->chmod(child, 0600) == -1 && errno == ENOENT, "chmod 不存在的文件返回 ENOENT");
+    /* 负 errno 语义：chmod 不存在文件返回 -ENOENT */
+    CHECK(ops->chmod(child, 0600) == -ENOENT, "chmod 不存在的文件返回 ENOENT");
 
     /* ---- 路径操作 ---- */
     char out[1024];

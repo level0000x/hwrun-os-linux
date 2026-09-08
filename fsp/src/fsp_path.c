@@ -15,7 +15,7 @@
 /* 词法规范化：折叠多个 '/',处理 '.' 与 '..'，返回原串拷贝到 out。
  * 若为相对路径,则基于当前工作目录解析为绝对路径。 */
 static int fsp_path_normalize(const char *in, char *out, size_t cap) {
-    if (!in || !out || cap == 0) { errno = EINVAL; return -1; }
+    if (!in || !out || cap == 0) return -EINVAL;
 
     char absbuf[4096];
     const char *src = in;
@@ -25,10 +25,10 @@ static int fsp_path_normalize(const char *in, char *out, size_t cap) {
 
     if (!absolute) {
         /* 相对路径：先拼接 cwd */
-        if (!getcwd(absbuf, sizeof(absbuf))) return -1;
+        if (!getcwd(absbuf, sizeof(absbuf))) return -errno;
         size_t cwdl = strlen(absbuf);
         size_t src_len = strlen(src);
-        if (cwdl + 1 + src_len + 1 > sizeof(absbuf)) { errno = ENAMETOOLONG; return -1; }
+        if (cwdl + 1 + src_len + 1 > sizeof(absbuf)) return -ENAMETOOLONG;
         absbuf[cwdl++] = '/';
         memcpy(absbuf + cwdl, src, src_len + 1);
         src = absbuf;
@@ -62,8 +62,7 @@ static int fsp_path_normalize(const char *in, char *out, size_t cap) {
                 snprintf(stack[top], sizeof(stack[top]), "%s", seg);
                 top++;
             } else {
-                errno = ENAMETOOLONG;
-                return -1;
+                return -ENAMETOOLONG;
             }
         }
     }
@@ -71,7 +70,7 @@ static int fsp_path_normalize(const char *in, char *out, size_t cap) {
     /* 组装输出 */
     size_t n = 0;
 #define PUSH(s) do { for (const char *q = (s); *q; q++) { \
-                    if (n + 1 >= cap) { errno = ENAMETOOLONG; return -1; } \
+                    if (n + 1 >= cap) return -ENAMETOOLONG; \
                     out[n++] = *q; } } while (0)
 
     PUSH("/");
@@ -86,14 +85,14 @@ static int fsp_path_normalize(const char *in, char *out, size_t cap) {
 
 /* join: dir + "/" + name，单分隔符拼接并直接规范化 */
 static int fsp_path_join(char *out, size_t cap, const char *dir, const char *name) {
-    if (!dir || !name || !out || cap == 0) { errno = EINVAL; return -1; }
+    if (!dir || !name || !out || cap == 0) return -EINVAL;
 
     char tmp[4096];
     size_t dl = strlen(dir);
     int d_needs = (dl > 0 && dir[dl - 1] != '/');
     size_t need = dl + (d_needs ? 1 : 0) + strlen(name);
 
-    if (need + 1 > sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    if (need + 1 > sizeof(tmp)) return -ENAMETOOLONG;
 
     size_t n = 0;
     memcpy(tmp, dir, dl); n += dl;
@@ -105,10 +104,11 @@ static int fsp_path_join(char *out, size_t cap, const char *dir, const char *nam
 
 /* parent: 去掉最后一个路径分量（含文件或目录均适用） */
 static int fsp_path_parent(const char *path, char *out, size_t cap) {
-    if (!path || !out || cap == 0) { errno = EINVAL; return -1; }
+    if (!path || !out || cap == 0) return -EINVAL;
 
     char norm[4096];
-    if (fsp_path_normalize(path, norm, sizeof(norm)) != 0) return -1;
+    int rc = fsp_path_normalize(path, norm, sizeof(norm));
+    if (rc != 0) return rc;
 
     size_t len = strlen(norm);
     /* 去掉末尾的 '/'（根目录除外） */
@@ -116,10 +116,10 @@ static int fsp_path_parent(const char *path, char *out, size_t cap) {
 
     /* 去掉最后一个分量 */
     char *slash = strrchr(norm, '/');
-    if (!slash) { errno = EINVAL; return -1; }
+    if (!slash) return -EINVAL;
 
     if (slash == norm) {            /* 根目录 */
-        if (cap < 2) { errno = ENAMETOOLONG; return -1; }
+        if (cap < 2) return -ENAMETOOLONG;
         snprintf(out, cap, "%s", "/");
         return 0;
     }
@@ -134,7 +134,7 @@ static int fsp_path_parent(const char *path, char *out, size_t cap) {
 
 /* 绝对化：非绝对路径补 cwd 前缀并规范化（目标无需存在） */
 static int fsp_path_absolute(const char *path, char *out, size_t cap) {
-    if (!path || !out || cap == 0) { errno = EINVAL; return -1; }
+    if (!path || !out || cap == 0) return -EINVAL;
     if (path[0] == '/') return fsp_path_normalize(path, out, cap);
     return fsp_path_normalize(path, out, cap);   /* normalize 已含相对->绝对逻辑 */
 }

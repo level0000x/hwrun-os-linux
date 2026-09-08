@@ -112,13 +112,13 @@ int loader_run_impl(const char *path, char **argv, int wait, int *exit_code) {
             return -ENOEXEC;
         if (loader_is_library(&info)) {
             /* 共享库：应由 load 用 dlopen 驻留，run 不负责执行 */
-            return -HWRUN_ENOTSUP;
+            return HWRUN_ENOTSUP;
         }
         return run_exec(path, argv, wait, exit_code);
 
     default:
         /* PE / Mach-O / WASM / APK：本阶段不做伪执行 */
-        return -HWRUN_ENOTSUP;
+        return HWRUN_ENOTSUP;
     }
 }
 

@@ -20,6 +20,7 @@ int hw_bus_init(hw_bus_t *bus, const char *state_dir, const char *scan_path,
                 int level) {
     if (!bus) return HWRUN_EINVAL;
     memset(bus, 0, sizeof(*bus));
+    hw_locker_init(&bus->plugins_lock, HWLOCK_RW);
 
     if (state_dir) snprintf(bus->state_dir, sizeof(bus->state_dir), "%s", state_dir);
     else           snprintf(bus->state_dir, sizeof(bus->state_dir), "/var/lib/hwrun");
@@ -46,19 +47,36 @@ int hw_bus_init(hw_bus_t *bus, const char *state_dir, const char *scan_path,
     hw_metaproto_register(&bus->meta, HWPROTO_LOG, "1.0", "bus", NULL);
     hw_metaproto_register(&bus->meta, HWPROTO_GIT, "1.0", "bus", NULL);
 
+    /* 绑定总线单例，供运行时注入转发 LOG/PARAM */
+    hw_runtime_bus_bind(bus);
+
     bus->running = 1;
     return HWRUN_OK;
 }
 
 void hw_bus_shutdown(hw_bus_t *bus) {
     if (!bus || !bus->initialized) return;
-    /* 逆序停止所有插件 */
-    for (hw_plugin_t *p = bus->plugins; p; p = p->next) {
-        if (p->state == HWPLUGIN_STARTED) hw_plugin_stop(bus, p);
+    /* 逆序停止并释放所有插件节点（含 meta 与 .so 句柄）。
+     * WRLOCK 只用于摘除整条链表（结构写），随后出锁再逐个 unload：
+     * unload 会调用插件回调与 dlclose，属外部调用，不得持 plugins_lock。 */
+    hw_plugin_t *list = NULL;
+    HW_WRLOCK_GUARD(&bus->plugins_lock) {
+        list = bus->plugins;
+        bus->plugins = NULL;
+    }
+    hw_plugin_t *p = list;
+    while (p) {
+        hw_plugin_t *n = p->next;
+        if (p->state == HWPLUGIN_STARTED || p->state == HWPLUGIN_LOADED)
+            hw_plugin_unload(bus, p);   /* stop + destroy + dlclose */
+        hw_plugin_free_meta(p);
+        free(p);
+        p = n;
     }
     hw_metaproto_shutdown(&bus->meta);
     hw_param_shutdown(&bus->params);
     hw_log_shutdown(&bus->log);
+    hw_locker_destroy(&bus->plugins_lock);
     bus->initialized = 0;
     bus->running = 0;
 }
@@ -72,14 +90,22 @@ static int check_add_path(hw_bus_t *bus, const char *path) {
 }
 
 hw_plugin_t *hw_bus_find(hw_bus_t *bus, const char *id) {
-    for (hw_plugin_t *p = bus->plugins; p; p = p->next)
-        if (hw_str_eq(p->id, id)) return p;
-    return NULL;
+    if (!bus || !id) return NULL;
+    hw_plugin_t *ret = NULL;
+    HW_RDLOCK_GUARD(&bus->plugins_lock) {
+        for (hw_plugin_t *p = bus->plugins; p; p = p->next)
+            if (hw_str_eq(p->id, id)) { ret = p; break; }
+    }
+    /* 借用指针：调用方自行保证与链表增删（scan/insert）不并发竞争 */
+    return ret;
 }
 
 int hw_bus_plugin_count(hw_bus_t *bus) {
+    if (!bus) return 0;
     int n = 0;
-    for (hw_plugin_t *p = bus->plugins; p; p = p->next) n++;
+    HW_RDLOCK_GUARD(&bus->plugins_lock) {
+        for (hw_plugin_t *p = bus->plugins; p; p = p->next) n++;
+    }
     return n;
 }
 
@@ -145,31 +171,61 @@ static int scan_dir_rec(hw_bus_t *bus, const char *base, const char *sub) {
     snprintf(p->pre_uninstall, sizeof(p->pre_uninstall), "%s", disc.pre_uninstall);
     snprintf(p->post_uninstall, sizeof(p->post_uninstall), "%s", disc.post_uninstall);
     p->size = disc.size;
-    p->provides = copy_str_arr(disc.provides, disc.provides_count);
-    p->provides_count = disc.provides_count;
-    p->requires = copy_str_arr(disc.requires, disc.requires_count);
-    p->requires_count = disc.requires_count;
-    p->conflicts = copy_str_arr(disc.conflicts, disc.conflicts_count);
+
+    /* p 的元数据：从 disc 深拷贝出独立堆数组（含绝对路径化前的相对值），
+     * 之后清空 disc 内部字符串，杜绝成功路径的 strdup 泄漏。 */
+    p->provides       = copy_str_arr(disc.provides, disc.provides_count);
+    p->requires       = copy_str_arr(disc.requires, disc.requires_count);
+    p->conflicts      = copy_str_arr(disc.conflicts, disc.conflicts_count);
+    p->files          = copy_str_arr(disc.files, disc.files_count);
+    p->provides_count  = disc.provides_count;
+    p->requires_count  = disc.requires_count;
     p->conflicts_count = disc.conflicts_count;
-    p->files = copy_str_arr(disc.files, disc.files_count);
-    p->files_count = disc.files_count;
+    p->files_count     = disc.files_count;
+    hw_plugin_discovery_clear(&disc);   /* 释放 disc 内部 strdup（d 在栈上，不 free） */
 
     /* 修正文件路径为绝对路径（相对于插件目录） */
     for (int i = 0; i < p->files_count; i++) {
-        char full[512];
+        if (!p->files[i]) continue;
         if (p->files[i][0] == '/') continue;   /* 已是绝对路径 */
-        hw_fmt_path(full, sizeof(full), plug_dir, p->files[i]);
+        char full[512];
+        int prc = hw_fmt_path(full, sizeof(full), plug_dir, p->files[i]);
+        if (prc != HWRUN_OK) {
+            /* 路径过长被截断会生成错误路径，宁可不登记该文件 */
+            HWLOG_WARNF(&bus->log, "bus",
+                        "discover %s: file path too long, skip: %s/%s",
+                        p->id, plug_dir, p->files[i]);
+            free(p->files[i]);
+            p->files[i] = NULL;
+            continue;
+        }
         free(p->files[i]);
         p->files[i] = hw_strdup(full);
     }
 
-    p->next = bus->plugins;
-    if (bus->plugins) bus->plugins->prev = p;
-    bus->plugins = p;
+    /* 链表结构写（头插）加 WRLOCK；查重经 hw_bus_find 的 RDLOCK 已先行退出，
+     * 两个 guard 各自独立、不嵌套 */
+    HW_WRLOCK_GUARD(&bus->plugins_lock) {
+        p->next = bus->plugins;
+        if (bus->plugins) bus->plugins->prev = p;
+        bus->plugins = p;
+    }
 
     HWLOG_INFOF(&bus->log, "bus", "discovered plugin: %s v%s (%s)",
                 p->id, p->version, hw_type_to_str(p->type));
     return HWRUN_OK;
+}
+
+/* 释放插件节点的动态元数据（scan_dir_rec 转移来的 4 组数组） */
+void hw_plugin_free_meta(hw_plugin_t *p) {
+    if (!p) return;
+    hw_str_list_free((char **)p->provides, p->provides_count);
+    hw_str_list_free((char **)p->requires, p->requires_count);
+    hw_str_list_free((char **)p->conflicts, p->conflicts_count);
+    hw_str_list_free((char **)p->files, p->files_count);
+    p->provides = p->requires = p->conflicts = p->files = NULL;
+    p->provides_count = p->requires_count = 0;
+    p->conflicts_count = p->files_count = 0;
 }
 
 int hw_bus_scan(hw_bus_t *bus) {

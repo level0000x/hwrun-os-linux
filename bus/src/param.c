@@ -17,8 +17,9 @@ static int hw_param_tree_save(const hw_param_t *p, const char *prefix,
 int hw_param_init(hw_param_context_t *ctx, const char *root_dir) {
     if (!ctx) return HWRUN_EINVAL;
     memset(ctx, 0, sizeof(*ctx));
+    hw_locker_init(&ctx->lock, HWLOCK_RW);
     ctx->root = calloc(1, sizeof(hw_param_t));
-    if (!ctx->root) return HWRUN_ENOMEM;
+    if (!ctx->root) { hw_locker_destroy(&ctx->lock); return HWRUN_ENOMEM; }
     snprintf(ctx->root->key, sizeof(ctx->root->key), ".");
     ctx->root->type = HWPARAM_TYPE_STRING;
     ctx->initialized = 1;
@@ -49,27 +50,42 @@ void hw_param_shutdown(hw_param_context_t *ctx) {
     hw_param_tree_free(ctx->root);
     ctx->root = NULL;
     ctx->initialized = 0;
+    hw_locker_destroy(&ctx->lock);
 }
 
 const char *hw_param_get(hw_param_context_t *ctx, const char *key) {
     if (!ctx || !ctx->root || !key) return NULL;
-    hw_param_t *p = hw_param_find(ctx->root, key);
-    if (!p || !p->value[0]) return NULL;
-    return p->value;
+    const char *ret = NULL;
+    HW_RDLOCK_GUARD(&ctx->lock) {
+        hw_param_t *p = hw_param_find(ctx->root, key);
+        if (p && p->value[0]) ret = p->value;
+    }
+    /* 借用指针：调用方须自行保证不与 hw_param_set_value 并发改写同一 key */
+    return ret;
 }
 
 int hw_param_get_int(hw_param_context_t *ctx, const char *key, int def) {
-    const char *v = hw_param_get(ctx, key);
-    if (!v) return def;
-    return (int)strtol(v, NULL, 10);
+    if (!ctx || !ctx->root || !key) return def;
+    char buf[256] = "";
+    HW_RDLOCK_GUARD(&ctx->lock) {
+        hw_param_t *p = hw_param_find(ctx->root, key);
+        if (p && p->value[0]) snprintf(buf, sizeof(buf), "%s", p->value);
+    }
+    if (!buf[0]) return def;
+    return (int)strtol(buf, NULL, 10);
 }
 
 bool hw_param_get_bool(hw_param_context_t *ctx, const char *key, bool def) {
-    const char *v = hw_param_get(ctx, key);
-    if (!v) return def;
-    if (hw_str_eq(v, "true") || hw_str_eq(v, "1") || hw_str_eq(v, "yes"))
+    if (!ctx || !ctx->root || !key) return def;
+    char buf[256] = "";
+    HW_RDLOCK_GUARD(&ctx->lock) {
+        hw_param_t *p = hw_param_find(ctx->root, key);
+        if (p && p->value[0]) snprintf(buf, sizeof(buf), "%s", p->value);
+    }
+    if (!buf[0]) return def;
+    if (hw_str_eq(buf, "true") || hw_str_eq(buf, "1") || hw_str_eq(buf, "yes"))
         return true;
-    if (hw_str_eq(v, "false") || hw_str_eq(v, "0") || hw_str_eq(v, "no"))
+    if (hw_str_eq(buf, "false") || hw_str_eq(buf, "0") || hw_str_eq(buf, "no"))
         return false;
     return def;
 }
@@ -77,10 +93,20 @@ bool hw_param_get_bool(hw_param_context_t *ctx, const char *key, bool def) {
 int hw_param_set_value(hw_param_context_t *ctx, const char *key,
                        const char *value, int type, const char *desc) {
     if (!ctx || !ctx->root) return HWRUN_EINVAL;
-    const char *old = hw_param_get(ctx, key);
-    int rc = hw_param_set(ctx->root, key, value, type, desc);
+    int rc = HWRUN_OK;
+    /* 锁内完成「读旧值 + 改树」，保证临界区原子；notify 移到出锁后 */
+    char old_copy[256] = "";
+    int has_old = 0;
+    HW_WRLOCK_GUARD(&ctx->lock) {
+        hw_param_t *p = hw_param_find(ctx->root, key);
+        if (p && p->value[0]) {
+            snprintf(old_copy, sizeof(old_copy), "%s", p->value);
+            has_old = 1;
+        }
+        rc = hw_param_set(ctx->root, key, value, type, desc);
+    }
     if (rc == HWRUN_OK) {
-        hw_param_notify(ctx, key, old, value);
+        hw_param_notify(ctx, key, has_old ? old_copy : NULL, value);
         hw_param_mark_revision(ctx, NULL);
     }
     return rc;
@@ -91,23 +117,44 @@ int hw_param_watch(hw_param_context_t *ctx, const char *plugin_id,
                    int (*cb)(const char*,const char*,const char*,void*),
                    void *userdata) {
     if (!ctx || !plugin_id || !cb) return HWRUN_EINVAL;
-    hw_param_watcher_t *w = calloc(1, sizeof(*w));
-    if (!w) return HWRUN_ENOMEM;
-    snprintf(w->plugin_id, sizeof(w->plugin_id), "%s", plugin_id);
-    if (pattern) snprintf(w->pattern, sizeof(w->pattern), "%s", pattern);
-    w->on_change = cb;
-    w->userdata = userdata;
-    w->next = ctx->watchers;
-    ctx->watchers = w;
-    return HWRUN_OK;
+    int rc = HWRUN_OK;
+    HW_WRLOCK_GUARD(&ctx->lock) {
+        hw_param_watcher_t *w = calloc(1, sizeof(*w));
+        if (!w) {
+            rc = HWRUN_ENOMEM;
+        } else {
+            snprintf(w->plugin_id, sizeof(w->plugin_id), "%s", plugin_id);
+            if (pattern) snprintf(w->pattern, sizeof(w->pattern), "%s", pattern);
+            w->on_change = cb;
+            w->userdata = userdata;
+            w->next = ctx->watchers;
+            ctx->watchers = w;
+        }
+    }
+    return rc;
 }
 
 void hw_param_notify(hw_param_context_t *ctx, const char *key,
                      const char *old_v, const char *new_v) {
     if (!ctx || !key) return;
-    for (hw_param_watcher_t *w = ctx->watchers; w; w = w->next) {
-        if (w->pattern[0] && fnmatch(w->pattern, key, 0) != 0) continue;
-        if (w->on_change) w->on_change(key, old_v, new_v, w->userdata);
+    /* 锁内快照匹配 watcher（cb+userdata；watcher 可能被并发释放），
+     * 出锁后逐个派发 —— 持锁期间绝不调用 watcher 回调。
+     * 快照上限 64：超限静默截断（watcher 数百的场景不存在）。 */
+    typedef int (*watch_cb_t)(const char *, const char *, const char *, void *);
+    struct { watch_cb_t cb; void *ud; } snaps[64];
+    int n = 0;
+    HW_RDLOCK_GUARD(&ctx->lock) {
+        for (hw_param_watcher_t *w = ctx->watchers; w; w = w->next) {
+            if (w->pattern[0] && fnmatch(w->pattern, key, 0) != 0) continue;
+            if (n < (int)(sizeof(snaps) / sizeof(snaps[0]))) {
+                snaps[n].cb = w->on_change;
+                snaps[n].ud = w->userdata;
+                n++;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (snaps[i].cb) snaps[i].cb(key, old_v, new_v, snaps[i].ud);
     }
 }
 

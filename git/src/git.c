@@ -15,6 +15,7 @@
 #include <sys/types.h>
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 #include "git.h"
 #include "git_internal.h"
 
@@ -118,6 +119,7 @@ static int git_plugin_init(hw_plugin_t *self) {
     git_audit_write(&git_g_ctx, "system", "init", git_g_ctx.repo_path,
                     "GIT 插件初始化", 1);
     git_g_ctx.initialized = 1;
+    HWAPI_LOGI("git", "init: repo=%s", git_g_ctx.repo_path);
     return HWRUN_OK;
 }
 
@@ -155,7 +157,7 @@ static git_config_t *git_ops_get_config(void) {
 }
 
 /* ============================================================
-   插件静态描述符
+   插件生命周期回调表（hw_plugin_ops_t，SDK 宏将其拷贝进描述符）
    ============================================================ */
 static hw_plugin_ops_t g_ops_desc = {
     .init          = git_plugin_init,
@@ -166,33 +168,17 @@ static hw_plugin_ops_t g_ops_desc = {
     .get_interface = git_plugin_get_interface,
 };
 
-static hw_plugin_t g_plugin;
-
 /* ============================================================
-   导出入口：每个插件 .so 必须实现
+   运行时注入绑定点 + 插件描述符（统一由 hwrun_plugin.h 宏生成）
    ============================================================ */
-hw_plugin_t *hw_plugin_entry(void) {
-    if (g_plugin.id[0] == '\0') {
-        memset(&g_plugin, 0, sizeof(g_plugin));
-        snprintf(g_plugin.id,          sizeof(g_plugin.id),          "%s", "git");
-        snprintf(g_plugin.name,        sizeof(g_plugin.name),        "%s", "Git 版本控制");
-        snprintf(g_plugin.version,     sizeof(g_plugin.version),     "%s", "1.0.0");
-        snprintf(g_plugin.description, sizeof(g_plugin.description), "%s",
-                 "系统 Git 命令的封装层 + 审计日志 + 自动历史管理");
-        g_plugin.type  = HWPLUGIN_TYPE_GIT;
-        g_plugin.state = HWPLUGIN_INSTALLED;
+HWRUN_PLUGIN_BIND()
 
-        /* 提供的协议 */
-        static char *provides[] = { "GIT", NULL };
-        g_plugin.provides      = provides;
-        g_plugin.provides_count = 1;
+/* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
+static const char *const g_provides[] = { GIT_PROTO, NULL };
+static const char *const g_requires[] = {
+    HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO, NULL,
+};
 
-        /* 依赖的协议 */
-        static char *requires[] = { "LOG", "PARAM", "METAPROTO", NULL };
-        g_plugin.requires      = requires;
-        g_plugin.requires_count = 3;
-
-        g_plugin.ops = g_ops_desc;
-    }
-    return &g_plugin;
-}
+HWRUN_PLUGIN_DEFINE("git", "Git 版本控制", "1.0.0", HWPLUGIN_TYPE_GIT,
+                    "系统 Git 命令的封装层 + 审计日志 + 自动历史管理",
+                    &g_ops_desc, g_provides, g_requires)

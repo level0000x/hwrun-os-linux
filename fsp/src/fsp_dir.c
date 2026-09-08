@@ -20,18 +20,18 @@ static int fsp_rmdir(const char *path) {
     return rmdir(path);
 }
 
-/* 存在性检查：返回 1=存在 0=不存在 -1=错误(并置 errno) */
+/* 存在性检查：返回 1=存在 0=不存在，负 errno=错误 */
 static int fsp_exists(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) return 1;
     if (errno == ENOENT || errno == ENOTDIR) return 0;
-    return -1;
+    return -errno;
 }
 
-/* 列出目录项，跳过 . 和 ..，返回实际条目数；失败返回 -1 */
+/* 列出目录项，跳过 . 和 ..，返回实际条目数；失败返回负 errno */
 static int fsp_list(const char *path, fsp_dirent_t *entries, int max) {
     DIR *d = opendir(path);
-    if (!d) return -1;
+    if (!d) return -errno;
 
     int n = 0;
     struct dirent *e;

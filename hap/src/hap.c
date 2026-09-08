@@ -8,6 +8,7 @@
  */
 
 #include "hwrun.h"
+#include "hwrun_plugin.h"
 
 #include <dlfcn.h>
 
@@ -38,6 +39,8 @@ static int hap_init(hw_plugin_t *self) {
     if (!pd) return HWRUN_ENOMEM;
     pd->started = 0;
     self->private_data = pd;
+    HWAPI_LOGI("hap", "init: probe_sample=%d",
+               HWAPI_PARAM_GET_INT("hap.probe_sample", 1));
     return HWRUN_OK;
 }
 
@@ -50,6 +53,9 @@ static int hap_start(hw_plugin_t *self) {
     /* 探测一次 CPU，作为启动自检并预热缓存（失败不影响启动） */
     memset(&cpu, 0, sizeof(cpu));
     hap_cpu_probe(&cpu);
+
+    HWAPI_LOGI("hap", "start: git=%s",
+               (HWAPI_R() && HWAPI_R()->git) ? "ready" : "n/a");
 
     pd->started = 1;
     self->state = HWPLUGIN_STARTED;
@@ -84,47 +90,28 @@ static void *hap_get_interface(const char *protocol) {
     return NULL;
 }
 
-static hw_plugin_t g_hap_plugin;
+/* 生命周期回调表（SDK 宏将其拷贝进描述符 g_hwplugin.ops） */
+static hw_plugin_ops_t hap_ops = {
+    .init          = hap_init,
+    .start         = hap_start,
+    .stop          = hap_stop,
+    .destroy       = hap_destroy,
+    .configure     = hap_configure,
+    .get_interface = hap_get_interface,
+};
 
 /* ============================================================
- * 插件入口：dlopen 加载时调用，返回 hw_plugin_t*
+ * 运行时注入绑定点 + 插件描述符（统一由 hwrun_plugin.h 宏生成）
  * ============================================================ */
-__attribute__((visibility("default")))
-hw_plugin_t *hw_plugin_entry(void) {
-    memset(&g_hap_plugin, 0, sizeof(g_hap_plugin));
+HWRUN_PLUGIN_BIND()
 
-    /* 基础元数据（与 plugin.yml 保持一致） */
-    strncpy(g_hap_plugin.id, "hap", sizeof(g_hap_plugin.id) - 1);
-    strncpy(g_hap_plugin.name, "Hardware Abstraction Protocol",
-            sizeof(g_hap_plugin.name) - 1);
-    strncpy(g_hap_plugin.version, "1.0.0", sizeof(g_hap_plugin.version) - 1);
-    g_hap_plugin.type = HWPLUGIN_TYPE_KERNEL;
-    g_hap_plugin.state = HWPLUGIN_INSTALLED;
-    strncpy(g_hap_plugin.description,
-            "HWRun OS 硬件抽象协议，提供对 CPU、内存、磁盘、网络、系统信息的统一访问",
-            sizeof(g_hap_plugin.description) - 1);
+/* 协议与依赖声明（plugin.yml 是对外的权威描述；.so 内自持一份） */
+static const char *const g_provides[] = { HWPROTO_HAP, NULL };
+static const char *const g_requires[] = {
+    HWPROTO_LOG, HWPROTO_PARAM, HWPROTO_METAPROTO, NULL,
+};
 
-    /* 提供的协议 */
-    static char *hap_provides[] = {
-        "HAP",
-    };
-    g_hap_plugin.provides = hap_provides;
-    g_hap_plugin.provides_count = 1;
-
-    /* 依赖的协议（仅声明，真正校验由总线 && METAPROTO 完成） */
-    static char *hap_requires[] = {
-        "LOG", "PARAM", "METAPROTO",
-    };
-    g_hap_plugin.requires = hap_requires;
-    g_hap_plugin.requires_count = 3;
-
-    /* 生命周期 */
-    g_hap_plugin.ops.init         = hap_init;
-    g_hap_plugin.ops.start        = hap_start;
-    g_hap_plugin.ops.stop         = hap_stop;
-    g_hap_plugin.ops.destroy      = hap_destroy;
-    g_hap_plugin.ops.configure    = hap_configure;
-    g_hap_plugin.ops.get_interface = hap_get_interface;
-
-    return &g_hap_plugin;
-}
+HWRUN_PLUGIN_DEFINE("hap", "Hardware Abstraction Protocol", "1.0.0",
+                    HWPLUGIN_TYPE_KERNEL,
+                    "HWRun OS 硬件抽象协议，提供对 CPU、内存、磁盘、网络、系统信息的统一访问",
+                    &hap_ops, g_provides, g_requires)
