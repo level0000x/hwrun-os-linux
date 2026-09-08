@@ -25,6 +25,7 @@ BUS_SRCS := bus/src/hwrun.c \
             bus/src/metaproto.c \
             bus/src/param.c \
             bus/src/log.c \
+            bus/src/hwlock.c \
             bus/src/yml.c \
             bus/src/runtime.c \
             bus/src/loader.c \

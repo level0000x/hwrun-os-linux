@@ -61,9 +61,9 @@ static void *g_h = NULL;        /* dlopen 句柄            */
 static hw_plugin_t *g_p = NULL; /* .so 静态描述符，不 free */
 static hw_git_ops_t *g_ops = NULL;
 
-static char g_base[256]; /* /tmp/hwtest_git_<pid> */
-static char g_repo[256]; /* <base>/repo            */
-static char g_audit[256];/* <base>/audit           */
+static char g_base[256];  /* /tmp/hwtest_git_<pid> */
+static char g_repo[256];  /* <base>/repo            */
+static char g_audit[256]; /* <base>/audit           */
 
 /* ---- 临时目录工具 ---- */
 
@@ -128,7 +128,7 @@ static int group_setup(void **state) {
         return 0;
     }
 
-    hw_plugin_t *(*entry)(void) = (hw_plugin_t *(*)(void))dlsym(g_h, "hw_plugin_entry");
+    hw_plugin_t *(*entry)(void) = (hw_plugin_t * (*)(void)) dlsym(g_h, "hw_plugin_entry");
     if (!entry) {
         printf("  [skip] %s: 无 hw_plugin_entry\n", so);
         dlclose(g_h);
@@ -147,8 +147,8 @@ static int group_setup(void **state) {
 
     for (int i = 0; i < self->provides_count; i++) {
         void *impl = self->ops.get_interface ? self->ops.get_interface(self->provides[i]) : NULL;
-        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION,
-                              self->id, impl ? impl : (void *)self);
+        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION, self->id,
+                              impl ? impl : (void *)self);
     }
     if (self->ops.start) self->ops.start(self);
     self->state = HWPLUGIN_STARTED;
@@ -226,8 +226,8 @@ static void test_git_workflow(void **state) {
             printf("  [skip] git config user.name 失败\n");
             return;
         }
-        snprintf(cmd, sizeof(cmd),
-                 "git -C \"%s\" config user.email 'hwrun-test@localhost'", g_repo);
+        snprintf(cmd, sizeof(cmd), "git -C \"%s\" config user.email 'hwrun-test@localhost'",
+                 g_repo);
         if (system(cmd) != 0) {
             printf("  [skip] git config user.email 失败\n");
             return;

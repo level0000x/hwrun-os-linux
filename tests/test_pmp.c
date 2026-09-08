@@ -59,7 +59,7 @@ static int group_setup(void **state) {
         return 0;
     }
 
-    hw_plugin_t *(*entry)(void) = (hw_plugin_t *(*)(void))dlsym(g_h, "hw_plugin_entry");
+    hw_plugin_t *(*entry)(void) = (hw_plugin_t * (*)(void)) dlsym(g_h, "hw_plugin_entry");
     if (!entry) {
         printf("  [skip] %s: 无 hw_plugin_entry\n", so);
         dlclose(g_h);
@@ -78,8 +78,8 @@ static int group_setup(void **state) {
 
     for (int i = 0; i < self->provides_count; i++) {
         void *impl = self->ops.get_interface ? self->ops.get_interface(self->provides[i]) : NULL;
-        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION,
-                              self->id, impl ? impl : (void *)self);
+        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION, self->id,
+                              impl ? impl : (void *)self);
     }
     if (self->ops.start) self->ops.start(self);
     self->state = HWPLUGIN_STARTED;
@@ -136,8 +136,7 @@ static void test_pmp_current_process(void **state) {
     assert_int_equal((int)info.pid, pid);
     assert_int_equal((int)info.tgid, pid);
     assert_true(info.comm[0] != '\0');
-    printf("  [info] comm='%s' state=%d ppid=%u\n", info.comm, (int)info.state,
-           info.ppid);
+    printf("  [info] comm='%s' state=%d ppid=%u\n", info.comm, (int)info.state, info.ppid);
 }
 
 /* 进程列表：Linux /proc 可枚举时返回 > 0 项，随后必须 free */
@@ -176,8 +175,7 @@ static void test_pmp_sched_get(void **state) {
         printf("  [info] sched_get 受权限/平台限制(rc=%d)，宽松通过\n", rc);
         return;
     }
-    printf("  [info] sched: policy=%d priority=%d nice=%d\n", (int)policy, (int)priority,
-           nice);
+    printf("  [info] sched: policy=%d priority=%d nice=%d\n", (int)policy, (int)priority, nice);
 }
 
 int main(void) {

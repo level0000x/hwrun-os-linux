@@ -79,7 +79,9 @@ jobs:
   # ---------------------------------------------------------------
   static:
     name: Format check (clang-format)
-    runs-on: ubuntu-latest
+    # 固定 ubuntu-22.04：其 apt clang-format=14 与本地开发(22.04)一致，
+    # 避免 ubuntu-latest(24.04, clang-format 18) 格式化漂移导致误报。
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 

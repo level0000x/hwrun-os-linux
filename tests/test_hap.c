@@ -63,7 +63,7 @@ static int group_setup(void **state) {
         return 0; /* .so 未构建/平台不支持 → 各用例打印跳过 */
     }
 
-    hw_plugin_t *(*entry)(void) = (hw_plugin_t *(*)(void))dlsym(g_h, "hw_plugin_entry");
+    hw_plugin_t *(*entry)(void) = (hw_plugin_t * (*)(void)) dlsym(g_h, "hw_plugin_entry");
     if (!entry) {
         printf("  [skip] %s: 无 hw_plugin_entry\n", so);
         dlclose(g_h);
@@ -84,8 +84,8 @@ static int group_setup(void **state) {
     /* 注册 provides（implementation 来自 get_interface） */
     for (int i = 0; i < self->provides_count; i++) {
         void *impl = self->ops.get_interface ? self->ops.get_interface(self->provides[i]) : NULL;
-        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION,
-                              self->id, impl ? impl : (void *)self);
+        hw_metaproto_register(&g_bus.meta, self->provides[i], HWRUN_PROTOCOL_VERSION, self->id,
+                              impl ? impl : (void *)self);
     }
     if (self->ops.start) self->ops.start(self);
     self->state = HWPLUGIN_STARTED;
@@ -153,8 +153,7 @@ static void test_hap_memory_info(void **state) {
     memset(&mem, 0, sizeof(mem));
     assert_int_equal(g_ops->get_memory_info(&mem), HWRUN_OK);
 
-    if (mem.total_kb == 0 && mem.available_kb == 0 && mem.free_kb == 0 &&
-        mem.swap_total_kb == 0) {
+    if (mem.total_kb == 0 && mem.available_kb == 0 && mem.free_kb == 0 && mem.swap_total_kb == 0) {
         printf("  [info] 内存信息完全降级（无 /proc/meminfo），跳过字段断言\n");
         return;
     }
@@ -174,8 +173,8 @@ static void test_hap_system_info(void **state) {
     memset(&sys, 0, sizeof(sys));
     assert_int_equal(g_ops->get_system_info(&sys), HWRUN_OK);
 
-    if (sys.hostname[0] == '\0' && sys.kernel_release[0] == '\0' &&
-        sys.os_name[0] == '\0' && sys.uptime_seconds == 0) {
+    if (sys.hostname[0] == '\0' && sys.kernel_release[0] == '\0' && sys.os_name[0] == '\0' &&
+        sys.uptime_seconds == 0) {
         printf("  [info] 系统信息完全降级，跳过字段断言\n");
         return;
     }

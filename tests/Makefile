@@ -14,6 +14,7 @@ BUS_OBJS := ../bus/src/hwrun.o \
             ../bus/src/metaproto.o \
             ../bus/src/param.o \
             ../bus/src/log.o \
+            ../bus/src/hwlock.o \
             ../bus/src/yml.o \
             ../bus/src/runtime.o \
             ../bus/src/loader.o \
