@@ -62,8 +62,6 @@ static hw_plugin_t *load_plugin(hw_bus_t *bus, const char *so_path) {
     /* start（大部分插件在 start 做自检/预热） */
     if (self->ops.start) self->ops.start(self);
     self->state = HWPLUGIN_STARTED;
-    /* 句柄记入 plugin，测试结束统一 dlclose */
-    self->handle = h;
     /* 挂到总线插件链表头部，便于统一清理 */
     self->next = bus->plugins; if (bus->plugins) bus->plugins->prev = self;
     bus->plugins = self;
@@ -114,6 +112,9 @@ int main(void) {
         CHECK(p != NULL, "插件 .so 加载成功");
         if (p) {
             CHECK(p->state == HWPLUGIN_STARTED, "插件已启动");
+            /* 运行时注入机制就绪：插件提供了 runtime_bind 绑定点，
+             * load_plugin 已在 init 前经此字段注入 LOG/PARAM 回调 */
+            CHECK(p->runtime_bind != NULL, "插件已提供运行时绑定点");
             for (int j = 0; j < p->provides_count; j++) {
                 char buf[96];
                 snprintf(buf, sizeof(buf), "协议 %s 已注册可解析", p->provides[j]);

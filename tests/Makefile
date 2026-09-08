@@ -6,7 +6,7 @@ CC       ?= gcc
 CFLAGS   ?= -O2 -Wall -Wextra -std=gnu11
 CPPFLAGS += -I../include -I../bus/src \
             -I../hap/include -I../pmp/include -I../fsp/include \
-            -I../np/include -I../loader/include
+            -I../np/include -I../loader/include -I../git/include
 LDFLAGS  +=
 LDLIBS   += -ldl -lpthread
 
@@ -15,6 +15,7 @@ BUS_OBJS := ../bus/src/hwrun.o \
             ../bus/src/param.o \
             ../bus/src/log.o \
             ../bus/src/yml.o \
+            ../bus/src/runtime.o \
             ../bus/src/loader.o \
             ../bus/src/kctl.o \
             ../bus/src/bus.o

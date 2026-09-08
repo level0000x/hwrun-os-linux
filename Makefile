@@ -12,7 +12,7 @@
 
 CC     ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -fPIC -std=gnu11
-CPPFLAGS += -Iinclude -Ibus/src
+CPPFLAGS += -Iinclude -Ibus/src -Igit/include
 LDFLAGS +=
 LDLIBS  += -ldl -lpthread
 
@@ -26,6 +26,7 @@ BUS_SRCS := bus/src/hwrun.c \
             bus/src/param.c \
             bus/src/log.c \
             bus/src/yml.c \
+            bus/src/runtime.c \
             bus/src/loader.c \
             bus/src/kctl.c \
             bus/src/bus.c \
