@@ -1,4 +1,4 @@
-﻿# build / deps
+# build / deps
 node_modules/
 dist/
 build/
@@ -6,6 +6,7 @@ linux-src/
 kernel/build/
 *.o
 *.ko
+hwrun-bus
 *.cmd
 *.mod
 *.mod.c
