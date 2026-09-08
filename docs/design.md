@@ -231,7 +231,8 @@ HWRun OS booted (8 plugins, 13 protocols)
   # 报告：build-cov/coverage/index.html
   ```
   基线（WSL，2026-09）：行覆盖 46.2%（1500/3245）、函数 49.8%（164/329），覆盖范围 bus/hwrun-core + 8 插件源码（测试桩代码已排除）。
-- **kernel 模块真编译**：本地 `linux-src/`（Linux 6.1.0）执行 `make -C kernel PROFILE=minimal JOBS=4 modules`，`hwrun_core.o` 编译通过——uapi desc 的 6 条 ABI `_Static_assert`（152B/各字段偏移）在真实 kbuild 下生效，产出 `hwrun_core.ko`（编译级验证；运行级 ioctl 验证仍需装入真实内核）。
+- **kernel 模块真编译**：本地 `linux-src/`（Linux 6.1.0）执行 `make -C kernel PROFILE=minimal JOBS=4 modules`，`hwrun_core.o` 编译通过——uapi desc 的 6 条 ABI `_Static_assert`（152B/各字段偏移）在真实 kbuild 下生效。
+- **kernel 模块运行级验证**：新增 `qemu` profile（minimal + `config/qemu.config`：串口/devtmpfs/misc/gzip-initramfs）与 `kernel/qemu/` 验证件。`make -C kernel PROFILE=qemu JOBS=4 kernel modules` 出 bzImage + `.ko`，`bash kernel/qemu/run_qemu.sh` 在 QEMU 引导该内核、insmod `hwrun_core.ko` 并跑静态 ioctl 探针 `hwprobe`——GET_ABI/PING/ENOTTY/REGISTER(EEXIST/EINVAL)/RESOLVE 往返/ENOENT/UNREGISTER/释放后 ENOENT 共 11 项全 PASS（`/dev/hwrun` 10:127 正常建立）。
 
 ## 7. 已知差异
 
@@ -242,7 +243,7 @@ HWRun OS booted (8 plugins, 13 protocols)
 5. 参数注入和 Git 状态管理尚未覆盖所有插件。
 6. 文档中的协议版本兼容规则还没有完全统一到所有插件。
 7. 内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接。
-8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 尚未装入真实 Linux 内核做 ioctl 运行级验证（需引导 6.1 内核）。
+8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 的 ioctl 运行级验证已在 QEMU（qemu profile）内通过（见 6.3），尚未装入物理/生产内核。
 9. ~~plugin.yml 仍有嵌套 map 与扁平纯字符串两种形态并存，单一样式收敛（统一嵌套 `plugin:` 根 + protocol/version map）~~（已收敛：8 个 yml 统一格式，解析器缩进感知修复子键覆盖问题）。
 
 ## 8. 后续实施顺序

@@ -29,6 +29,20 @@ make -C kernel PROFILE=host LINUX_SRC=/path/to/linux modules
 不可插件化的机制（启动、地址空间、调度、系统调用、ELF、initramfs、模块装载、
 基础事件原语）；`host` profile 追加 VFS、ext4/overlayfs、`/proc`、`/sys`、
 socket、namespace、cgroup、seccomp 等现有插件所需的机制。
+`qemu` profile 在 `minimal` 之上叠加 `config/qemu.config`（串口/devtmpfs/misc/
+gzip-initramfs），用于模块运行级验证。
+
+### 运行级验证（QEMU）
+
+```sh
+make -C kernel PROFILE=qemu JOBS=4 kernel modules   # bzImage + hwrun_core.ko
+bash kernel/qemu/run_qemu.sh                        # 引导 + insmod + ioctl 探针
+```
+
+依赖 WSL 侧：`qemu-system-x86`、`busybox-static`。脚本会编静态探针
+`kernel/qemu/hwprobe.c`、组装 gzip initramfs（busybox + `.ko` + 探针）、
+`-nographic` 引导并断言 `HWRUN_RUNTIME_PASS`。完整启动日志保留在
+`/tmp/hwrun-qemu-boot.log`。
 
 构建产物输出到 `kernel/build/`（不入库），模块产物留在 `modules/`（均被
 `.gitignore` 覆盖，不入库）。
