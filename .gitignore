@@ -2,6 +2,7 @@
 node_modules/
 dist/
 build/
+build-*/          # 变体构建树：build-cov(覆盖率) 等
 linux-src/
 kernel/build/
 *.o

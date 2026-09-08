@@ -220,6 +220,18 @@ HWRun OS booted (8 plugins, 13 protocols)
 - `hw_param_mark_revision` 落地为事件钩子：param 属依赖链第 1 环，不直接依赖 GIT 头；改为在 ctx 上提供可选回调 `on_revision(userdata, reason)`，由 bus（第 2 环）在 `hw_bus_init` 装配。回调 resolve GIT 协议，在 git 插件已启动且 auto_commit 开启时把参数状态文件 `add + commit("param: <reason>")`；git 就绪前静默跳过，commit 期间设重入守卫防递归。
 - `boot_chain` 启动校验补齐：`hw_plugin_start` 在 requires 检查之后新增 conflicts 检查（声明冲突的协议已被注册 → 拒绝启动、置 ERROR、返回 `HWRUN_ECONFLICT`）；`boot_chain` 末尾对 boot_order 表外的已发现插件给出"未纳入启动序，不会自动启动"告警。
 
+### 6.3 门禁收尾（0.4 E 组：格式清零 / 插件单测 / 覆盖率汇总）
+
+- **E1 格式存量清零**：8 插件目录（src/include/selftest/test）+ bus/tests 全量 `clang-format -i`（纯格式，无语义改动）；本地 dry-run 0 违规。CI static job 移除 `continue-on-error`：以 `git ls-files` 列出非 `.trae` 文件跑 `clang-format --dry-run --Werror`，排除 `kernel/`。
+- **E2 插件层单测**：hap/pmp/git/crypto 各新增 CMocka dlopen 集成单测（tests/test_{hap,pmp,git,crypto}.c），加载插件 `.so` 后经 METAPROTO 真调协议 ops；git 测试在隔离仓库覆盖 add/commit/log/status/compact，crypto 覆盖 hash/HMAC(RFC4231)/AES/RSA。tests/CMakeLists 的 `_dlopen_tests` 组与 test_proto 同构（ENABLE_EXPORTS + add_dependencies + HWRUN_PLUGIN_ROOT）。
+- **E3 lcov 覆盖率汇总**：`HWRUN_ENABLE_COVERAGE=ON` 下，插件 `.so` 与全部测试目标统一 `--coverage` 插桩（原来只插桩 hwrun-core，插件与 dlopen 测试漏插导致覆盖不全）。单命令自助目标：
+  ```sh
+  cmake -S . -B build-cov -DHWRUN_ENABLE_COVERAGE=ON
+  cmake --build build-cov --target coverage-report -j4   # 清计数→ctest→lcov→genhtml
+  # 报告：build-cov/coverage/index.html
+  ```
+  基线（WSL，2026-09）：行覆盖 46.2%（1500/3245）、函数 49.8%（164/329），覆盖范围 bus/hwrun-core + 8 插件源码（测试桩代码已排除）。
+
 ## 7. 已知差异
 
 1. TXT 文档同时描述了自研微内核和 Linux 内核两条路线，当前实现选择 Linux。

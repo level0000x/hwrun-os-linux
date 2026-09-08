@@ -121,6 +121,18 @@ else()
   set(HWRUN_PLUGIN_ROOT "")   # 非隔离：test_proto 用默认 "../" 前缀
 endif()
 
+# ---------------------------------------------------------------
+# 覆盖率：插件 .so 一并插桩（源码覆盖不只限 bus/hwrun-core）。
+# dlopen 的插件与宿主同进程，--coverage 链接已含 libgcov；捕获聚合见
+# tests/CMakeLists.txt 的 coverage-report 目标。
+# ---------------------------------------------------------------
+if(HWRUN_ENABLE_COVERAGE)
+  foreach(_p git hap pmp fsp np sp crypto loader)
+    target_compile_options(${_p} PRIVATE --coverage)
+    target_link_options(${_p} PRIVATE --coverage)
+  endforeach()
+endif()
+
 if(HWRUN_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

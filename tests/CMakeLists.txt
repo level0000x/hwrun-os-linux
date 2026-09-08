@@ -93,14 +93,43 @@ foreach(_t IN LISTS _dlopen_tests)
 endforeach()
 
 # ----------------------------------------------------------------
-# gcov 覆盖率：test_proto 与全部 CMocka 单测目标统一加 --coverage
-# （hwrun-core 的 --coverage 已在 bus/CMakeLists.txt 由同一 option 控制）
+# gcov 覆盖率：test_proto、CMocka 单测与 dlopen 集成测试统一加 --coverage
+# （hwrun-core 的 --coverage 已在 bus/CMakeLists.txt 由同一 option 控制；
+#   插件 .so 插桩在顶层 CMakeLists.txt 完成，dlopen 测试需 --coverage 拉 libgcov）
 # ----------------------------------------------------------------
 if(HWRUN_ENABLE_COVERAGE)
   target_compile_options(test_proto PRIVATE --coverage)
   target_link_options(test_proto PRIVATE --coverage)
-  foreach(_t IN LISTS _cmocka_unit_tests)
+  foreach(_t IN LISTS _cmocka_unit_tests _dlopen_tests)
     target_compile_options(${_t} PRIVATE --coverage)
     target_link_options(${_t} PRIVATE --coverage)
   endforeach()
+
+  # --------------------------------------------------------------
+  # coverage-report：清计数 -> 全量 ctest -> lcov 捕获 -> genhtml
+  # 产物：build/coverage.info 与 build/coverage/index.html（需 lcov）。
+  # --------------------------------------------------------------
+  find_program(LCOV lcov)
+  find_program(GENHTML genhtml)
+  if(LCOV AND GENHTML)
+    # 依赖全部被测目标，保证单命令自洽：
+    #   cmake --build <build> --target coverage-report
+    add_custom_target(coverage-report
+      COMMAND find ${CMAKE_BINARY_DIR} -name '*.gcda' -delete
+      COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR}
+      COMMAND ${LCOV} --capture --directory ${CMAKE_BINARY_DIR}
+              --exclude '*/usr/include/*'
+              --exclude '${CMAKE_CURRENT_SOURCE_DIR}/*'
+              --output-file ${CMAKE_BINARY_DIR}/coverage.info
+      COMMAND ${GENHTML} ${CMAKE_BINARY_DIR}/coverage.info
+              --output-directory ${CMAKE_BINARY_DIR}/coverage
+      COMMAND ${CMAKE_COMMAND} -E echo
+              "Coverage report: ${CMAKE_BINARY_DIR}/coverage/index.html"
+      COMMENT "Collect coverage (lcov + genhtml)")
+    add_dependencies(coverage-report
+      test_proto ${_cmocka_unit_tests} ${_dlopen_tests}
+      git hap pmp fsp np sp crypto loader hwrun-bus)
+  else()
+    message(WARNING "lcov/genhtml not found; coverage-report target skipped")
+  endif()
 endif()
