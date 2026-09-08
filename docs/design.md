@@ -232,7 +232,10 @@ HWRun OS booted (8 plugins, 13 protocols)
   ```
   基线（WSL，2026-09）：行覆盖 46.2%（1500/3245）、函数 49.8%（164/329），覆盖范围 bus/hwrun-core + 8 插件源码（测试桩代码已排除）。
 - **kernel 模块真编译**：本地 `linux-src/`（Linux 6.1.0）执行 `make -C kernel PROFILE=minimal JOBS=4 modules`，`hwrun_core.o` 编译通过——uapi desc 的 6 条 ABI `_Static_assert`（152B/各字段偏移）在真实 kbuild 下生效。
-- **kernel 模块运行级验证**：新增 `qemu` profile（minimal + `config/qemu.config`：串口/devtmpfs/misc/gzip-initramfs）与 `kernel/qemu/` 验证件。`make -C kernel PROFILE=qemu JOBS=4 kernel modules` 出 bzImage + `.ko`，`bash kernel/qemu/run_qemu.sh` 在 QEMU 引导该内核、insmod `hwrun_core.ko` 并跑静态 ioctl 探针 `hwprobe`——GET_ABI/PING/ENOTTY/REGISTER(EEXIST/EINVAL)/RESOLVE 往返/ENOENT/UNREGISTER/释放后 ENOENT 共 11 项全 PASS（`/dev/hwrun` 10:127 正常建立）。
+- **kernel 模块运行级验证**：新增 `qemu` profile（minimal + `config/qemu.config`：串口/devtmpfs/misc/gzip-initramfs）与 `kernel/qemu/` 验证件。`make -C kernel PROFILE=qemu JOBS=4 kernel modules` 出 bzImage + `.ko`，`bash kernel/qemu/run_qemu.sh` 在 QEMU 引导该内核、insmod `hwrun_core.ko` 并跑两层探针（`/dev/hwrun` 10:127 正常建立）：
+  - `hwprobe`（裸 ioctl）：GET_ABI/PING/ENOTTY/REGISTER(EEXIST/EINVAL)/RESOLVE 往返/ENOENT/UNREGISTER/释放后 ENOENT 共 11 项全 PASS；
+  - `hwrun_kctl_probe`（复用 BUS 侧 `bus/src/kctl.c` 客户端库真调）：open/GET_ABI/PING/REGISTER(EEXIST/EINVAL)/RESOLVE 往返/ENOENT/UNREGISTER/释放后 ENOENT/设备缺失→ENOTREADY 降级 共 11 项全 PASS——kctl 客户端与内核 uapi 的位布局/负 errno 语义在运行级对齐。
+- **CI 远端实跑修复**：legacy 根/tests Makefile 的 BUS_OBJS 补 `hwlock.c`（0.3 引入锁抽象后漏接，干净构建 hwrun-bus/test_proto 缺 `hw_locker_*` 符号）；E2 新增 dlopen 测试文件补 clang-format；static job 固定 `ubuntu-22.04`（apt clang-format=14，与本地一致，避免 v18 漂移）。远端 build/sanitize/static 三 job 全绿。
 
 ## 7. 已知差异
 
