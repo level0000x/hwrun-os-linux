@@ -33,13 +33,43 @@ int hw_proto_version_cmp(const char *a, const char *b) {
     return 0;
 }
 
-/* 兼容：版本号逐段相等（允许 have 有副版本而 req 没有） */
+/* 解析 "major[.minor[.patch]]" 各段；缺失段记为 0，返回已识别的段数 */
+static int version_segments(const char *v, long *major, long *minor, long *patch) {
+    *major = *minor = *patch = 0;
+    if (!v || !*v) return 0;
+    char *end = NULL;
+    *major = strtol(v, &end, 10);
+    if (end == v) return 0; /* 首段非数字 */
+    int n = 1;
+    if (*end == '.') {
+        *minor = strtol(end + 1, &end, 10);
+        n = 2;
+        if (*end == '.') {
+            *patch = strtol(end + 1, &end, 10);
+            n = 3;
+        }
+    }
+    return n;
+}
+
+/* 兼容：语义版本规则。主版本（major）必须相同；req 的 minor <= have 的 minor。
+ * 如 have="1.3", req="1.0" 兼容；have="1.0", req="1.3" 不兼容；
+ * have="2.0", req="1.9" 主版本不同不兼容。patch 段遵循 semver 语义，
+ * 请求方 patch 缺省视为 0，故 have="1.0.1", req="1.0" 兼容。 */
 int hw_proto_version_compat(const char *have, const char *req) {
     if (!have || !req) return 0;
-    /* 完全相等则兼容 */
-    if (strcmp(have, req) == 0) return 1;
-    /* have = "1.0", req = "1.0.1" 不兼容（主协议升版）*/
-    return 0;
+    long hma = 0, hmi = 0, hpa = 0, rma = 0, rmi = 0, rpa = 0;
+    int hn = version_segments(have, &hma, &hmi, &hpa);
+    int rn = version_segments(req, &rma, &rmi, &rpa);
+    if (hn == 0 || rn == 0) return 0; /* 任一无法解析则不兼容 */
+
+    /* 主版本必须一致（协议升主版视为破坏性变更，不兼容） */
+    if (hma != rma) return 0;
+    /* 次版本：have 必须 >= req */
+    if (hmi < rmi) return 0;
+    /* 同 minor 下 patch：have >= req */
+    if (hmi == rmi && hpa < rpa) return 0;
+    return 1;
 }
 
 int hw_metaproto_init(hw_metaproto_registry_t *reg, const char *state_dir) {

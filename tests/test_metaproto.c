@@ -198,11 +198,38 @@ static void test_check_deps(void **state) {
     hw_metaproto_shutdown(&reg);
 }
 
+/* ---- 版本兼容：语义版本规则（主版本相同，have.minor >= req.minor） ---- */
+static void test_version_compat_semver(void **state) {
+    (void)state;
+
+    /* 完全相等 */
+    assert_true(hw_proto_version_compat("1.0", "1.0"));
+    assert_true(hw_proto_version_compat("1.0.5", "1.0.5"));
+
+    /* have 次版本更高 → 兼容（向后兼容） */
+    assert_true(hw_proto_version_compat("1.3", "1.0"));
+    assert_true(hw_proto_version_compat("1.0.1", "1.0"));
+
+    /* have 次版本更低 → 不兼容 */
+    assert_false(hw_proto_version_compat("1.0", "1.3"));
+    assert_false(hw_proto_version_compat("1.0", "1.0.5"));
+
+    /* 主版本不同 → 不兼容（破坏性变更） */
+    assert_false(hw_proto_version_compat("2.0", "1.9"));
+    assert_false(hw_proto_version_compat("1.9", "2.0"));
+
+    /* 非法 / 空版本 */
+    assert_false(hw_proto_version_compat(NULL, "1.0"));
+    assert_false(hw_proto_version_compat("1.0", NULL));
+    assert_false(hw_proto_version_compat("", "1.0"));
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_register_resolve_unregister),
         cmocka_unit_test(test_subscribe_notify),
         cmocka_unit_test(test_check_deps),
+        cmocka_unit_test(test_version_compat_semver),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
