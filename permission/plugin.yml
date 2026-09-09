@@ -1,0 +1,28 @@
+# HWRun OS — PERMISSION 插件描述
+# Permission Management Protocol：用户态 RBAC（主体-角色-权限，默认拒绝）。
+# 提供角色定义/主体绑定/动作+资源判权/策略状态文件持久化（重启可恢复）。
+# 内核态 LSM/MAC/Capabilities 封装不在本用户态 .so 范围（边界见 include/permission.h）。
+plugin:
+  id: "permission"
+  name: "Permission Management Protocol"
+  version: "1.0.0"
+  type: "security"
+
+  description: "HWRun OS 权限管理协议，用户态 RBAC：角色/主体绑定/(动作,资源)判权，默认拒绝，策略落盘可恢复"
+
+  provides:
+    - protocol: "PERMISSION"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/permission.so"

@@ -1,0 +1,29 @@
+# HWRun OS — STORAGE 插件描述
+# Storage Backend Protocol：存储后端统一抽象（依据根目录《HWRun OS STORAG.txt》）。
+# 本实现落地设计稿"用户态卷管理"范畴：卷注册表/卷生命周期/df 统计(statvfs+du)/
+# 目录级快照（真实复制与恢复），卷注册表持久化到 $HWRUN_STATE/storage.state。
+# 宿主 Linux 边界：块设备/DM/LVM/RAID/精简池/配额/mkfs/mount 由宿主承担。
+plugin:
+  id: "storage"
+  name: "Storage Backend Protocol"
+  version: "1.0.0"
+  type: "storage"
+
+  description: "HWRun OS 存储后端协议，提供用户态卷管理：目录卷注册表/生命周期/统计与快照"
+
+  provides:
+    - protocol: "STORAGE"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/storage.so"

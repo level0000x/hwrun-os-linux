@@ -36,7 +36,7 @@ BUS_OBJS := $(BUS_SRCS:.c=.o)
 BUS_BIN  := hwrun-bus
 
 # ---------- 插件目录（各子代理出品）----------
-PLUGIN_DIRS := git hap pmp fsp np sp crypto loader compress
+PLUGIN_DIRS := git hap pmp fsp np sp crypto loader compress audit permission storage
 PLUGIN_SOS  := $(foreach d,$(PLUGIN_DIRS),$(d)/build/$(lastword $(subst /, ,$(d))).so)
 
 all: bus plugins

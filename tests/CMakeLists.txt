@@ -74,7 +74,7 @@ endforeach()
 # 与 test_proto 同构（需 ENABLE_EXPORTS 供插件解析宿主符号；
 # add_dependencies 保证 .so 先构建；dlopen 用相对路径故 WORKING_DIRECTORY=tests）。
 # ----------------------------------------------------------------
-set(_dlopen_tests test_hap test_pmp test_git test_crypto test_compress)
+set(_dlopen_tests test_hap test_pmp test_git test_crypto test_compress test_audit test_permission test_storage)
 foreach(_t IN LISTS _dlopen_tests)
   add_executable(${_t} ${_t}.c)
   target_link_libraries(${_t} PRIVATE
@@ -82,7 +82,7 @@ foreach(_t IN LISTS _dlopen_tests)
     hwrun_includes
     PkgConfig::CMOCKA)
   set_target_properties(${_t} PROPERTIES ENABLE_EXPORTS ON)
-  add_dependencies(${_t} hap pmp git crypto compress)
+  add_dependencies(${_t} hap pmp git crypto compress audit permission storage)
   if(HWRUN_PLUGIN_ROOT)
     target_compile_definitions(${_t} PRIVATE
       HWRUN_PLUGIN_ROOT="${HWRUN_PLUGIN_ROOT}")

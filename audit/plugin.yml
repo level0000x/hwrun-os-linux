@@ -1,0 +1,29 @@
+# HWRun OS — AUDIT 插件描述
+# Audit Protocol：用户态安全事件审计。上层子系统把"谁/何时/何动作/对象/
+# 结果/详情"经 ops.append 显式记录，持久化为只追加日志文件，支持条件查询、
+# 导出与按字节容量自动滚动（保留最新段）。
+# 与 GIT 插件内部的 git/src/audit.c（Git 操作审计查询）无关，本插件为独立协议。
+plugin:
+  id: "audit"
+  name: "Audit Protocol"
+  version: "1.0.0"
+  type: "security"
+
+  description: "HWRun OS 审计协议（用户态事件审计）：事件记录、条件查询、导出与容量滚动"
+
+  provides:
+    - protocol: "AUDIT"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/audit.so"
