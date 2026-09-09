@@ -237,6 +237,9 @@ typedef struct hw_bus_ops hw_bus_ops_t;
 #define HWPROTO_CRYPTO "CRYPTO"
 #define HWPROTO_LOADER "LOADER"
 #define HWPROTO_COMPRESS "COMPRESS"
+#define HWPROTO_TERMINAL "TERMINAL"
+#define HWPROTO_SHELL "SHELL"
+#define HWPROTO_CONSOLE "CONSOLE"
 
 /* ============================================================
  * 工具函数（由核心库 hwrun-core 提供）

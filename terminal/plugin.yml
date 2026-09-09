@@ -1,0 +1,27 @@
+# HWRun OS — TERMINAL 插件描述
+# Terminal Protocol：PTY 终端会话管理、终端控制、行规程处理、终端 I/O 的统一抽象。
+# 实现：用户态纯 POSIX（posix_openpt/grantpt/unlockpt/ptsname + termios），零内核依赖。
+plugin:
+  id: "terminal"
+  name: "Terminal Protocol"
+  version: "1.0.0"
+  type: "tools"
+
+  description: "HWRun OS 终端协议，提供 PTY 会话管理、终端控制与终端 I/O（伪终端，用户态纯 POSIX）"
+
+  provides:
+    - protocol: "TERMINAL"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/terminal.so"

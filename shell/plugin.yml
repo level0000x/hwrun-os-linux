@@ -1,0 +1,27 @@
+# HWRun OS — SHELL 插件描述
+# Shell Protocol：命令行解释器。接收用户命令并执行：内置命令、历史、别名、
+# 以及非内置行通过 fork + exec /bin/sh -c 捕获输出（用户态、零内核依赖）。
+plugin:
+  id: "shell"
+  name: "Shell Interpreter"
+  version: "1.0.0"
+  type: "tools"
+
+  description: "HWRun OS 命令行解释器 SHELL 协议，提供命令解析、内置命令、历史、别名与外部命令执行"
+
+  provides:
+    - protocol: "SHELL"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/shell.so"

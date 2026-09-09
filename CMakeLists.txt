@@ -102,6 +102,9 @@ add_subdirectory(compress)
 add_subdirectory(audit)
 add_subdirectory(permission)
 add_subdirectory(storage)
+add_subdirectory(terminal)
+add_subdirectory(shell)
+add_subdirectory(console)
 
 # ---------------------------------------------------------------
 # 插件产物目录隔离
@@ -115,7 +118,7 @@ add_subdirectory(storage)
 # ---------------------------------------------------------------
 if(HWRUN_ENABLE_SANITIZER OR HWRUN_ENABLE_COVERAGE)
   set(_hw_iso_root "${CMAKE_BINARY_DIR}/plugins")
-  foreach(_p git hap pmp fsp np sp crypto loader compress audit permission storage)
+  foreach(_p git hap pmp fsp np sp crypto loader compress audit permission storage terminal shell console)
     set_target_properties(${_p} PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY "${_hw_iso_root}/${_p}/build")
   endforeach()
@@ -131,7 +134,7 @@ endif()
 # tests/CMakeLists.txt 的 coverage-report 目标。
 # ---------------------------------------------------------------
 if(HWRUN_ENABLE_COVERAGE)
-  foreach(_p git hap pmp fsp np sp crypto loader compress audit permission storage)
+  foreach(_p git hap pmp fsp np sp crypto loader compress audit permission storage terminal shell console)
     target_compile_options(${_p} PRIVATE --coverage)
     target_link_options(${_p} PRIVATE --coverage)
   endforeach()
