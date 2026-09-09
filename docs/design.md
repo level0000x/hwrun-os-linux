@@ -237,15 +237,26 @@ HWRun OS booted (8 plugins, 13 protocols)
   - `hwrun_kctl_probe`（复用 BUS 侧 `bus/src/kctl.c` 客户端库真调）：open/GET_ABI/PING/REGISTER(EEXIST/EINVAL)/RESOLVE 往返/ENOENT/UNREGISTER/释放后 ENOENT/设备缺失→ENOTREADY 降级 共 11 项全 PASS——kctl 客户端与内核 uapi 的位布局/负 errno 语义在运行级对齐。
 - **CI 远端实跑修复**：legacy 根/tests Makefile 的 BUS_OBJS 补 `hwlock.c`（0.3 引入锁抽象后漏接，干净构建 hwrun-bus/test_proto 缺 `hw_locker_*` 符号）；E2 新增 dlopen 测试文件补 clang-format；static job 固定 `ubuntu-22.04`（apt clang-format=14，与本地一致，避免 v18 漂移）。远端 build/sanitize/static 三 job 全绿。
 
+### 6.4 P1 交互层 + P4 架构缺口（2026-09：TERMINAL/SHELL/CONSOLE + 三项桥接）
+
+- **P1 交互层三项插件落地**（子代理并行产出，独立目录）：
+  - `terminal/` — TERMINAL PTY 会话协议：`posix_openpt/grantpt/unlockpt/ptsname` 真实 spawn（fork+setsid+TIOCSCTTY+dup2 把 slave 接到 0/1/2），master 非阻塞 + `poll` 有界读写，`resize`/`status`/`list_sessions`，close 后读写返回 `-EBADF`。单测 8 用例全 PASS。
+  - `shell/` — SHELL 命令行解释器：内置 `help/echo/pwd/history/alias/exit` + 外部命令 `fork()+exec /bin/sh -c`（pipe 捕获 stdout+stderr），进程内 history/alias 表（一级别名展开）。单测 8 用例全 PASS。
+  - `console/` — CONSOLE 系统控制台：内存行缓冲 `write/read_line/banner/clear/status/list_sessions/bind_output`，行放不下 `-ENOBUFS`、空行 `-EAGAIN`、关闭后负 errno。单测 9 用例全 PASS。
+  - 三者均用 `HWRUN_PLUGIN_DEFINE` SDK 入口、requires LOG/PARAM/METAPROTO、接入 CMake 构建与 tests `_dlopen_tests` 组；`include/hwrun.h` 新增 `HWPROTO_TERMINAL/SHELL/CONSOLE`。ctest 17/17 全绿。
+- **P4 架构缺口一——协议版本规则统一**：`hw_proto_version_compat` 由仅字符串相等改为语义版本兼容（主版本必须相同、`have.minor >= req.minor`、同 minor 下 `have.patch >= req.patch`），新增 `test_version_compat_semver` 单测。既有"2.0 升版后 1.0 不再命中"语义保持不变。
+- **P4 架构缺口二——内核路由 ↔ METAPROTO 统一桥接**：新增 `hw_bus_resolve_ex`（bus.h/bus.c）——用户态 METAPROTO 优先，未命中且 `/dev/hwrun` 可用时经 kctl 折返内核路由表，命中合成 `kernel_backed=1`、`implementation=NULL` 的静态路由（内核实现在内核侧经 ioctl 调用，不向用户态暴露函数指针）；无内核边界时 kctl 降级 → 维持 ENOENT，行为可逆不变。`hw_protocol_route_t` 新增 `kernel_backed` 标记；`test_proto` 增 2 断言（用户态命中非内核背书 / 无边界回落 ENOENT）。
+- **P4 架构缺口一（余）——参数注入覆盖**：核验全部插件 src（git…console 15 个插件）均已经 `hw_plugin_runtime_bind` 接入并可在运行时用 `HWAPI_LOG/HWAPI_PARAM_*`，缺口闭合。
+
 ## 7. 已知差异
 
 1. TXT 文档同时描述了自研微内核和 Linux 内核两条路线，当前实现选择 Linux。
 2. 文档中许多模块写成 `.ko`，当前 HAP/PMP/FSP/NP/SP/LOADER 主要是用户态 `.so`。
 3. 设计中的微内核 IPC 尚未成为当前 BUS 的通信 ABI；当前插件使用 POSIX 运行时。
 4. 完整 ISO、rootfs、APT 仓库和 bootloader 流程尚未完成。
-5. 参数注入和 Git 状态管理尚未覆盖所有插件。
-6. 文档中的协议版本兼容规则还没有完全统一到所有插件。
-7. 内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接。
+5. ~~参数注入和 Git 状态管理尚未覆盖所有插件~~（已落地：全部插件 src 经 `hw_plugin_runtime_bind` + `HWAPI_LOG/HWAPI_PARAM_*` 接入，见 6.4）。
+6. ~~文档中的协议版本兼容规则还没有完全统一到所有插件~~（已统一：`hw_proto_version_compat` 改为语义版本兼容，主版本相同 + 次版本向后兼容，见 6.4）。
+7. ~~内核协议路由和用户态 METAPROTO 目前是两套路由表，尚未做统一桥接~~（已落地：`hw_bus_resolve_ex` 回落式桥接，见 6.4）。
 8. 构建产物（bzImage/vmlinux/`.ko`/`.so`）仅存在于本地工作区，未入库；`hwrun_core.ko` 的 ioctl 运行级验证已在 QEMU（qemu profile）内通过（见 6.3），尚未装入物理/生产内核。
 9. ~~plugin.yml 仍有嵌套 map 与扁平纯字符串两种形态并存，单一样式收敛（统一嵌套 `plugin:` 根 + protocol/version map）~~（已收敛：8 个 yml 统一格式，解析器缩进感知修复子键覆盖问题）。
 
