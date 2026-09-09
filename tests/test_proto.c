@@ -117,6 +117,17 @@ int main(void) {
     tr = NULL;
     CHECK(hw_metaproto_resolve(&bus.meta, "LOG", NULL, &tr) == HWRUN_OK && tr, "内置 LOG 可解析");
 
+    /* P4 架构缺口：内核路由 ↔ METAPROTO 回落桥接。
+     * 用户态命中的协议，hw_bus_resolve_ex 直接返回用户态路由（非内核背书）；
+     * 用户态未命中时回落内核路由表——本测试环境无 /dev/hwrun，kctl 降级 → ENOENT，
+     * 维持原语义，验证桥接不会在无内核边界时改变行为。 */
+    hw_protocol_route_t *br = NULL;
+    CHECK(hw_bus_resolve_ex(&bus, "METAPROTO", &br) == HWRUN_OK && br && !br->kernel_backed,
+          "resolve_ex 用户态命中（非内核背书）");
+    br = NULL;
+    CHECK(hw_bus_resolve_ex(&bus, "NO_SUCH_PROTO", &br) == HWRUN_ENOENT,
+          "resolve_ex 未命中回落内核→无边界时 ENOENT");
+
     /* 插件 .so 路径：默认相对 "../"（WORKING_DIRECTORY=tests 源目录，指到源树各插件 build/）。
      * sanitizer/coverage 隔离构建时由 CMake 传 HWRUN_PLUGIN_ROOT=构建树 plugins/（绝对）。 */
     const char *names[] = {"hap", "pmp", "fsp", "np", "loader"};

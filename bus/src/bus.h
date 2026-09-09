@@ -73,6 +73,9 @@ extern int hw_bus_boot_chain(hw_bus_t *bus);           /* 按依赖链依序启�
 extern int hw_bus_stop(hw_bus_t *bus, const char *id);
 extern int hw_bus_unload(hw_bus_t *bus, const char *id);
 extern int hw_bus_resolve(hw_bus_t *bus, const char *protocol, hw_protocol_route_t **out);
+/* 回落式解析：用户态 METAPROTO 未命中且内核边界可用时，经 kctl 折返内核路由表，
+ * 命中返回 kernel_backed=1 的路由（implementation=NULL）。无 /dev/hwrun 时走原语义。 */
+extern int hw_bus_resolve_ex(hw_bus_t *bus, const char *protocol, hw_protocol_route_t **out);
 
 /* 状态查询 */
 extern hw_plugin_t *hw_bus_find(hw_bus_t *bus, const char *id);

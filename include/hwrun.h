@@ -171,6 +171,7 @@ typedef struct hw_protocol_route {
     char plugin_id[64];
     void *implementation;    /* 实现接口指针 */
     uint16_t provider_state; /* 提供者插件状态 */
+    int kernel_backed; /* 1 = 来自内核路由表（kctl 回落桥接），非用户态 .so */
     struct hw_protocol_route *next;
 } hw_protocol_route_t;
 

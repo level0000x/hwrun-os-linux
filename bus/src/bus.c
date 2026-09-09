@@ -6,6 +6,7 @@
 
 #include "bus.h"
 #include "git.h"
+#include "kctl.h"
 
 #include <dirent.h>
 #include <unistd.h>
@@ -367,6 +368,37 @@ int hw_bus_boot_chain(hw_bus_t *bus) {
 
 int hw_bus_resolve(hw_bus_t *bus, const char *protocol, hw_protocol_route_t **out) {
     return hw_metaproto_resolve(&bus->meta, protocol, NULL, out);
+}
+
+/* 回落式解析：先用户态 METAPROTO，未命中且内核边界可用时经 kctl 查询内核路由表。
+ * 命中内核路由时合成一条静态路由，kernel_backed=1、implementation=NULL（内核路由
+ * 的实现在内核侧，经 kctl ioctl 调用，不向用户态暴露函数指针）。当前无 /dev/hwrun
+ * 时 kctl 返回 HWRUN_ENOTREADY，本函数静默回到 ENOENT，与现状行为一致。 */
+static hw_protocol_route_t g_kernel_route;
+
+int hw_bus_resolve_ex(hw_bus_t *bus, const char *protocol, hw_protocol_route_t **out) {
+    if (!bus || !protocol || !out) return HWRUN_EINVAL;
+    if (hw_bus_resolve(bus, protocol, out) == HWRUN_OK) return HWRUN_OK;
+
+    hwrun_kctl_t kc;
+    if (hwrun_kctl_open_path(&kc, HWRUN_KCTL_DEVICE) != HWRUN_OK)
+        return HWRUN_ENOENT; /* 无内核边界：维持用户态结果 */
+
+    hwrun_kctl_desc_t d;
+    int rc = hwrun_kctl_protocol_resolve(&kc, protocol, &d);
+    hwrun_kctl_close(&kc);
+    if (rc != HWRUN_OK) return HWRUN_ENOENT;
+
+    memset(&g_kernel_route, 0, sizeof(g_kernel_route));
+    snprintf(g_kernel_route.protocol, sizeof(g_kernel_route.protocol), "%s", d.protocol);
+    snprintf(g_kernel_route.version, sizeof(g_kernel_route.version), "%s", d.version);
+    snprintf(g_kernel_route.plugin_id, sizeof(g_kernel_route.plugin_id), "%s",
+             d.provider[0] ? d.provider : "kernel");
+    g_kernel_route.implementation = NULL;
+    g_kernel_route.provider_state = HWPLUGIN_STARTED;
+    g_kernel_route.kernel_backed = 1;
+    *out = &g_kernel_route;
+    return HWRUN_OK;
 }
 
 extern int hw_bus_cli(int argc, char **argv);
