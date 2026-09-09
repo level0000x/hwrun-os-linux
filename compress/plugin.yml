@@ -1,0 +1,27 @@
+# HWRun OS — COMPRESS 插件描述
+# Compression Protocol：数据/文件压缩、解压与格式自动识别的统一抽象。
+# v1 引擎：zlib(gzip/zlib) + libzstd；xz/lz4 仅探测（扩展预留）。
+plugin:
+  id: "compress"
+  name: "Compression Protocol"
+  version: "1.0.0"
+  type: "service"
+
+  description: "HWRun OS 压缩协议，提供缓冲/文件压缩、解压与格式识别的统一抽象（zlib+zstd）"
+
+  provides:
+    - protocol: "COMPRESS"
+      version: "1.0"
+
+  requires:
+    - protocol: "LOG"
+      version: "1.0"
+    - protocol: "PARAM"
+      version: "1.0"
+    - protocol: "METAPROTO"
+      version: "1.0"
+
+  conflicts: []
+
+  files:
+    - "build/compress.so"

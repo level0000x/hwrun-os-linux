@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake libcmocka-dev pkg-config libssl-dev
+            cmake libcmocka-dev pkg-config libssl-dev libzstd-dev
 
       - name: Configure (Release)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -58,7 +58,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake libcmocka-dev pkg-config libssl-dev
+            cmake libcmocka-dev pkg-config libssl-dev libzstd-dev
 
       - name: Configure (sanitizer=address;undefined)
         run: 'cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHWRUN_ENABLE_SANITIZER="address;undefined"'
@@ -111,7 +111,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libcmocka-dev pkg-config libssl-dev
+            libcmocka-dev pkg-config libssl-dev libzstd-dev
 
       # make 全量（bus + 各插件 .so）后，make test 所需插件产物即就绪
       - name: make (bus + plugins)

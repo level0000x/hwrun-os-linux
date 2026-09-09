@@ -319,12 +319,14 @@ int hw_bus_load(hw_bus_t *bus, const char *id) {
 
 /* 依赖链标准启动顺序 */
 static const char *boot_order[] = {
-    "metaproto", "bus",      "param",      "log",       "git",         "hap",
-    "pmp",       "fsp",      "np",         "sp",        "crypto",      "loader",
-    "cluster",   "instance", "sandbox",    "input",     "display",     "audio",
-    "power",     "storage",  "permission", "consensus", "fs_transfer", "node_discovery",
-    "driver",    "hotplug",  "terminal",   "audit",     "packages",    "monitor",
-    "ui",        "console",  "desktop",    "shell",     NULL};
+    "metaproto", "bus",        "param",     "log",         "git",
+    "hap",       "pmp",        "fsp",       "np",          "sp",
+    "crypto",    "loader",     "compress",  "cluster",     "instance",
+    "sandbox",   "input",      "display",   "audio",       "power",
+    "storage",   "permission", "consensus", "fs_transfer", "node_discovery",
+    "driver",    "hotplug",    "terminal",  "audit",       "packages",
+    "monitor",   "ui",         "console",   "desktop",     "shell",
+    NULL};
 
 /* 插件 id 是否在 boot_order 表内（决定是否会被 boot_chain 自动启动） */
 static int in_boot_order(const char *id) {

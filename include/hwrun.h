@@ -91,6 +91,7 @@ typedef enum {
     HWPLUGIN_TYPE_DRIVER,
     HWPLUGIN_TYPE_CONTAINER,
     HWPLUGIN_TYPE_CRYPTO,
+    HWPLUGIN_TYPE_SERVICE,
     HWPLUGIN_TYPE_UNKNOWN,
 } hwplugin_type_t;
 
@@ -235,6 +236,7 @@ typedef struct hw_bus_ops hw_bus_ops_t;
 #define HWPROTO_SP "SP"
 #define HWPROTO_CRYPTO "CRYPTO"
 #define HWPROTO_LOADER "LOADER"
+#define HWPROTO_COMPRESS "COMPRESS"
 
 /* ============================================================
  * 工具函数（由核心库 hwrun-core 提供）
